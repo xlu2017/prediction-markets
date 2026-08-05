@@ -82,6 +82,10 @@ describe("run storage", () => {
       ],
       clobStaleAfterMs: 15_000,
       referenceStaleAfterMs: 10_000,
+      lastReferenceReceivedAt: null,
+      lastReferenceConnectionGeneration: null,
+      finalReferenceAgeMs: null,
+      referenceFresh: false,
     };
     await store.finalize({
       status: "COMPLETED",

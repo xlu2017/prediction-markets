@@ -35,6 +35,8 @@ export class HealthTracker {
   private reconnects = 0;
   private staleIncidents = 0;
   private referenceObserved = false;
+  private lastReferenceReceivedAt: number | null = null;
+  private lastReferenceConnectionGeneration: number | null = null;
   private fatalError = false;
   private maxSourceLatency: number | null = null;
   private maxProcessingLatency: number | null = null;
@@ -77,6 +79,10 @@ export class HealthTracker {
       envelope.eventType === "REFERENCE_PRICE"
     ) {
       this.referenceObserved = true;
+      this.lastReferenceReceivedAt = envelope.receivedAt;
+      if (envelope.connectionGeneration !== null) {
+        this.lastReferenceConnectionGeneration = envelope.connectionGeneration;
+      }
     }
     if (envelope.eventType === "DATA_GAP_STARTED") {
       const feed = feedFromEnvelope(envelope);
@@ -124,11 +130,24 @@ export class HealthTracker {
   public computeCaptureStatus(
     bookHealth: Record<string, BookHealth>,
     currentClobGeneration: number | null,
+    options: {
+      processFailed?: boolean;
+      nowMs: number;
+      referenceStaleAfterMs: number;
+    },
   ): { status: CaptureStatus; usable: boolean; failures: QualityFailure[] } {
     const failures: QualityFailure[] = [];
+    const processFailed = options.processFailed ?? false;
 
     if (this.fatalError) {
       failures.push({ code: "FATAL_PROCESSOR_ERROR", message: "Fatal processor or storage error" });
+    }
+
+    if (processFailed) {
+      failures.push({
+        code: "PROCESS_FAILURE",
+        message: "Run did not complete successfully (completionStatus is FAILED)",
+      });
     }
 
     for (const tokenId of this.expectedTokenIds) {
@@ -147,6 +166,14 @@ export class HealthTracker {
         code: "REFERENCE_STREAM_MISSING",
         message: "Chainlink reference stream not observed",
       });
+    } else if (this.lastReferenceReceivedAt !== null) {
+      const referenceAge = options.nowMs - this.lastReferenceReceivedAt;
+      if (referenceAge > options.referenceStaleAfterMs) {
+        failures.push({
+          code: "REFERENCE_STREAM_STALE",
+          message: `Chainlink reference stream is stale: last observation ${referenceAge}ms ago (threshold ${options.referenceStaleAfterMs}ms)`,
+        });
+      }
     }
 
     if (this.openGaps.size > 0) {
@@ -212,7 +239,8 @@ export class HealthTracker {
     const usable = failures.length === 0;
     let status: CaptureStatus;
     if (usable) status = "COMPLETE";
-    else if (this.fatalError || (this.total === 0 && this.malformed === 0)) status = "UNUSABLE";
+    else if (this.fatalError || processFailed || (this.total === 0 && this.malformed === 0))
+      status = "UNUSABLE";
     else status = "PARTIAL";
     return { status, usable, failures };
   }
@@ -223,12 +251,23 @@ export class HealthTracker {
     clobStaleAfterMs: number,
     referenceStaleAfterMs: number,
     currentClobGeneration: number | null,
+    processFailed = false,
   ): HealthSummary {
     this.books.markStale(nowMs, clobStaleAfterMs);
     const bookHealth = this.books.snapshot(nowMs, clobStaleAfterMs);
-    const capture = this.computeCaptureStatus(bookHealth, currentClobGeneration);
+    const capture = this.computeCaptureStatus(bookHealth, currentClobGeneration, {
+      processFailed,
+      nowMs,
+      referenceStaleAfterMs,
+    });
     const openGapsRecord: Record<string, OpenGap> = {};
     for (const [feed, gap] of this.openGaps) openGapsRecord[feed] = gap;
+    const finalReferenceAgeMs =
+      this.lastReferenceReceivedAt !== null ? nowMs - this.lastReferenceReceivedAt : null;
+    const referenceFresh =
+      this.referenceObserved &&
+      finalReferenceAgeMs !== null &&
+      finalReferenceAgeMs <= referenceStaleAfterMs;
     return {
       schemaVersion: 2,
       runId: this.runId,
@@ -254,6 +293,10 @@ export class HealthTracker {
       qualityFailures: capture.failures,
       clobStaleAfterMs,
       referenceStaleAfterMs,
+      lastReferenceReceivedAt: this.lastReferenceReceivedAt,
+      lastReferenceConnectionGeneration: this.lastReferenceConnectionGeneration,
+      finalReferenceAgeMs,
+      referenceFresh,
     };
   }
 }

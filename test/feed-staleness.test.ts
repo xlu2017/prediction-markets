@@ -150,6 +150,7 @@ describe("feed-specific staleness thresholds", () => {
         source: "POLYMARKET_REFERENCE_PRICE",
         eventType: "REFERENCE_PRICE",
         sequence: 3,
+        receivedAt: NOW + 9_000,
       }),
     );
     const clobStale = 20_000;

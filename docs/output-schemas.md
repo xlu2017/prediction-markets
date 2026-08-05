@@ -94,18 +94,24 @@ receive latencies are preserved for diagnosis rather than clamped to zero.
 
 `captureStatus` is one of `COMPLETE`, `PARTIAL`, or `UNUSABLE`:
 
-- `COMPLETE`: both token streams observed, reference price stream observed, no open gaps, no
-  malformed events, no stale incidents, all books `SYNCHRONIZED` with current-generation snapshots,
-  no fatal errors.
+- `COMPLETE`: both token streams observed, reference price stream observed and fresh, no open gaps,
+  no malformed events, no stale incidents, all books `SYNCHRONIZED` with current-generation
+  snapshots, no fatal errors, process completed successfully.
 - `PARTIAL`: at least one quality issue detected (malformed events, stale/invalid/resync-required
-  books, stale-generation snapshots, missing reference stream, open gaps, stale incidents).
-- `UNUSABLE`: fatal processor error, or no events captured at all.
+  books, stale-generation snapshots, missing or stale reference stream, open gaps, stale incidents).
+- `UNUSABLE`: fatal processor error, process failure, or no events captured at all.
 
 `usableForReplay` is true only when `captureStatus` is `COMPLETE`. `qualityFailures` lists
 `QualityFailure` objects with machine-readable `code` and human-readable `message` fields. Codes
 include `MALFORMED_EVENTS_PRESENT`, `BOOK_STALE`, `BOOK_INVALID`, `BOOK_RESYNC_REQUIRED`,
-`BOOK_SNAPSHOT_STALE_GENERATION`, `REFERENCE_STREAM_MISSING`, `OPEN_GAPS`, `STALE_INCIDENTS`,
-`FATAL_PROCESSOR_ERROR`, and `NO_EVENTS_CAPTURED`.
+`BOOK_SNAPSHOT_STALE_GENERATION`, `REFERENCE_STREAM_MISSING`, `REFERENCE_STREAM_STALE`,
+`OPEN_DATA_GAP`, `FATAL_PROCESSOR_ERROR`, and `PROCESS_FAILURE`.
+
+The health summary also includes reference freshness fields: `lastReferenceReceivedAt` (wall-clock
+time of the last valid Chainlink observation, or null), `lastReferenceConnectionGeneration`
+(connection generation of that observation, or null), `finalReferenceAgeMs` (age of the last
+observation at finalization, or null), and `referenceFresh` (true only if the reference was observed
+and is within the staleness threshold).
 
 ## Clock semantics
 

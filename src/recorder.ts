@@ -271,6 +271,7 @@ export async function runRecorder(
       clobStaleAfterMs,
       referenceStaleAfterMs,
       currentClobGeneration,
+      true,
     );
     await store
       .finalize({

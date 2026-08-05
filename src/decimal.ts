@@ -80,3 +80,15 @@ export function compareDecimalStrings(left: string, right: string): number {
   if (af === bf) return 0;
   return (af < bf ? -1 : 1) * sign;
 }
+
+export function isMultipleOfTick(price: string, tickSize: string): boolean {
+  if (!isDecimalString(price) || !isDecimalString(tickSize)) return false;
+  const p = splitDecimal(price);
+  const t = splitDecimal(tickSize);
+  if (p.negative || t.negative) return false;
+  const fractionWidth = Math.max(p.fraction.length, t.fraction.length);
+  const pScaled = BigInt(p.integer + p.fraction.padEnd(fractionWidth, "0"));
+  const tScaled = BigInt(t.integer + t.fraction.padEnd(fractionWidth, "0"));
+  if (tScaled === 0n) return false;
+  return pScaled % tScaled === 0n;
+}

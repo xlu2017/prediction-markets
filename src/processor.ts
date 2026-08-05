@@ -66,16 +66,32 @@ function sliceArrayMessages(rawText: string): string[] | null {
       else if (ch === '"') inString = false;
       continue;
     }
-    if (ch === '"') inString = true;
-    else if (ch === "[" || ch === "{") {
+    if (ch === '"') {
+      inString = true;
+      if (depth === 1 && start < 0) start = i;
+    } else if (ch === "[" || ch === "{") {
       if (depth === 1 && start < 0) start = i;
       depth += 1;
-    } else if (ch === "]" || ch === "}") {
+    } else if (ch === "}" || ch === "]") {
       depth -= 1;
       if (depth === 1 && start >= 0) {
         messages.push(rawText.slice(start, i + 1));
         start = -1;
+      } else if (depth === 0) {
+        if (start >= 0) messages.push(rawText.slice(start, i).trim());
+        break;
       }
+    } else if (depth === 1 && ch === ",") {
+      if (start >= 0) {
+        messages.push(rawText.slice(start, i).trim());
+        start = -1;
+      }
+    } else if (
+      depth === 1 &&
+      start < 0 &&
+      !(ch === " " || ch === "\t" || ch === "\n" || ch === "\r")
+    ) {
+      start = i;
     }
   }
   return messages.length > 0 ? messages : null;

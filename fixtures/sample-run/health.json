@@ -53,5 +53,9 @@
   "usableForReplay": true,
   "qualityFailures": [],
   "clobStaleAfterMs": 15000,
-  "referenceStaleAfterMs": 10000
+  "referenceStaleAfterMs": 10000,
+  "lastReferenceReceivedAt": 1785909720125,
+  "lastReferenceConnectionGeneration": 1,
+  "finalReferenceAgeMs": 1,
+  "referenceFresh": true
 }

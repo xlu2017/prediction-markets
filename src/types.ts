@@ -63,13 +63,15 @@ export type QualityFailureCode =
   | "MISSING_UP_SNAPSHOT"
   | "MISSING_DOWN_SNAPSHOT"
   | "REFERENCE_STREAM_MISSING"
+  | "REFERENCE_STREAM_STALE"
   | "OPEN_DATA_GAP"
   | "MALFORMED_EVENTS_PRESENT"
   | "BOOK_STALE"
   | "BOOK_INVALID"
   | "BOOK_RESYNC_REQUIRED"
   | "BOOK_SNAPSHOT_STALE_GENERATION"
-  | "FATAL_PROCESSOR_ERROR";
+  | "FATAL_PROCESSOR_ERROR"
+  | "PROCESS_FAILURE";
 
 export type QualityFailure = {
   code: QualityFailureCode;
@@ -139,6 +141,10 @@ export type HealthSummary = {
   qualityFailures: QualityFailure[];
   clobStaleAfterMs: number;
   referenceStaleAfterMs: number;
+  lastReferenceReceivedAt: number | null;
+  lastReferenceConnectionGeneration: number | null;
+  finalReferenceAgeMs: number | null;
+  referenceFresh: boolean;
 };
 
 export type LogLevel = "debug" | "error" | "info" | "warn";

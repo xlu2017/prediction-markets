@@ -1,4 +1,9 @@
-import { compareDecimalStrings, exactWireDecimalString, isDecimalString } from "./decimal.js";
+import {
+  compareDecimalStrings,
+  exactWireDecimalString,
+  isDecimalString,
+  isMultipleOfTick,
+} from "./decimal.js";
 import type { BookHealth, BookState } from "./types.js";
 
 type BookSide = Map<string, string>;
@@ -30,12 +35,7 @@ function validatePriceBounds(price: string, label: string): void {
 
 function validateTickSize(price: string, tickSize: string, label: string): void {
   if (tickSize === "0" || !isDecimalString(tickSize)) return;
-  const priceScaled = parseFloat(price);
-  const tickScaled = parseFloat(tickSize);
-  if (!Number.isFinite(priceScaled) || !Number.isFinite(tickScaled) || tickScaled <= 0) return;
-  const ratio = priceScaled / tickScaled;
-  const rounded = Math.round(ratio);
-  if (Math.abs(ratio - rounded) > 1e-9) {
+  if (!isMultipleOfTick(price, tickSize)) {
     throw new Error(`${label} price ${price} is not a multiple of tick size ${tickSize}`);
   }
 }

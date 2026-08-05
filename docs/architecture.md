@@ -92,6 +92,13 @@ tick-size violation, duplicate price level), the entire batch is rolled back and
 transitions to `INVALID`. Recovery requires a new full `book` snapshot from the current connection
 generation.
 
+Pre-mutation rejections (unknown token, invalid side, missing fields, tick-size violation, price out
+of bounds) throw before any book backup is created. In this case the prior book state is preserved
+but the event is recorded as malformed, making the overall capture unusable through
+`MALFORMED_EVENTS_PRESENT`. Only failures during mutation or crossed-book validation (which occur
+after backups are created) transition the book to `INVALID`. This policy ensures that a single
+malformed batch never silently corrupts a previously valid book.
+
 After a reconnection gap, all books transition to `RESYNC_REQUIRED`. A `book` snapshot from the new
 connection generation is required to restore `SYNCHRONIZED` state. Snapshots from a stale generation
 are rejected. The `synchronizationEpoch` field tracks how many times the book has been

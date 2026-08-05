@@ -15,6 +15,7 @@
     "format:check": "prettier --check .",
     "lint": "eslint . --max-warnings 0",
     "market:record": "tsx src/cli.ts",
+    "market:verify-run": "tsx src/verify-run.ts",
     "read-only:check": "node scripts/assert-read-only.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
