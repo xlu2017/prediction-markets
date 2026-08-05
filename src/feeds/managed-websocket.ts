@@ -103,6 +103,7 @@ export class ManagedWebSocket {
   }
 
   public notifyValidDataMessage(receivedAt: number, connectionGeneration: number): void {
+    if (connectionGeneration !== this.generation) return;
     this.staleDetector.observe(receivedAt);
     if (this.gapStartedAt !== null && !this.gapEnded) {
       this.emitLifecycle("DATA_GAP_ENDED", connectionGeneration, {
@@ -140,7 +141,6 @@ export class ManagedWebSocket {
       if (this.stopping || socket !== this.socket) return;
       const receivedAt = this.now();
       const rawText = rawDataToString(data);
-      if (rawText !== "PONG" && rawText !== "PING") this.staleDetector.observe(receivedAt);
       this.options.onFrame({
         source: this.options.source,
         rawText,

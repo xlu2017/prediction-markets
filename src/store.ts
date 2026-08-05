@@ -10,6 +10,7 @@ import type {
   HealthSummary,
   JsonValue,
   MarketSpecification,
+  QualityFailure,
   RawEventEnvelope,
   RunManifest,
 } from "./types.js";
@@ -47,6 +48,8 @@ export function createManifest(input: {
   market: MarketSpecification;
   gitCommit: string | null;
   commandArguments: Record<string, JsonValue>;
+  clobStaleAfterMs: number;
+  referenceStaleAfterMs: number;
 }): RunManifest {
   return {
     schemaVersion: 2,
@@ -64,6 +67,8 @@ export function createManifest(input: {
     captureStatus: "UNUSABLE",
     usableForReplay: false,
     qualityFailures: [],
+    clobStaleAfterMs: input.clobStaleAfterMs,
+    referenceStaleAfterMs: input.referenceStaleAfterMs,
   };
 }
 
@@ -102,7 +107,7 @@ export class RunStore {
     health: HealthSummary;
     captureStatus: CaptureStatus;
     usableForReplay: boolean;
-    qualityFailures: string[];
+    qualityFailures: QualityFailure[];
     failureReason?: string | null;
   }): Promise<void> {
     await this.flush();

@@ -37,10 +37,14 @@ Every envelope carries:
 - `conditionId`: the Polymarket CLOB condition id used as the on-wire market identity;
 - `sourceMarketId`: the `market` field from a CLOB event, validated against `conditionId`;
 - `frameId`: local per-frame identifier for correlating batched messages;
-- `messageIndex` / `messageCount`: position within a batched frame array.
+- `messageIndex` / `messageCount`: position within a batched frame array;
+- `observedTokenIds`: token IDs present in a snapshot or touched by a price_change batch;
+- `topLevelSourceTimestamp` / `payloadSourceTimestamp`: Chainlink top-level and payload timestamps;
+- `rawMessageText`: exact wire bytes for the individual message within a batched frame.
 
 CLOB events whose `market` field does not match the discovered `conditionId` are rejected as
-malformed, preventing cross-market contamination.
+malformed, preventing cross-market contamination. A missing `market` field on a CLOB event is also
+rejected.
 
 ## Event processing
 
@@ -53,50 +57,90 @@ sequence numbers and file append order agree. Each envelope includes:
 - reconnect generation;
 - frame and message identity;
 - normalized payload;
-- untouched wire-frame text.
+- untouched wire-frame text (`rawText`) and per-message text (`rawMessageText`).
 
-## Conservative deduplication
+## Message-level deduplication
 
-Duplicate suppression uses a composite key of connection generation, source timestamp, and a SHA-256
-hash of the raw frame text. This avoids the unsafe previous approach of keying on CLOB `hash` fields
-alone, which could suppress legitimate cancellations that share a hash but have different content.
-The first occurrence's sequence number is retained in `duplicateOfSequence` for traceability.
+Duplicate suppression operates at the message level, not the frame level. The composite key is
+`(connectionGeneration, frameHash, messageIndex, messageHash, sourceTimestamp)`, where `frameHash`
+is a SHA-256 of the full frame text and `messageHash` is a SHA-256 of the individual message text.
+This ensures that two distinct messages within the same array frame are never classified as
+duplicates of each other, and that the same message retransmitted on a different connection
+generation is not suppressed.
+
+A message is registered as applied only after validation and book mutation succeed. If processing
+throws, the message is not registered, and a future retransmission will be re-processed. The
+`dedupeState` field on each envelope records the outcome: `UNIQUE_APPLIED`, `DUPLICATE_APPLIED`, or
+`RECEIVED_NOT_APPLIED`.
 
 Malformed source frames are not discarded silently. They increment the malformed count and append a
-`MALFORMED_EVENT` envelope containing the error and original text.
+`MALFORMED_EVENT` envelope containing the error, original text, and any extractable source identity.
 
 ## Transactional order-book projection
 
-The in-memory tracker implements a `BookState` machine: `UNINITIALIZED` -> `SYNCHRONIZED` ->
-`INVALID`. Updates are transactional: all changes in a batch are validated before any mutation. If
-any change fails validation (unknown token, invalid side, negative size, crossed book), the entire
-batch is rolled back and the book transitions to `INVALID`. Recovery requires a new full `book`
+The in-memory tracker implements a `BookState` machine:
+
+- `UNINITIALIZED` -> `SYNCHRONIZED` (via a `book` snapshot)
+- `SYNCHRONIZED` -> `STALE` (when no update arrives within the CLOB staleness threshold)
+- `SYNCHRONIZED` -> `INVALID` (when a `price_change` batch fails validation)
+- `SYNCHRONIZED` -> `RESYNC_REQUIRED` (when a gap occurs or a new connection generation arrives)
+- Any state -> `SYNCHRONIZED` (via a fresh `book` snapshot from the current generation)
+
+Updates are transactional: all changes in a batch are validated before any mutation. If any change
+fails validation (unknown token, invalid side, negative size, crossed book, price out of bounds,
+tick-size violation, duplicate price level), the entire batch is rolled back and the book
+transitions to `INVALID`. Recovery requires a new full `book` snapshot from the current connection
+generation.
+
+After a reconnection gap, all books transition to `RESYNC_REQUIRED`. A `book` snapshot from the new
+connection generation is required to restore `SYNCHRONIZED` state. Snapshots from a stale generation
+are rejected. The `synchronizationEpoch` field tracks how many times the book has been
+re-synchronized, and `snapshotConnectionGeneration` records which generation produced the current
 snapshot.
 
 The projection stores price and size strings exactly, removes zero-size levels, and computes best
-prices with decimal-string comparison rather than floating point. It reports best bid, best ask,
-bid/ask level counts, book state, last successful update time, and freshness. It is not an execution
-simulator and does not infer fills, queue position, or profitability.
+prices with decimal-string comparison rather than floating point. It validates price bounds (0 <
+price < 1), tick-size alignment, and duplicate price levels. It reports best bid, best ask, bid/ask
+level counts, book state, synchronization epoch, snapshot generation, last successful update time,
+and freshness. It is not an execution simulator and does not infer fills, queue position, or
+profitability.
 
 ## Reconnection, gaps, and stale streams
 
 Each feed has capped exponential backoff with 20% jitter, automatic subscription restoration, and a
 monotonic reconnect generation. Unexpected closure appends `DATA_GAP_STARTED`; the gap ends only
-when the first valid subscribed data message arrives, appending `DATA_GAP_ENDED` with duration. An
-open-but-silent socket does not close a gap.
+when the first valid subscribed data message arrives on the current generation, appending
+`DATA_GAP_ENDED` with duration. An open-but-silent socket does not close a gap. Valid data messages
+from an old connection generation are ignored for gap-ending purposes.
 
-If no data arrives within `staleAfterMs`, the feed emits a `STALE_STREAM` incident, closes the
-socket, and schedules a reconnect. Open gaps are tracked in `health.json` under `openGapsByFeed`.
+Staleness checking uses feed-specific thresholds: `clobStaleAfterMs` for the CLOB feed and
+`referenceStaleAfterMs` for the RTDS feed. Freshness is refreshed only by `notifyValidDataMessage`,
+which is called after successful processing, not by raw WebSocket message arrival. This prevents
+non-data frames (e.g., PING/PONG) from masking a silent data stream.
+
+If no valid data arrives within the feed-specific threshold, the feed emits a `STALE_STREAM`
+incident, closes the socket, and schedules a reconnect. Open gaps are tracked in `health.json` under
+`openGapsByFeed`.
 
 Reconnect scheduling, errors, opens, closes, subscription messages, and stale incidents are all
 recorded.
 
 ## Capture status and replay usability
 
-`health.json` reports a `captureStatus` of `COMPLETE`, `PARTIAL`, or `FAILED` based on whether both
-token streams were observed, the reference price stream was observed, no gaps remain open, no
-malformed events occurred, and all books are synchronized. `usableForReplay` is true only when
-`captureStatus` is `COMPLETE`. `qualityFailures` lists the specific reasons.
+`health.json` reports a `captureStatus` of `COMPLETE`, `PARTIAL`, or `UNUSABLE` based on:
+
+- `COMPLETE`: both token streams observed, reference stream observed, no open gaps, no malformed
+  events, no stale incidents, all books `SYNCHRONIZED` with current-generation snapshots, no fatal
+  errors.
+- `PARTIAL`: at least one quality issue detected (malformed events, stale books, invalid books,
+  resync-required books, stale-generation snapshots, missing reference stream, open gaps).
+- `UNUSABLE`: fatal processor error, or no events captured at all.
+
+`usableForReplay` is true only when `captureStatus` is `COMPLETE`. `qualityFailures` lists specific
+`QualityFailure` objects with machine-readable `code` and human-readable `message` fields. Codes
+include `MALFORMED_EVENTS_PRESENT`, `BOOK_STALE`, `BOOK_INVALID`, `BOOK_RESYNC_REQUIRED`,
+`BOOK_SNAPSHOT_STALE_GENERATION`, `REFERENCE_STREAM_MISSING`, `OPEN_GAPS`, `STALE_INCIDENTS`,
+`FATAL_PROCESSOR_ERROR`, and `NO_EVENTS_CAPTURED`.
 
 ## Secret boundary
 

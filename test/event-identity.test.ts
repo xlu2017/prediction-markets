@@ -139,6 +139,11 @@ describe("event identity contract", () => {
       .split("\n")
       .map((line) => JSON.parse(line) as RawEventEnvelope);
 
+    console.error(
+      "[DEBUG-IDENTITY] events:",
+      events.map((e) => `${e.sequence}:${e.source}:${e.eventType}:${e.isDuplicate}`),
+    );
+
     const metadata = events.find((event) => event.eventType === "MARKET_DISCOVERED");
     const clobBook = events.find(
       (event) => event.source === "POLYMARKET_CLOB" && event.eventType === "book",
@@ -254,7 +259,10 @@ describe("event identity contract", () => {
     expect(malformed.length).toBeGreaterThanOrEqual(1);
     for (const event of malformed) {
       const payload = event.payload as Record<string, unknown>;
-      expect(String(payload.error)).toContain("does not match conditionId");
+      expect(String(payload.errorMessage)).toContain("does not match conditionId");
+      expect(payload.errorCode).toBe("MALFORMED_EVENT");
+      const identity = payload.parsedIdentity as Record<string, unknown>;
+      expect(identity.sourceMarketId).toBe("0xWRONGCONDITION");
     }
   });
 });

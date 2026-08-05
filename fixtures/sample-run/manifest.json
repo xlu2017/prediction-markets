@@ -42,5 +42,7 @@
   "failureReason": null,
   "captureStatus": "COMPLETE",
   "usableForReplay": true,
-  "qualityFailures": []
+  "qualityFailures": [],
+  "clobStaleAfterMs": 15000,
+  "referenceStaleAfterMs": 10000
 }

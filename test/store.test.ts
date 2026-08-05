@@ -31,6 +31,8 @@ describe("run storage", () => {
         market,
         gitCommit: null,
         commandArguments: { durationSeconds: 1 },
+        clobStaleAfterMs: 15_000,
+        referenceStaleAfterMs: 10_000,
       }),
     );
     const sequencer = new EventSequencer(runId);
@@ -66,9 +68,20 @@ describe("run storage", () => {
       captureStatus: "PARTIAL",
       usableForReplay: false,
       qualityFailures: [
-        "Missing token snapshots: 111111, 222222",
-        "Chainlink reference stream not observed",
+        {
+          code: "MISSING_UP_SNAPSHOT",
+          message: "Missing token snapshot: 111111",
+          tokenId: "111111",
+        },
+        {
+          code: "MISSING_DOWN_SNAPSHOT",
+          message: "Missing token snapshot: 222222",
+          tokenId: "222222",
+        },
+        { code: "REFERENCE_STREAM_MISSING", message: "Chainlink reference stream not observed" },
       ],
+      clobStaleAfterMs: 15_000,
+      referenceStaleAfterMs: 10_000,
     };
     await store.finalize({
       status: "COMPLETED",
@@ -78,8 +91,17 @@ describe("run storage", () => {
       captureStatus: "PARTIAL",
       usableForReplay: false,
       qualityFailures: [
-        "Missing token snapshots: 111111, 222222",
-        "Chainlink reference stream not observed",
+        {
+          code: "MISSING_UP_SNAPSHOT",
+          message: "Missing token snapshot: 111111",
+          tokenId: "111111",
+        },
+        {
+          code: "MISSING_DOWN_SNAPSHOT",
+          message: "Missing token snapshot: 222222",
+          tokenId: "222222",
+        },
+        { code: "REFERENCE_STREAM_MISSING", message: "Chainlink reference stream not observed" },
       ],
     });
 

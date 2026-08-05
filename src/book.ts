@@ -1,9 +1,11 @@
-import { compareDecimalStrings, exactWireDecimalString } from "./decimal.js";
+import { compareDecimalStrings, exactWireDecimalString, isDecimalString } from "./decimal.js";
 import type { BookHealth, BookState } from "./types.js";
 
 type BookSide = Map<string, string>;
 type TokenBook = {
   state: BookState;
+  synchronizationEpoch: number;
+  snapshotConnectionGeneration: number | null;
   bids: BookSide;
   asks: BookSide;
   lastSuccessfulUpdateTime: number | null;
@@ -19,21 +21,49 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function validateLevel(rawLevel: unknown, label: string): { price: string; size: string } {
+function validatePriceBounds(price: string, label: string): void {
+  const cmpZero = compareDecimalStrings(price, "0");
+  if (cmpZero <= 0) throw new Error(`${label} price must be > 0, got ${price}`);
+  const cmpOne = compareDecimalStrings(price, "1");
+  if (cmpOne >= 0) throw new Error(`${label} price must be < 1, got ${price}`);
+}
+
+function validateTickSize(price: string, tickSize: string, label: string): void {
+  if (tickSize === "0" || !isDecimalString(tickSize)) return;
+  const priceScaled = parseFloat(price);
+  const tickScaled = parseFloat(tickSize);
+  if (!Number.isFinite(priceScaled) || !Number.isFinite(tickScaled) || tickScaled <= 0) return;
+  const ratio = priceScaled / tickScaled;
+  const rounded = Math.round(ratio);
+  if (Math.abs(ratio - rounded) > 1e-9) {
+    throw new Error(`${label} price ${price} is not a multiple of tick size ${tickSize}`);
+  }
+}
+
+function validateLevel(
+  rawLevel: unknown,
+  label: string,
+  tickSize: string | null,
+): { price: string; size: string } {
   const level = asRecord(rawLevel);
   if (level === null) throw new Error(`${label} must be an object`);
   const price = exactWireDecimalString(recordValue(level, "price"), `${label} price`);
   const size = exactWireDecimalString(recordValue(level, "size"), `${label} size`);
   if (compareDecimalStrings(size, "0") < 0) throw new Error(`${label} size must not be negative`);
+  validatePriceBounds(price, label);
+  if (tickSize !== null) validateTickSize(price, tickSize, label);
   return { price, size };
 }
 
-function buildSide(levels: unknown, label: string): BookSide {
+function buildSide(levels: unknown, label: string, tickSize: string | null): BookSide {
   if (!Array.isArray(levels)) throw new Error(`${label} must be an array`);
   const side: BookSide = new Map();
   for (const rawLevel of levels) {
-    const { price, size } = validateLevel(rawLevel, label);
-    if (compareDecimalStrings(size, "0") > 0) side.set(price, size);
+    const { price, size } = validateLevel(rawLevel, label, tickSize);
+    if (compareDecimalStrings(size, "0") > 0) {
+      if (side.has(price)) throw new Error(`${label} has duplicate price level ${price}`);
+      side.set(price, size);
+    }
   }
   return side;
 }
@@ -69,11 +99,17 @@ function cloneSide(side: BookSide): BookSide {
 
 export class OrderBookTracker {
   private readonly books = new Map<string, TokenBook>();
+  private currentSynchronizationEpoch = 0;
 
-  public constructor(tokenIds: string[]) {
+  public constructor(
+    tokenIds: string[],
+    private readonly tickSize: string | null = null,
+  ) {
     for (const tokenId of tokenIds) {
       this.books.set(tokenId, {
         state: "UNINITIALIZED",
+        synchronizationEpoch: 0,
+        snapshotConnectionGeneration: null,
         bids: new Map(),
         asks: new Map(),
         lastSuccessfulUpdateTime: null,
@@ -81,28 +117,43 @@ export class OrderBookTracker {
     }
   }
 
-  public apply(event: unknown, processedAt: number): string[] {
+  public apply(event: unknown, processedAt: number, connectionGeneration: number): string[] {
     const record = asRecord(event);
     if (record === null) throw new Error("CLOB event must be an object");
     const eventType = recordValue(record, "event_type");
     if (typeof eventType !== "string") throw new Error("CLOB event is missing event_type");
 
-    if (eventType === "book") return this.applyBook(record, processedAt);
+    if (eventType === "book") return this.applyBook(record, processedAt, connectionGeneration);
     if (eventType === "price_change") return this.applyPriceChange(record, processedAt);
     return this.applyNonBookEvent(record);
   }
 
-  private applyBook(record: Record<string, unknown>, processedAt: number): string[] {
+  public requireResync(): void {
+    this.currentSynchronizationEpoch += 1;
+    for (const book of this.books.values()) {
+      if (book.state === "SYNCHRONIZED" || book.state === "STALE") {
+        book.state = "RESYNC_REQUIRED";
+      }
+    }
+  }
+
+  private applyBook(
+    record: Record<string, unknown>,
+    processedAt: number,
+    connectionGeneration: number,
+  ): string[] {
     const tokenId = recordValue(record, "asset_id");
     if (typeof tokenId !== "string") throw new Error("Book event is missing asset_id");
     const book = this.books.get(tokenId);
     if (book === undefined) throw new Error(`Unknown token ID in book event: ${tokenId}`);
-    const bids = buildSide(recordValue(record, "bids"), "book bid");
-    const asks = buildSide(recordValue(record, "asks"), "book ask");
+    const bids = buildSide(recordValue(record, "bids"), "book bid", this.tickSize);
+    const asks = buildSide(recordValue(record, "asks"), "book ask", this.tickSize);
     checkNotCrossed(bids, asks);
     book.bids = bids;
     book.asks = asks;
     book.state = "SYNCHRONIZED";
+    book.snapshotConnectionGeneration = connectionGeneration;
+    book.synchronizationEpoch = this.currentSynchronizationEpoch;
     book.lastSuccessfulUpdateTime = processedAt;
     return [tokenId];
   }
@@ -142,17 +193,23 @@ export class OrderBookTracker {
       if (book.state === "INVALID") {
         throw new Error(`Cannot apply price_change to invalid book for token ${tokenId}`);
       }
+      if (book.state === "RESYNC_REQUIRED") {
+        throw new Error(
+          `Cannot apply price_change to resync-required book for token ${tokenId}; fresh snapshot needed`,
+        );
+      }
+      if (book.state === "STALE") {
+        throw new Error(
+          `Cannot apply price_change to stale book for token ${tokenId}; fresh snapshot needed`,
+        );
+      }
       const price = exactWireDecimalString(recordValue(change, "price"), "price change price");
       const size = exactWireDecimalString(recordValue(change, "size"), "price change size");
       if (compareDecimalStrings(size, "0") < 0)
         throw new Error("Price change size must not be negative");
-      validated.push({
-        tokenId,
-        side: normalizedSide,
-        price,
-        size,
-        book,
-      });
+      validatePriceBounds(price, "price change");
+      if (this.tickSize !== null) validateTickSize(price, this.tickSize, "price change");
+      validated.push({ tokenId, side: normalizedSide, price, size, book });
     }
 
     const backups = new Map<TokenBook, { bids: BookSide; asks: BookSide; state: BookState }>();
@@ -219,6 +276,8 @@ export class OrderBookTracker {
       result[tokenId] = {
         tokenId,
         state,
+        synchronizationEpoch: book.synchronizationEpoch,
+        snapshotConnectionGeneration: book.snapshotConnectionGeneration,
         bestBid: best(book.bids, "highest"),
         bestAsk: best(book.asks, "lowest"),
         bidDepthCount: book.bids.size,

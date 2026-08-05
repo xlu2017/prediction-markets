@@ -1,4 +1,11 @@
-import type { CaptureStatus, HealthSummary, OpenGap, RawEventEnvelope } from "./types.js";
+import type {
+  BookHealth,
+  CaptureStatus,
+  HealthSummary,
+  OpenGap,
+  QualityFailure,
+  RawEventEnvelope,
+} from "./types.js";
 import { OrderBookTracker } from "./book.js";
 
 function increment(counter: Record<string, number>, key: string): void {
@@ -54,6 +61,9 @@ export class HealthTracker {
     );
     for (const tokenId of tokenIds) this.tokenIdsObserved.add(tokenId);
     if (envelope.tokenId !== null) this.tokenIdsObserved.add(envelope.tokenId);
+    if (envelope.observedTokenIds !== null) {
+      for (const tokenId of envelope.observedTokenIds) this.tokenIdsObserved.add(tokenId);
+    }
     if (
       envelope.source === "POLYMARKET_CLOB" &&
       envelope.eventType === "book" &&
@@ -111,22 +121,94 @@ export class HealthTracker {
     return this.openGaps.size;
   }
 
-  public computeCaptureStatus(): { status: CaptureStatus; usable: boolean; failures: string[] } {
-    const failures: string[] = [];
-    const bothTokens = this.expectedTokenIds.every((tokenId) =>
-      this.tokenSnapshotsObserved.has(tokenId),
-    );
-    if (!bothTokens) {
-      const missing = this.expectedTokenIds.filter(
-        (tokenId) => !this.tokenSnapshotsObserved.has(tokenId),
-      );
-      failures.push(`Missing token snapshots: ${missing.join(", ")}`);
+  public computeCaptureStatus(
+    bookHealth: Record<string, BookHealth>,
+    currentClobGeneration: number | null,
+  ): { status: CaptureStatus; usable: boolean; failures: QualityFailure[] } {
+    const failures: QualityFailure[] = [];
+
+    if (this.fatalError) {
+      failures.push({ code: "FATAL_PROCESSOR_ERROR", message: "Fatal processor or storage error" });
     }
-    if (!this.referenceObserved) failures.push("Chainlink reference stream not observed");
-    if (this.fatalError) failures.push("Fatal processor or storage error occurred");
+
+    for (const tokenId of this.expectedTokenIds) {
+      if (!this.tokenSnapshotsObserved.has(tokenId)) {
+        failures.push({
+          code:
+            tokenId === this.expectedTokenIds[0] ? "MISSING_UP_SNAPSHOT" : "MISSING_DOWN_SNAPSHOT",
+          message: `Missing token snapshot: ${tokenId}`,
+          tokenId,
+        });
+      }
+    }
+
+    if (!this.referenceObserved) {
+      failures.push({
+        code: "REFERENCE_STREAM_MISSING",
+        message: "Chainlink reference stream not observed",
+      });
+    }
+
     if (this.openGaps.size > 0) {
-      failures.push(`Open data gaps remain: ${[...this.openGaps.keys()].join(", ")}`);
+      for (const [feed] of this.openGaps) {
+        failures.push({
+          code: "OPEN_DATA_GAP",
+          message: `Open data gap on feed ${feed}`,
+          feed,
+        });
+      }
     }
+
+    if (this.malformed > 0) {
+      failures.push({
+        code: "MALFORMED_EVENTS_PRESENT",
+        message: `${this.malformed} malformed event(s) occurred`,
+      });
+    }
+
+    for (const [tokenId, health] of Object.entries(bookHealth)) {
+      if (health.state === "STALE") {
+        failures.push({
+          code: "BOOK_STALE",
+          message: `Book for token ${tokenId} is stale`,
+          tokenId,
+        });
+      }
+      if (health.state === "INVALID") {
+        failures.push({
+          code: "BOOK_INVALID",
+          message: `Book for token ${tokenId} is invalid`,
+          tokenId,
+        });
+      }
+      if (health.state === "RESYNC_REQUIRED") {
+        failures.push({
+          code: "BOOK_RESYNC_REQUIRED",
+          message: `Book for token ${tokenId} requires resynchronization`,
+          tokenId,
+        });
+      }
+      if (health.state === "UNINITIALIZED") {
+        failures.push({
+          code:
+            tokenId === this.expectedTokenIds[0] ? "MISSING_UP_SNAPSHOT" : "MISSING_DOWN_SNAPSHOT",
+          message: `Book for token ${tokenId} was never initialized`,
+          tokenId,
+        });
+      }
+      if (
+        health.snapshotConnectionGeneration !== null &&
+        currentClobGeneration !== null &&
+        health.snapshotConnectionGeneration !== currentClobGeneration
+      ) {
+        failures.push({
+          code: "BOOK_SNAPSHOT_STALE_GENERATION",
+          message: `Book for token ${tokenId} snapshot from generation ${health.snapshotConnectionGeneration}, current is ${currentClobGeneration}`,
+          tokenId,
+        });
+      }
+    }
+
     const usable = failures.length === 0;
     let status: CaptureStatus;
     if (usable) status = "COMPLETE";
@@ -135,9 +217,16 @@ export class HealthTracker {
     return { status, usable, failures };
   }
 
-  public summary(endedAt: string | null, nowMs: number, staleAfterMs: number): HealthSummary {
-    this.books.markStale(nowMs, staleAfterMs);
-    const capture = this.computeCaptureStatus();
+  public summary(
+    endedAt: string | null,
+    nowMs: number,
+    clobStaleAfterMs: number,
+    referenceStaleAfterMs: number,
+    currentClobGeneration: number | null,
+  ): HealthSummary {
+    this.books.markStale(nowMs, clobStaleAfterMs);
+    const bookHealth = this.books.snapshot(nowMs, clobStaleAfterMs);
+    const capture = this.computeCaptureStatus(bookHealth, currentClobGeneration);
     const openGapsRecord: Record<string, OpenGap> = {};
     for (const [feed, gap] of this.openGaps) openGapsRecord[feed] = gap;
     return {
@@ -158,11 +247,13 @@ export class HealthTracker {
         this.tokenIdsObserved.has(tokenId),
       ),
       referencePriceStreamObserved: this.referenceObserved,
-      finalBookHealth: this.books.snapshot(nowMs, staleAfterMs),
+      finalBookHealth: bookHealth,
       openGapsByFeed: openGapsRecord,
       captureStatus: capture.status,
       usableForReplay: capture.usable,
       qualityFailures: capture.failures,
+      clobStaleAfterMs,
+      referenceStaleAfterMs,
     };
   }
 }

@@ -26,6 +26,8 @@
     "111111": {
       "tokenId": "111111",
       "state": "SYNCHRONIZED",
+      "synchronizationEpoch": 0,
+      "snapshotConnectionGeneration": 1,
       "bestBid": ".48",
       "bestAsk": ".52",
       "bidDepthCount": 1,
@@ -36,6 +38,8 @@
     "222222": {
       "tokenId": "222222",
       "state": "SYNCHRONIZED",
+      "synchronizationEpoch": 0,
+      "snapshotConnectionGeneration": 1,
       "bestBid": ".47",
       "bestAsk": ".53",
       "bidDepthCount": 1,
@@ -47,5 +51,7 @@
   "openGapsByFeed": {},
   "captureStatus": "COMPLETE",
   "usableForReplay": true,
-  "qualityFailures": []
+  "qualityFailures": [],
+  "clobStaleAfterMs": 15000,
+  "referenceStaleAfterMs": 10000
 }

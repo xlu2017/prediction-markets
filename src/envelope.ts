@@ -1,5 +1,5 @@
 import { normalizeJson } from "./decimal.js";
-import type { EventSource, JsonValue, RawEventEnvelope } from "./types.js";
+import type { DedupeState, EventSource, JsonValue, RawEventEnvelope } from "./types.js";
 
 export type EventInput = {
   source: EventSource;
@@ -8,7 +8,10 @@ export type EventInput = {
   conditionId?: string | null;
   sourceMarketId?: string | null;
   tokenId?: string | null;
+  observedTokenIds?: string[] | null;
   sourceTimestamp?: number | null;
+  topLevelSourceTimestamp?: number | null;
+  payloadSourceTimestamp?: number | null;
   receivedAt: number;
   processedAt: number;
   connectionGeneration?: number | null;
@@ -16,10 +19,12 @@ export type EventInput = {
   messageIndex?: number | null;
   messageCount?: number | null;
   isDuplicate?: boolean;
+  dedupeState?: DedupeState;
   duplicateOfSequence?: number | null;
   dedupeReason?: string | null;
   payload: unknown;
   rawText?: string | null;
+  rawMessageText?: string | null;
 };
 
 export class EventSequencer {
@@ -39,7 +44,10 @@ export class EventSequencer {
       conditionId: input.conditionId ?? null,
       sourceMarketId: input.sourceMarketId ?? null,
       tokenId: input.tokenId ?? null,
+      observedTokenIds: input.observedTokenIds ?? null,
       sourceTimestamp: input.sourceTimestamp ?? null,
+      topLevelSourceTimestamp: input.topLevelSourceTimestamp ?? null,
+      payloadSourceTimestamp: input.payloadSourceTimestamp ?? null,
       receivedAt: input.receivedAt,
       processedAt: input.processedAt,
       connectionGeneration: input.connectionGeneration ?? null,
@@ -47,10 +55,12 @@ export class EventSequencer {
       messageIndex: input.messageIndex ?? null,
       messageCount: input.messageCount ?? null,
       isDuplicate: input.isDuplicate ?? false,
+      dedupeState: input.dedupeState ?? "UNIQUE_APPLIED",
       duplicateOfSequence: input.duplicateOfSequence ?? null,
       dedupeReason: input.dedupeReason ?? null,
       payload: normalizeJson(input.payload),
       rawText: input.rawText ?? null,
+      rawMessageText: input.rawMessageText ?? null,
     };
   }
 
@@ -64,8 +74,20 @@ export type DedupeResult = {
   duplicateOfSequence: number | null;
 };
 
-export class FrameDeduplicator {
-  private readonly sequences = new Map<string, number>();
+export type MessageDedupeKey = {
+  connectionGeneration: number;
+  frameHash: string;
+  messageIndex: number;
+  messageHash: string;
+  sourceTimestamp: number | null;
+};
+
+function messageDedupeKeyToString(key: MessageDedupeKey): string {
+  return `${key.connectionGeneration}:${key.frameHash}:${key.messageIndex}:${key.messageHash}:${key.sourceTimestamp ?? "null"}`;
+}
+
+export class MessageDeduplicator {
+  private readonly appliedSequences = new Map<string, number>();
   private readonly order: string[] = [];
 
   public constructor(private readonly capacity = 10_000) {
@@ -74,17 +96,24 @@ export class FrameDeduplicator {
     }
   }
 
-  public classify(key: string | null, currentSequence: number): DedupeResult {
+  public classify(key: MessageDedupeKey | null): DedupeResult {
     if (key === null) return { isDuplicate: false, duplicateOfSequence: null };
-    const existing = this.sequences.get(key);
+    const keyString = messageDedupeKeyToString(key);
+    const existing = this.appliedSequences.get(keyString);
     if (existing !== undefined) return { isDuplicate: true, duplicateOfSequence: existing };
-    this.sequences.set(key, currentSequence);
-    this.order.push(key);
+    return { isDuplicate: false, duplicateOfSequence: null };
+  }
+
+  public registerApplied(key: MessageDedupeKey | null, sequence: number): void {
+    if (key === null) return;
+    const keyString = messageDedupeKeyToString(key);
+    if (this.appliedSequences.has(keyString)) return;
+    this.appliedSequences.set(keyString, sequence);
+    this.order.push(keyString);
     if (this.order.length > this.capacity) {
       const oldest = this.order.shift();
-      if (oldest !== undefined) this.sequences.delete(oldest);
+      if (oldest !== undefined) this.appliedSequences.delete(oldest);
     }
-    return { isDuplicate: false, duplicateOfSequence: null };
   }
 }
 

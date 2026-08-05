@@ -154,6 +154,8 @@ export async function runRecorder(
   const startedAt = new Date(startedAtMs).toISOString();
   const runId = dependencies.runId ?? createRunId(startedAtMs);
   const gitCommit = await currentGitCommit(cwd);
+  const clobStaleAfterMs = dependencies.clobStaleAfterMs ?? 15_000;
+  const referenceStaleAfterMs = dependencies.referenceStaleAfterMs ?? 10_000;
   const commandArguments: Record<string, JsonValue> = {
     durationSeconds: options.durationSeconds,
     outputDir: options.outputDir,
@@ -162,15 +164,31 @@ export async function runRecorder(
   };
   const store = await RunStore.initialize(
     options.outputDir,
-    createManifest({ runId, startedAt, market, gitCommit, commandArguments }),
+    createManifest({
+      runId,
+      startedAt,
+      market,
+      gitCommit,
+      commandArguments,
+      clobStaleAfterMs,
+      referenceStaleAfterMs,
+    }),
   );
-  const books = new OrderBookTracker([market.upTokenId, market.downTokenId]);
+  const books = new OrderBookTracker([market.upTokenId, market.downTokenId], market.tickSize);
   const health = new HealthTracker(runId, startedAt, [market.upTokenId, market.downTokenId], books);
   const fatalController = new AbortController();
   const feedsBySource = new Map<string, ManagedWebSocket>();
+  let currentClobGeneration: number | null = null;
   const onValidData = (frame: FeedFrame): void => {
     const feed = feedsBySource.get(frame.source);
-    feed?.notifyValidDataMessage(frame.receivedAt, frame.connectionGeneration);
+    if (feed === undefined) return;
+    if (frame.source === "POLYMARKET_CLOB") {
+      currentClobGeneration = frame.connectionGeneration;
+    }
+    feed.notifyValidDataMessage(frame.receivedAt, frame.connectionGeneration);
+  };
+  const onClobGap = (): void => {
+    currentClobGeneration = null;
   };
   const onFatalError = (): void => {
     logger.error("Fatal processing error detected, stopping feeds");
@@ -186,6 +204,7 @@ export async function runRecorder(
     now,
     onValidData,
     onFatalError,
+    onClobGap,
   );
   const feeds = createFeeds({
     market,
@@ -195,10 +214,6 @@ export async function runRecorder(
     onLifecycle: (event) => processor.enqueueLifecycle(event),
   });
   for (const feed of feeds) feedsBySource.set(feed.source, feed);
-  const staleAfterMs = Math.max(
-    dependencies.clobStaleAfterMs ?? 15_000,
-    dependencies.referenceStaleAfterMs ?? 10_000,
-  );
 
   processor.enqueueMarketMetadata(startedAtMs);
   try {
@@ -220,7 +235,13 @@ export async function runRecorder(
     const eventCount = await processor.drain();
     const endedAtMs = now();
     const endedAt = new Date(endedAtMs).toISOString();
-    const healthSummary = health.summary(endedAt, endedAtMs, staleAfterMs);
+    const healthSummary = health.summary(
+      endedAt,
+      endedAtMs,
+      clobStaleAfterMs,
+      referenceStaleAfterMs,
+      currentClobGeneration,
+    );
     await store.finalize({
       status: "COMPLETED",
       endedAt,
@@ -244,7 +265,13 @@ export async function runRecorder(
     const endedAtMs = now();
     const endedAt = new Date(endedAtMs).toISOString();
     const reason = errorMessage(error);
-    const healthSummary = health.summary(endedAt, endedAtMs, staleAfterMs);
+    const healthSummary = health.summary(
+      endedAt,
+      endedAtMs,
+      clobStaleAfterMs,
+      referenceStaleAfterMs,
+      currentClobGeneration,
+    );
     await store
       .finalize({
         status: "FAILED",
