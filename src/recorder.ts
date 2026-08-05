@@ -174,7 +174,7 @@ export async function runRecorder(
       referenceStaleAfterMs,
     }),
   );
-  const books = new OrderBookTracker([market.upTokenId, market.downTokenId], market.tickSize);
+  const books = new OrderBookTracker([market.upTokenId, market.downTokenId]);
   const health = new HealthTracker(runId, startedAt, [market.upTokenId, market.downTokenId], books);
   const fatalController = new AbortController();
   const feedsBySource = new Map<string, ManagedWebSocket>();

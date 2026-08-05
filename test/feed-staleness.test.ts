@@ -41,7 +41,7 @@ function makeEnvelope(
 
 describe("feed-specific staleness thresholds", () => {
   it("CLOB threshold shorter than RTDS: book is stale while RTDS is healthy", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     books.apply(
       {
@@ -101,7 +101,7 @@ describe("feed-specific staleness thresholds", () => {
   });
 
   it("RTDS threshold shorter than CLOB: book remains healthy", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     books.apply(
       {
@@ -161,7 +161,7 @@ describe("feed-specific staleness thresholds", () => {
   });
 
   it("stores both thresholds in health summary", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     const summary = health.summary(null, NOW, 15_000, 10_000, null);
     expect(summary.clobStaleAfterMs).toBe(15_000);

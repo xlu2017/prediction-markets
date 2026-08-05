@@ -99,7 +99,7 @@ function observeBookSnapshots(health: HealthTracker): void {
 
 describe("capture status fail-closed semantics", () => {
   it("produces COMPLETE when all conditions are met", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupBooks(books);
     observeBookSnapshots(health);
@@ -111,7 +111,7 @@ describe("capture status fail-closed semantics", () => {
   });
 
   it("produces PARTIAL when one malformed event occurred", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupBooks(books);
     observeBookSnapshots(health);
@@ -124,7 +124,7 @@ describe("capture status fail-closed semantics", () => {
   });
 
   it("produces PARTIAL when a book is stale", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupBooks(books);
     observeBookSnapshots(health);
@@ -136,7 +136,7 @@ describe("capture status fail-closed semantics", () => {
   });
 
   it("accepts crossed books without marking capture unusable", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupBooks(books);
     observeBookSnapshots(health);
@@ -154,7 +154,7 @@ describe("capture status fail-closed semantics", () => {
   });
 
   it("produces PARTIAL when a book is RESYNC_REQUIRED", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupBooks(books);
     observeBookSnapshots(health);
@@ -166,7 +166,7 @@ describe("capture status fail-closed semantics", () => {
   });
 
   it("produces PARTIAL when snapshot is from old generation", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupBooks(books, 1);
     observeBookSnapshots(health);
@@ -179,7 +179,7 @@ describe("capture status fail-closed semantics", () => {
   });
 
   it("produces UNUSABLE when fatal error occurred", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupBooks(books);
     observeBookSnapshots(health);
@@ -192,7 +192,7 @@ describe("capture status fail-closed semantics", () => {
   });
 
   it("produces UNUSABLE for empty capture", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     const summary = health.summary(null, NOW + 100, 15_000, 10_000, null);
     expect(summary.usableForReplay).toBe(false);
@@ -200,7 +200,7 @@ describe("capture status fail-closed semantics", () => {
   });
 
   it("produces PARTIAL when reference stream is missing", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupBooks(books);
     observeBookSnapshots(health);
@@ -210,7 +210,7 @@ describe("capture status fail-closed semantics", () => {
   });
 
   it("uses QualityFailure codes not human strings", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     const summary = health.summary(null, NOW + 100, 15_000, 10_000, null);
     for (const failure of summary.qualityFailures) {

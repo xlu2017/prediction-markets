@@ -87,18 +87,17 @@ The in-memory tracker implements a `BookState` machine:
 - Any state -> `SYNCHRONIZED` (via a fresh `book` snapshot from the current generation)
 
 Updates are transactional: all changes in a batch are validated before any mutation. If any change
-fails validation (unknown token, invalid side, negative size, price out of bounds, tick-size
-violation, duplicate price level), the entire batch is rolled back and the book transitions to
-`INVALID`. Recovery requires a new full `book` snapshot from the current connection generation.
-Crossed and locked books are accepted as valid market data — the recorder faithfully captures what
-the feed sends.
+fails validation (unknown token, invalid side, negative size, price out of bounds, duplicate price
+level), the entire batch is rolled back and the book transitions to `INVALID`. Recovery requires a
+new full `book` snapshot from the current connection generation. Crossed and locked books are
+accepted as valid market data — the recorder faithfully captures what the feed sends. Tick size is
+recorded in the manifest for reference but not enforced, as the live feed may send sub-tick prices.
 
-Pre-mutation rejections (unknown token, invalid side, missing fields, tick-size violation, price out
-of bounds) throw before any book backup is created. In this case the prior book state is preserved
-but the event is recorded as malformed, making the overall capture unusable through
-`MALFORMED_EVENTS_PRESENT`. Only failures during mutation (which occur after backups are created)
-transition the book to `INVALID`. This policy ensures that a single malformed batch never silently
-corrupts a previously valid book.
+Pre-mutation rejections (unknown token, invalid side, missing fields, price out of bounds) throw
+before any book backup is created. In this case the prior book state is preserved but the event is
+recorded as malformed, making the overall capture unusable through `MALFORMED_EVENTS_PRESENT`. Only
+failures during mutation (which occur after backups are created) transition the book to `INVALID`.
+This policy ensures that a single malformed batch never silently corrupts a previously valid book.
 
 After a reconnection gap, all books transition to `RESYNC_REQUIRED`. A `book` snapshot from the new
 connection generation is required to restore `SYNCHRONIZED` state. Snapshots from a stale generation
@@ -108,10 +107,9 @@ snapshot.
 
 The projection stores price and size strings exactly, removes zero-size levels, and computes best
 prices with decimal-string comparison rather than floating point. It validates price bounds (0 <
-price < 1), tick-size alignment, and duplicate price levels. It reports best bid, best ask, bid/ask
-level counts, book state, synchronization epoch, snapshot generation, last successful update time,
-and freshness. It is not an execution simulator and does not infer fills, queue position, or
-profitability.
+price < 1) and duplicate price levels. It reports best bid, best ask, bid/ask level counts, book
+state, synchronization epoch, snapshot generation, last successful update time, and freshness. It is
+not an execution simulator and does not infer fills, queue position, or profitability.
 
 ## Reconnection, gaps, and stale streams
 

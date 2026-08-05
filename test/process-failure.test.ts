@@ -84,7 +84,7 @@ function setupComplete(books: OrderBookTracker, health: HealthTracker): void {
 
 describe("process failure forces unusable", () => {
   it("produces COMPLETE when process succeeds and all checks pass", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupComplete(books, health);
     const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1, false);
@@ -94,7 +94,7 @@ describe("process failure forces unusable", () => {
   });
 
   it("produces UNUSABLE when process failed even if all other checks pass", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupComplete(books, health);
     const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1, true);
@@ -104,7 +104,7 @@ describe("process failure forces unusable", () => {
   });
 
   it("includes PROCESS_FAILURE code in quality failures when process failed", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupComplete(books, health);
     const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1, true);
@@ -115,7 +115,7 @@ describe("process failure forces unusable", () => {
 
 describe("reference freshness tracking", () => {
   it("reports referenceFresh=true when reference is recent", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupComplete(books, health);
     const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1, false);
@@ -125,7 +125,7 @@ describe("reference freshness tracking", () => {
   });
 
   it("reports referenceFresh=false and REFERENCE_STREAM_STALE when reference is old", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupComplete(books, health);
     const summary = health.summary(null, NOW + 20_000, 15_000, 10_000, 1, false);
@@ -135,7 +135,7 @@ describe("reference freshness tracking", () => {
   });
 
   it("reports referenceFresh=false when no reference observed", () => {
-    const books = new OrderBookTracker(TOKENS, "0.01");
+    const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     const summary = health.summary(null, NOW, 15_000, 10_000, null, false);
     expect(summary.referenceFresh).toBe(false);

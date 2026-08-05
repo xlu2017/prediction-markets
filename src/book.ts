@@ -1,9 +1,4 @@
-import {
-  compareDecimalStrings,
-  exactWireDecimalString,
-  isDecimalString,
-  isMultipleOfTick,
-} from "./decimal.js";
+import { compareDecimalStrings, exactWireDecimalString } from "./decimal.js";
 import type { BookHealth, BookState } from "./types.js";
 
 type BookSide = Map<string, string>;
@@ -33,33 +28,21 @@ function validatePriceBounds(price: string, label: string): void {
   if (cmpOne >= 0) throw new Error(`${label} price must be < 1, got ${price}`);
 }
 
-function validateTickSize(price: string, tickSize: string, label: string): void {
-  if (tickSize === "0" || !isDecimalString(tickSize)) return;
-  if (!isMultipleOfTick(price, tickSize)) {
-    throw new Error(`${label} price ${price} is not a multiple of tick size ${tickSize}`);
-  }
-}
-
-function validateLevel(
-  rawLevel: unknown,
-  label: string,
-  tickSize: string | null,
-): { price: string; size: string } {
+function validateLevel(rawLevel: unknown, label: string): { price: string; size: string } {
   const level = asRecord(rawLevel);
   if (level === null) throw new Error(`${label} must be an object`);
   const price = exactWireDecimalString(recordValue(level, "price"), `${label} price`);
   const size = exactWireDecimalString(recordValue(level, "size"), `${label} size`);
   if (compareDecimalStrings(size, "0") < 0) throw new Error(`${label} size must not be negative`);
   validatePriceBounds(price, label);
-  if (tickSize !== null) validateTickSize(price, tickSize, label);
   return { price, size };
 }
 
-function buildSide(levels: unknown, label: string, tickSize: string | null): BookSide {
+function buildSide(levels: unknown, label: string): BookSide {
   if (!Array.isArray(levels)) throw new Error(`${label} must be an array`);
   const side: BookSide = new Map();
   for (const rawLevel of levels) {
-    const { price, size } = validateLevel(rawLevel, label, tickSize);
+    const { price, size } = validateLevel(rawLevel, label);
     if (compareDecimalStrings(size, "0") > 0) {
       if (side.has(price)) throw new Error(`${label} has duplicate price level ${price}`);
       side.set(price, size);
@@ -93,10 +76,7 @@ export class OrderBookTracker {
   private readonly books = new Map<string, TokenBook>();
   private currentSynchronizationEpoch = 0;
 
-  public constructor(
-    tokenIds: string[],
-    private readonly tickSize: string | null = null,
-  ) {
+  public constructor(tokenIds: string[]) {
     for (const tokenId of tokenIds) {
       this.books.set(tokenId, {
         state: "UNINITIALIZED",
@@ -138,8 +118,8 @@ export class OrderBookTracker {
     if (typeof tokenId !== "string") throw new Error("Book event is missing asset_id");
     const book = this.books.get(tokenId);
     if (book === undefined) throw new Error(`Unknown token ID in book event: ${tokenId}`);
-    const bids = buildSide(recordValue(record, "bids"), "book bid", this.tickSize);
-    const asks = buildSide(recordValue(record, "asks"), "book ask", this.tickSize);
+    const bids = buildSide(recordValue(record, "bids"), "book bid");
+    const asks = buildSide(recordValue(record, "asks"), "book ask");
     book.bids = bids;
     book.asks = asks;
     book.state = "SYNCHRONIZED";
@@ -199,7 +179,6 @@ export class OrderBookTracker {
       if (compareDecimalStrings(size, "0") < 0)
         throw new Error("Price change size must not be negative");
       validatePriceBounds(price, "price change");
-      if (this.tickSize !== null) validateTickSize(price, this.tickSize, "price change");
       validated.push({ tokenId, side: normalizedSide, price, size, book });
     }
 

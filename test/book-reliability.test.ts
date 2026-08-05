@@ -248,23 +248,22 @@ describe("transactional order-book updates", () => {
     ).toThrow(/duplicate price level/u);
   });
 
-  it("validates tick size when provided", () => {
-    const tracker = new OrderBookTracker(["up"], "0.01");
+  it("accepts sub-tick prices without tick-size enforcement", () => {
+    const tracker = new OrderBookTracker(["up"]);
     tracker.apply(
       { event_type: "book", asset_id: "up", bids: [{ price: ".48", size: "10" }], asks: [] },
       100,
       GEN,
     );
-    expect(() =>
-      tracker.apply(
-        {
-          event_type: "price_change",
-          price_changes: [{ asset_id: "up", side: "BUY", price: ".485", size: "10" }],
-        },
-        110,
-        GEN,
-      ),
-    ).toThrow(/not a multiple of tick size/u);
+    tracker.apply(
+      {
+        event_type: "price_change",
+        price_changes: [{ asset_id: "up", side: "BUY", price: ".485", size: "10" }],
+      },
+      110,
+      GEN,
+    );
+    expect(tracker.snapshot(110, 50).up?.bestBid).toBe(".485");
   });
 });
 

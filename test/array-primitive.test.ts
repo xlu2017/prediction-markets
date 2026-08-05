@@ -23,7 +23,7 @@ class CapturingStore {
 describe("array slicing with primitive elements", () => {
   it("emits a malformed envelope for every array element including primitives", async () => {
     const market = validMarket();
-    const books = new OrderBookTracker([market.upTokenId, market.downTokenId], market.tickSize);
+    const books = new OrderBookTracker([market.upTokenId, market.downTokenId]);
     const health = new HealthTracker(
       "test",
       "2026-08-05T06:02:00.000Z",
