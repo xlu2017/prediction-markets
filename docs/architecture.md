@@ -88,9 +88,10 @@ The in-memory tracker implements a `BookState` machine:
 
 Updates are transactional: all changes in a batch are validated before any mutation. If any change
 fails validation (unknown token, invalid side, negative size, crossed book, price out of bounds,
-tick-size violation, duplicate price level), the entire batch is rolled back and the book
-transitions to `INVALID`. Recovery requires a new full `book` snapshot from the current connection
-generation.
+tick-size violation, duplicate price level, crossed book), the entire batch is rolled back and the
+book transitions to `INVALID`. Recovery requires a new full `book` snapshot from the current
+connection generation. Locked markets (best bid == best ask) are accepted; only truly crossed books
+(best bid > best ask) are rejected.
 
 Pre-mutation rejections (unknown token, invalid side, missing fields, tick-size violation, price out
 of bounds) throw before any book backup is created. In this case the prior book state is preserved

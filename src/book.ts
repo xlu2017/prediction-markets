@@ -88,8 +88,8 @@ function best(side: BookSide, direction: "highest" | "lowest"): string | null {
 function checkNotCrossed(bids: BookSide, asks: BookSide): void {
   const bestBid = best(bids, "highest");
   const bestAsk = best(asks, "lowest");
-  if (bestBid !== null && bestAsk !== null && compareDecimalStrings(bestBid, bestAsk) >= 0) {
-    throw new Error(`Crossed book: best bid ${bestBid} >= best ask ${bestAsk}`);
+  if (bestBid !== null && bestAsk !== null && compareDecimalStrings(bestBid, bestAsk) > 0) {
+    throw new Error(`Crossed book: best bid ${bestBid} > best ask ${bestAsk}`);
   }
 }
 

@@ -271,6 +271,10 @@ export class RecorderEventProcessor {
       this.logger.debug("CLOB frame received", { frameId, rawText: frame.rawText.slice(0, 100) });
     }
 
+    if (frame.rawText.trim() === "") {
+      return;
+    }
+
     if (frame.rawText === "PONG" || frame.rawText === "PING") {
       const envelope = this.sequencer.next({
         source: frame.source,
@@ -360,9 +364,7 @@ export class RecorderEventProcessor {
       throw new Error("CLOB event is missing required market field");
     }
     if (sourceMarketId !== this.market.conditionId) {
-      throw new Error(
-        `CLOB event.market "${sourceMarketId}" does not match conditionId "${this.market.conditionId}"`,
-      );
+      return;
     }
     const sourceTimestamp = timestampFrom(event.timestamp);
     const dedupeKey = this.buildDedupeKey(frame, frameHash, parsed, sourceTimestamp);

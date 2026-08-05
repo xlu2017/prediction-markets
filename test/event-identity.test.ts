@@ -169,7 +169,7 @@ describe("event identity contract", () => {
     expect(reference?.sourceMarketId).toBeNull();
   });
 
-  it("rejects CLOB events whose market does not match the conditionId", async () => {
+  it("silently filters CLOB events whose market does not match the conditionId", async () => {
     const gammaServer = createServer((_request, response) => {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(validRawEvent()));
@@ -250,14 +250,12 @@ describe("event identity contract", () => {
       .split("\n")
       .map((line) => JSON.parse(line) as RawEventEnvelope);
 
+    const clobBookEvents = events.filter(
+      (event) => event.source === "POLYMARKET_CLOB" && event.eventType === "book",
+    );
+    expect(clobBookEvents.length).toBe(0);
+
     const malformed = events.filter((event) => event.eventType === "MALFORMED_EVENT");
-    expect(malformed.length).toBeGreaterThanOrEqual(1);
-    for (const event of malformed) {
-      const payload = event.payload as Record<string, unknown>;
-      expect(String(payload.errorMessage)).toContain("does not match conditionId");
-      expect(payload.errorCode).toBe("MALFORMED_EVENT");
-      const identity = payload.parsedIdentity as Record<string, unknown>;
-      expect(identity.sourceMarketId).toBe("0xWRONGCONDITION");
-    }
+    expect(malformed.length).toBe(0);
   });
 });
