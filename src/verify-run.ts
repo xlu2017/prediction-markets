@@ -63,6 +63,11 @@ function assertOptionalNumber(value: unknown, label: string): number | null {
   return assertNumber(value, label);
 }
 
+function assertOptionalString(value: unknown, label: string): string | null {
+  if (value === null) return null;
+  return assertString(value, label);
+}
+
 function runtimeValidateManifest(raw: unknown): RunManifest {
   const record = raw as Record<string, unknown>;
   if (typeof record !== "object") throw new Error("manifest is not an object");
@@ -109,8 +114,8 @@ function runtimeValidateBookHealth(raw: unknown, tokenId: string): BookHealth {
     record.snapshotConnectionGeneration,
     `book.${tokenId}.snapshotConnectionGeneration`,
   );
-  assertOptionalNumber(record.bestBid, `book.${tokenId}.bestBid`);
-  assertOptionalNumber(record.bestAsk, `book.${tokenId}.bestAsk`);
+  assertOptionalString(record.bestBid, `book.${tokenId}.bestBid`);
+  assertOptionalString(record.bestAsk, `book.${tokenId}.bestAsk`);
   assertNumber(record.bidDepthCount, `book.${tokenId}.bidDepthCount`);
   assertNumber(record.askDepthCount, `book.${tokenId}.askDepthCount`);
   assertOptionalNumber(record.lastSuccessfulUpdateTime, `book.${tokenId}.lastSuccessfulUpdateTime`);
