@@ -4,7 +4,7 @@ export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue
 export type EventSource = "POLYMARKET_CLOB" | "POLYMARKET_MARKET" | "POLYMARKET_REFERENCE_PRICE";
 
 export type MarketSpecification = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   eventId: string;
   marketId: string;
   conditionId: string;
@@ -21,28 +21,39 @@ export type MarketSpecification = {
   active: boolean;
   closed: boolean;
   rawMetadata: JsonValue;
+  rawGammaText: string;
 };
 
 export type RawEventEnvelope = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   runId: string;
   sequence: number;
   source: EventSource;
   eventType: string;
   marketId: string | null;
+  conditionId: string | null;
+  sourceMarketId: string | null;
   tokenId: string | null;
   sourceTimestamp: number | null;
   receivedAt: number;
   processedAt: number;
   connectionGeneration: number | null;
+  frameId: string | null;
+  messageIndex: number | null;
+  messageCount: number | null;
+  isDuplicate: boolean;
+  duplicateOfSequence: number | null;
+  dedupeReason: string | null;
   payload: JsonValue;
   rawText: string | null;
 };
 
 export type CompletionStatus = "COMPLETED" | "FAILED" | "RUNNING";
+export type CaptureStatus = "COMPLETE" | "PARTIAL" | "UNUSABLE";
+export type BookState = "UNINITIALIZED" | "SYNCHRONIZED" | "STALE" | "INVALID";
 
 export type RunManifest = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   runId: string;
   startedAt: string;
   endedAt: string | null;
@@ -54,10 +65,14 @@ export type RunManifest = {
   completionStatus: CompletionStatus;
   finalEventCount: number | null;
   failureReason: string | null;
+  captureStatus: CaptureStatus;
+  usableForReplay: boolean;
+  qualityFailures: string[];
 };
 
 export type BookHealth = {
   tokenId: string;
+  state: BookState;
   bestBid: string | null;
   bestAsk: string | null;
   bidDepthCount: number;
@@ -66,8 +81,13 @@ export type BookHealth = {
   healthy: boolean;
 };
 
+export type OpenGap = {
+  feed: string;
+  startedAt: number;
+};
+
 export type HealthSummary = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   runId: string;
   startedAt: string;
   endedAt: string | null;
@@ -83,6 +103,10 @@ export type HealthSummary = {
   bothTokenStreamsObserved: boolean;
   referencePriceStreamObserved: boolean;
   finalBookHealth: Record<string, BookHealth>;
+  openGapsByFeed: Record<string, OpenGap>;
+  captureStatus: CaptureStatus;
+  usableForReplay: boolean;
+  qualityFailures: string[];
 };
 
 export type LogLevel = "debug" | "error" | "info" | "warn";

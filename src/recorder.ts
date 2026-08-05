@@ -166,7 +166,27 @@ export async function runRecorder(
   );
   const books = new OrderBookTracker([market.upTokenId, market.downTokenId]);
   const health = new HealthTracker(runId, startedAt, [market.upTokenId, market.downTokenId], books);
-  const processor = new RecorderEventProcessor(runId, market, store, books, health, logger, now);
+  const fatalController = new AbortController();
+  const feedsBySource = new Map<string, ManagedWebSocket>();
+  const onValidData = (frame: FeedFrame): void => {
+    const feed = feedsBySource.get(frame.source);
+    feed?.notifyValidDataMessage(frame.receivedAt, frame.connectionGeneration);
+  };
+  const onFatalError = (): void => {
+    logger.error("Fatal processing error detected, stopping feeds");
+    fatalController.abort("fatal processing error");
+  };
+  const processor = new RecorderEventProcessor(
+    runId,
+    market,
+    store,
+    books,
+    health,
+    logger,
+    now,
+    onValidData,
+    onFatalError,
+  );
   const feeds = createFeeds({
     market,
     dependencies,
@@ -174,6 +194,7 @@ export async function runRecorder(
     onFrame: (frame) => processor.enqueueFrame(frame),
     onLifecycle: (event) => processor.enqueueLifecycle(event),
   });
+  for (const feed of feeds) feedsBySource.set(feed.source, feed);
   const staleAfterMs = Math.max(
     dependencies.clobStaleAfterMs ?? 15_000,
     dependencies.referenceStaleAfterMs ?? 10_000,
@@ -188,18 +209,34 @@ export async function runRecorder(
       durationSeconds: options.durationSeconds,
       outputDirectory: store.directory,
     });
-    await waitForDuration(options.durationSeconds * 1_000, options.signal, monotonicNow);
+    const combinedSignal = options.signal;
+    if (combinedSignal !== undefined) {
+      combinedSignal.addEventListener("abort", () => fatalController.abort(combinedSignal.reason), {
+        once: true,
+      });
+    }
+    await waitForDuration(options.durationSeconds * 1_000, fatalController.signal, monotonicNow);
     await Promise.all(feeds.map(async (feed) => feed.stop()));
     const eventCount = await processor.drain();
     const endedAtMs = now();
     const endedAt = new Date(endedAtMs).toISOString();
+    const healthSummary = health.summary(endedAt, endedAtMs, staleAfterMs);
     await store.finalize({
       status: "COMPLETED",
       endedAt,
       finalEventCount: eventCount,
-      health: health.summary(endedAt, endedAtMs, staleAfterMs),
+      health: healthSummary,
+      captureStatus: healthSummary.captureStatus,
+      usableForReplay: healthSummary.usableForReplay,
+      qualityFailures: healthSummary.qualityFailures,
     });
-    logger.info("Recorder completed", { runId, eventCount, outputDirectory: store.directory });
+    logger.info("Recorder completed", {
+      runId,
+      eventCount,
+      outputDirectory: store.directory,
+      captureStatus: healthSummary.captureStatus,
+      usableForReplay: healthSummary.usableForReplay,
+    });
     return { runId, runDirectory: store.directory, eventCount, market };
   } catch (error) {
     await Promise.allSettled(feeds.map(async (feed) => feed.stop()));
@@ -207,12 +244,16 @@ export async function runRecorder(
     const endedAtMs = now();
     const endedAt = new Date(endedAtMs).toISOString();
     const reason = errorMessage(error);
+    const healthSummary = health.summary(endedAt, endedAtMs, staleAfterMs);
     await store
       .finalize({
         status: "FAILED",
         endedAt,
         finalEventCount: processor.count,
-        health: health.summary(endedAt, endedAtMs, staleAfterMs),
+        health: healthSummary,
+        captureStatus: healthSummary.captureStatus,
+        usableForReplay: healthSummary.usableForReplay,
+        qualityFailures: healthSummary.qualityFailures,
         failureReason: reason,
       })
       .catch((finalizationError: unknown) => {

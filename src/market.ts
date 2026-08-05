@@ -71,7 +71,11 @@ function expectedOutcomeIndexes(outcomes: string[]): { up: number; down: number 
   return { up, down };
 }
 
-export function validateBtcFiveMinuteEvent(rawEvent: unknown, nowMs: number): MarketSpecification {
+export function validateBtcFiveMinuteEvent(
+  rawEvent: unknown,
+  nowMs: number,
+  rawGammaText: string = JSON.stringify(rawEvent),
+): MarketSpecification {
   const event = gammaEventSchema.parse(rawEvent);
   if (!event.active || event.closed) throw new Error("Event is not active and open");
 
@@ -144,7 +148,7 @@ export function validateBtcFiveMinuteEvent(rawEvent: unknown, nowMs: number): Ma
     (value): value is string => typeof value === "string" && value.trim() !== "",
   );
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     eventId: String(event.id),
     marketId: String(market.id),
     conditionId: market.conditionId,
@@ -165,5 +169,6 @@ export function validateBtcFiveMinuteEvent(rawEvent: unknown, nowMs: number): Ma
     active: market.active,
     closed: market.closed,
     rawMetadata,
+    rawGammaText,
   };
 }

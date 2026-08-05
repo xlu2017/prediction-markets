@@ -9,5 +9,5 @@ export function validRawEvent(): Record<string, unknown> {
 }
 
 export function validMarket() {
-  return validateBtcFiveMinuteEvent(validRawEvent(), FIXED_NOW);
+  return validateBtcFiveMinuteEvent(validRawEvent(), FIXED_NOW, JSON.stringify(validRawEvent()));
 }

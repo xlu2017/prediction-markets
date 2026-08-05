@@ -38,13 +38,15 @@ describe("run storage", () => {
       sequencer.next({
         source: "POLYMARKET_CLOB",
         eventType: "book",
+        marketId: market.marketId,
+        conditionId: market.conditionId,
         receivedAt: 1,
         processedAt: 2,
         payload: { bids: [{ price: ".48", size: "30" }] },
       }),
     );
     const health: HealthSummary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       runId,
       startedAt: "2026-08-05T06:02:00.000Z",
       endedAt: "2026-08-05T06:02:01.000Z",
@@ -60,12 +62,25 @@ describe("run storage", () => {
       bothTokenStreamsObserved: false,
       referencePriceStreamObserved: false,
       finalBookHealth: {},
+      openGapsByFeed: {},
+      captureStatus: "PARTIAL",
+      usableForReplay: false,
+      qualityFailures: [
+        "Missing token snapshots: 111111, 222222",
+        "Chainlink reference stream not observed",
+      ],
     };
     await store.finalize({
       status: "COMPLETED",
       endedAt: "2026-08-05T06:02:01.000Z",
       finalEventCount: 1,
       health,
+      captureStatus: "PARTIAL",
+      usableForReplay: false,
+      qualityFailures: [
+        "Missing token snapshots: 111111, 222222",
+        "Chainlink reference stream not observed",
+      ],
     });
 
     const eventLines = (await readFile(path.join(store.directory, "events.jsonl"), "utf8"))

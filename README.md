@@ -61,12 +61,16 @@ data/polymarket-runs/<run-id>/
   health.json
 ```
 
-- `manifest.json`: run identity, arguments, Git commit, validated market, status, and final count.
-- `market.json`: versioned normalized market specification plus full raw Gamma metadata.
+- `manifest.json`: run identity, arguments, Git commit, validated market, status, final count,
+  capture status, replay usability, and quality failures.
+- `market.json`: versioned normalized market specification plus full raw Gamma metadata and raw
+  response text.
 - `events.jsonl`: one versioned envelope per complete line with a strictly increasing local sequence
-  number.
-- `health.json`: source/type counts, malformed and duplicate counts, reconnects, gaps, latency
-  maxima, stream-observation flags, and final book-health projections.
+  number, event identity (`conditionId`, `sourceMarketId`, `frameId`, `messageIndex`), and
+  deduplication metadata (`isDuplicate`, `duplicateOfSequence`).
+- `health.json`: source/type counts, malformed and duplicate counts, reconnects, open gaps by feed,
+  latency maxima, stream-observation flags, book-health projections with state machine, capture
+  status, replay usability, and quality failures.
 
 The committed [`fixtures/sample-run`](fixtures/sample-run) directory is a synthetic, deterministic
 saved run used for offline tests. It is not evidence of live market behaviour.

@@ -51,6 +51,7 @@ export class ManagedWebSocket {
   private reconnectAttempt = 0;
   private generation = 0;
   private gapStartedAt: number | null = null;
+  private gapEnded = true;
   private readonly staleDetector: StaleDetector;
   private readonly now: () => number;
   private readonly random: () => number;
@@ -61,6 +62,14 @@ export class ManagedWebSocket {
     this.now = options.now ?? Date.now;
     this.random = options.random ?? Math.random;
     this.createSocket = options.createSocket ?? ((url) => new WebSocket(url));
+  }
+
+  public get source(): EventSource {
+    return this.options.source;
+  }
+
+  public get name(): string {
+    return this.options.name;
   }
 
   public start(): void {
@@ -93,6 +102,18 @@ export class ManagedWebSocket {
     });
   }
 
+  public notifyValidDataMessage(receivedAt: number, connectionGeneration: number): void {
+    this.staleDetector.observe(receivedAt);
+    if (this.gapStartedAt !== null && !this.gapEnded) {
+      this.emitLifecycle("DATA_GAP_ENDED", connectionGeneration, {
+        gapStartedAt: this.gapStartedAt,
+        gapDurationMs: Math.max(0, receivedAt - this.gapStartedAt),
+      });
+      this.gapStartedAt = null;
+      this.gapEnded = true;
+    }
+  }
+
   private connect(): void {
     if (this.stopping) return;
     this.generation += 1;
@@ -112,13 +133,6 @@ export class ManagedWebSocket {
       this.emitLifecycle("SUBSCRIPTION_SENT", currentGeneration, {
         subscription: this.options.subscription,
       });
-      if (this.gapStartedAt !== null) {
-        this.emitLifecycle("DATA_GAP_ENDED", currentGeneration, {
-          gapStartedAt: this.gapStartedAt,
-          gapDurationMs: Math.max(0, openedAt - this.gapStartedAt),
-        });
-        this.gapStartedAt = null;
-      }
       this.startTimers(socket, currentGeneration);
     });
 
@@ -149,6 +163,7 @@ export class ManagedWebSocket {
       if (this.stopping) return;
       if (this.gapStartedAt === null) {
         this.gapStartedAt = closedAt;
+        this.gapEnded = false;
         this.emitLifecycle("DATA_GAP_STARTED", currentGeneration, { gapStartedAt: closedAt });
       }
       const delayMs = reconnectDelayMs(
@@ -183,6 +198,7 @@ export class ManagedWebSocket {
           this.emitLifecycle("STALE_STREAM", generation, {
             staleAfterMs: this.options.staleAfterMs,
           });
+          if (socket.readyState === WebSocket.OPEN) socket.close(1011, "stale stream");
         }
       },
       Math.max(250, Math.floor(this.options.staleAfterMs / 4)),

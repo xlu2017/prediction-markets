@@ -1,8 +1,9 @@
 import { compareDecimalStrings, exactWireDecimalString } from "./decimal.js";
-import type { BookHealth } from "./types.js";
+import type { BookHealth, BookState } from "./types.js";
 
 type BookSide = Map<string, string>;
 type TokenBook = {
+  state: BookState;
   bids: BookSide;
   asks: BookSide;
   lastSuccessfulUpdateTime: number | null;
@@ -18,16 +19,23 @@ function asRecord(value: unknown): Record<string, unknown> | null {
     : null;
 }
 
-function applyLevels(side: BookSide, levels: unknown): void {
-  if (!Array.isArray(levels)) throw new Error("Book levels must be an array");
-  side.clear();
+function validateLevel(rawLevel: unknown, label: string): { price: string; size: string } {
+  const level = asRecord(rawLevel);
+  if (level === null) throw new Error(`${label} must be an object`);
+  const price = exactWireDecimalString(recordValue(level, "price"), `${label} price`);
+  const size = exactWireDecimalString(recordValue(level, "size"), `${label} size`);
+  if (compareDecimalStrings(size, "0") < 0) throw new Error(`${label} size must not be negative`);
+  return { price, size };
+}
+
+function buildSide(levels: unknown, label: string): BookSide {
+  if (!Array.isArray(levels)) throw new Error(`${label} must be an array`);
+  const side: BookSide = new Map();
   for (const rawLevel of levels) {
-    const level = asRecord(rawLevel);
-    if (level === null) throw new Error("Book level must be an object");
-    const price = exactWireDecimalString(recordValue(level, "price"), "book price");
-    const size = exactWireDecimalString(recordValue(level, "size"), "book size");
+    const { price, size } = validateLevel(rawLevel, label);
     if (compareDecimalStrings(size, "0") > 0) side.set(price, size);
   }
+  return side;
 }
 
 function best(side: BookSide, direction: "highest" | "lowest"): string | null {
@@ -47,12 +55,29 @@ function best(side: BookSide, direction: "highest" | "lowest"): string | null {
   return candidate;
 }
 
+function checkNotCrossed(bids: BookSide, asks: BookSide): void {
+  const bestBid = best(bids, "highest");
+  const bestAsk = best(asks, "lowest");
+  if (bestBid !== null && bestAsk !== null && compareDecimalStrings(bestBid, bestAsk) >= 0) {
+    throw new Error(`Crossed book: best bid ${bestBid} >= best ask ${bestAsk}`);
+  }
+}
+
+function cloneSide(side: BookSide): BookSide {
+  return new Map(side);
+}
+
 export class OrderBookTracker {
   private readonly books = new Map<string, TokenBook>();
 
   public constructor(tokenIds: string[]) {
     for (const tokenId of tokenIds) {
-      this.books.set(tokenId, { bids: new Map(), asks: new Map(), lastSuccessfulUpdateTime: null });
+      this.books.set(tokenId, {
+        state: "UNINITIALIZED",
+        bids: new Map(),
+        asks: new Map(),
+        lastSuccessfulUpdateTime: null,
+      });
     }
   }
 
@@ -62,63 +87,144 @@ export class OrderBookTracker {
     const eventType = recordValue(record, "event_type");
     if (typeof eventType !== "string") throw new Error("CLOB event is missing event_type");
 
-    if (eventType === "book") {
-      const tokenId = recordValue(record, "asset_id");
-      if (typeof tokenId !== "string") throw new Error("Book event is missing asset_id");
-      const book = this.books.get(tokenId);
-      if (book === undefined) return [];
-      applyLevels(book.bids, recordValue(record, "bids"));
-      applyLevels(book.asks, recordValue(record, "asks"));
-      book.lastSuccessfulUpdateTime = processedAt;
-      return [tokenId];
-    }
+    if (eventType === "book") return this.applyBook(record, processedAt);
+    if (eventType === "price_change") return this.applyPriceChange(record, processedAt);
+    return this.applyNonBookEvent(record);
+  }
 
-    if (eventType === "price_change") {
-      const changes = recordValue(record, "price_changes");
-      if (!Array.isArray(changes)) throw new Error("price_change event is missing price_changes");
-      const updated = new Set<string>();
-      for (const rawChange of changes) {
-        const change = asRecord(rawChange);
-        if (change === null) throw new Error("Price change must be an object");
-        const tokenId = recordValue(change, "asset_id");
-        const sideName = recordValue(change, "side");
-        if (typeof tokenId !== "string" || typeof sideName !== "string") {
-          throw new Error("Price change is missing asset_id or side");
-        }
-        const book = this.books.get(tokenId);
-        if (book === undefined) continue;
-        const price = exactWireDecimalString(recordValue(change, "price"), "price change price");
-        const size = exactWireDecimalString(recordValue(change, "size"), "price change size");
-        const side = sideName.toUpperCase() === "BUY" ? book.bids : book.asks;
-        if (compareDecimalStrings(size, "0") === 0) side.delete(price);
-        else side.set(price, size);
-        book.lastSuccessfulUpdateTime = processedAt;
-        updated.add(tokenId);
-      }
-      return [...updated];
-    }
-
+  private applyBook(record: Record<string, unknown>, processedAt: number): string[] {
     const tokenId = recordValue(record, "asset_id");
-    if (typeof tokenId === "string" && this.books.has(tokenId)) {
+    if (typeof tokenId !== "string") throw new Error("Book event is missing asset_id");
+    const book = this.books.get(tokenId);
+    if (book === undefined) throw new Error(`Unknown token ID in book event: ${tokenId}`);
+    const bids = buildSide(recordValue(record, "bids"), "book bid");
+    const asks = buildSide(recordValue(record, "asks"), "book ask");
+    checkNotCrossed(bids, asks);
+    book.bids = bids;
+    book.asks = asks;
+    book.state = "SYNCHRONIZED";
+    book.lastSuccessfulUpdateTime = processedAt;
+    return [tokenId];
+  }
+
+  private applyPriceChange(record: Record<string, unknown>, processedAt: number): string[] {
+    const changes = recordValue(record, "price_changes");
+    if (!Array.isArray(changes)) throw new Error("price_change event is missing price_changes");
+    if (changes.length === 0) return [];
+
+    const validated: {
+      tokenId: string;
+      side: "BUY" | "SELL";
+      price: string;
+      size: string;
+      book: TokenBook;
+    }[] = [];
+    const updated = new Set<string>();
+
+    for (const rawChange of changes) {
+      const change = asRecord(rawChange);
+      if (change === null) throw new Error("Price change must be an object");
+      const tokenId = recordValue(change, "asset_id");
+      const sideName = recordValue(change, "side");
+      if (typeof tokenId !== "string") throw new Error("Price change is missing asset_id");
+      if (typeof sideName !== "string") throw new Error("Price change is missing side");
+      const normalizedSide = sideName.toUpperCase();
+      if (normalizedSide !== "BUY" && normalizedSide !== "SELL") {
+        throw new Error(`Invalid side "${sideName}"; only BUY and SELL are accepted`);
+      }
       const book = this.books.get(tokenId);
-      if (book !== undefined) book.lastSuccessfulUpdateTime = processedAt;
-      return [tokenId];
+      if (book === undefined) throw new Error(`Unknown token ID in price_change: ${tokenId}`);
+      if (book.state === "UNINITIALIZED") {
+        throw new Error(
+          `Cannot apply price_change before initial book snapshot for token ${tokenId}`,
+        );
+      }
+      if (book.state === "INVALID") {
+        throw new Error(`Cannot apply price_change to invalid book for token ${tokenId}`);
+      }
+      const price = exactWireDecimalString(recordValue(change, "price"), "price change price");
+      const size = exactWireDecimalString(recordValue(change, "size"), "price change size");
+      if (compareDecimalStrings(size, "0") < 0)
+        throw new Error("Price change size must not be negative");
+      validated.push({
+        tokenId,
+        side: normalizedSide,
+        price,
+        size,
+        book,
+      });
     }
+
+    const backups = new Map<TokenBook, { bids: BookSide; asks: BookSide; state: BookState }>();
+    for (const entry of validated) {
+      if (!backups.has(entry.book)) {
+        backups.set(entry.book, {
+          bids: cloneSide(entry.book.bids),
+          asks: cloneSide(entry.book.asks),
+          state: entry.book.state,
+        });
+      }
+    }
+
+    try {
+      for (const entry of validated) {
+        const side = entry.side === "BUY" ? entry.book.bids : entry.book.asks;
+        if (compareDecimalStrings(entry.size, "0") === 0) side.delete(entry.price);
+        else side.set(entry.price, entry.size);
+        entry.book.lastSuccessfulUpdateTime = processedAt;
+        entry.book.state = "SYNCHRONIZED";
+        updated.add(entry.tokenId);
+      }
+      for (const entry of validated) {
+        checkNotCrossed(entry.book.bids, entry.book.asks);
+      }
+    } catch (error) {
+      for (const [book, backup] of backups) {
+        book.bids = backup.bids;
+        book.asks = backup.asks;
+        book.state = "INVALID";
+        book.lastSuccessfulUpdateTime = null;
+      }
+      throw error;
+    }
+    return [...updated];
+  }
+
+  private applyNonBookEvent(record: Record<string, unknown>): string[] {
+    const tokenId = recordValue(record, "asset_id");
+    if (typeof tokenId === "string" && this.books.has(tokenId)) return [tokenId];
     return [];
+  }
+
+  public markStale(nowMs: number, staleAfterMs: number): void {
+    for (const book of this.books.values()) {
+      if (
+        book.state === "SYNCHRONIZED" &&
+        book.lastSuccessfulUpdateTime !== null &&
+        nowMs - book.lastSuccessfulUpdateTime > staleAfterMs
+      ) {
+        book.state = "STALE";
+      }
+    }
   }
 
   public snapshot(nowMs: number, staleAfterMs: number): Record<string, BookHealth> {
     const result: Record<string, BookHealth> = {};
     for (const [tokenId, book] of this.books) {
       const lastUpdate = book.lastSuccessfulUpdateTime;
+      let state = book.state;
+      if (state === "SYNCHRONIZED" && lastUpdate !== null && nowMs - lastUpdate > staleAfterMs) {
+        state = "STALE";
+      }
       result[tokenId] = {
         tokenId,
+        state,
         bestBid: best(book.bids, "highest"),
         bestAsk: best(book.asks, "lowest"),
         bidDepthCount: book.bids.size,
         askDepthCount: book.asks.size,
         lastSuccessfulUpdateTime: lastUpdate,
-        healthy: lastUpdate !== null && nowMs - lastUpdate <= staleAfterMs,
+        healthy: state === "SYNCHRONIZED",
       };
     }
     return result;
