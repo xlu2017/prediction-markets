@@ -81,7 +81,7 @@ export class RunStore {
 
   public static async initialize(outputBase: string, manifest: RunManifest): Promise<RunStore> {
     const directory = path.resolve(outputBase, manifest.runId);
-    await mkdir(directory, { recursive: false });
+    await mkdir(directory, { recursive: true });
     const eventsFile = await open(path.join(directory, "events.jsonl"), "wx");
     const store = new RunStore(directory, manifest, eventsFile);
     await atomicJson(path.join(directory, "market.json"), {

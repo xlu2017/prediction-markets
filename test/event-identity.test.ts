@@ -139,11 +139,6 @@ describe("event identity contract", () => {
       .split("\n")
       .map((line) => JSON.parse(line) as RawEventEnvelope);
 
-    console.error(
-      "[DEBUG-IDENTITY] events:",
-      events.map((e) => `${e.sequence}:${e.source}:${e.eventType}:${e.isDuplicate}`),
-    );
-
     const metadata = events.find((event) => event.eventType === "MARKET_DISCOVERED");
     const clobBook = events.find(
       (event) => event.source === "POLYMARKET_CLOB" && event.eventType === "book",
