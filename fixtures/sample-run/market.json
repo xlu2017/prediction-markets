@@ -1,0 +1,27 @@
+{
+  "schemaVersion": 1,
+  "market": {
+    "schemaVersion": 1,
+    "eventId": "event-100",
+    "marketId": "market-200",
+    "conditionId": "0xcondition",
+    "slug": "btc-updown-5m-1785909600",
+    "question": "Bitcoin Up or Down - August 5, 6:00AM-6:05AM ET",
+    "opensAt": "2026-08-05T06:00:00.000Z",
+    "closesAt": "2026-08-05T06:05:00.000Z",
+    "resolutionSource": "https://data.chain.link/streams/btc-usd",
+    "referenceSymbol": "btc/usd",
+    "referenceTopic": "crypto_prices_chainlink",
+    "upTokenId": "111111",
+    "downTokenId": "222222",
+    "tickSize": "0.01",
+    "active": true,
+    "closed": false,
+    "rawMetadata": {
+      "id": "event-100",
+      "slug": "btc-updown-5m-1785909600",
+      "active": true,
+      "closed": false
+    }
+  }
+}

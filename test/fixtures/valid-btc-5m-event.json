@@ -1,0 +1,28 @@
+{
+  "id": "event-100",
+  "slug": "btc-updown-5m-1785909600",
+  "title": "Bitcoin Up or Down - August 5, 6:00AM-6:05AM ET",
+  "description": "This market resolves using the Chainlink BTC/USD data stream. It is Up when the ending value is at least the starting value, and Down otherwise.",
+  "resolutionSource": "https://data.chain.link/streams/btc-usd",
+  "startDate": "2026-08-05T06:00:00.000Z",
+  "endDate": "2026-08-05T06:05:00.000Z",
+  "active": true,
+  "closed": false,
+  "markets": [
+    {
+      "id": "market-200",
+      "conditionId": "0xcondition",
+      "slug": "btc-updown-5m-1785909600",
+      "question": "Bitcoin Up or Down - August 5, 6:00AM-6:05AM ET",
+      "description": "Resolution uses the Chainlink BTC/USD reference stream.",
+      "resolutionSource": "https://data.chain.link/streams/btc-usd",
+      "startDate": "2026-08-05T06:00:00.000Z",
+      "endDate": "2026-08-05T06:05:00.000Z",
+      "active": true,
+      "closed": false,
+      "outcomes": "[\"Up\",\"Down\"]",
+      "clobTokenIds": "[\"111111\",\"222222\"]",
+      "orderPriceMinTickSize": 0.01
+    }
+  ]
+}

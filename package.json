@@ -1,0 +1,39 @@
+{
+  "name": "polymarket-btc-5m-recorder",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Strictly read-only recorder for Polymarket BTC five-minute market research data.",
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "packageManager": "pnpm@10.17.1",
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "ci": "pnpm read-only:check && pnpm format:check && pnpm lint && pnpm typecheck && pnpm test",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "lint": "eslint . --max-warnings 0",
+    "market:record": "tsx src/cli.ts",
+    "read-only:check": "node scripts/assert-read-only.mjs",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "commander": "15.0.0",
+    "ws": "8.21.2",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/node": "26.1.2",
+    "@types/ws": "8.18.1",
+    "eslint": "10.8.0",
+    "prettier": "3.9.6",
+    "tsx": "4.23.7",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.66.0",
+    "vitest": "4.1.10"
+  }
+}

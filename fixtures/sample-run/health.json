@@ -1,0 +1,45 @@
+{
+  "schemaVersion": 1,
+  "runId": "fixture-run-001",
+  "startedAt": "2026-08-05T06:02:00.000Z",
+  "endedAt": "2026-08-05T06:02:01.000Z",
+  "totalEventsReceived": 4,
+  "eventCountsBySource": {
+    "POLYMARKET_MARKET": 1,
+    "POLYMARKET_CLOB": 2,
+    "POLYMARKET_REFERENCE_PRICE": 1
+  },
+  "eventCountsByType": {
+    "POLYMARKET_MARKET:MARKET_DISCOVERED": 1,
+    "POLYMARKET_CLOB:book": 2,
+    "POLYMARKET_REFERENCE_PRICE:REFERENCE_PRICE": 1
+  },
+  "malformedEventCount": 0,
+  "duplicateEventCount": 0,
+  "reconnectCount": 0,
+  "maximumSourceToReceiveLatencyMs": 5,
+  "maximumReceiveToProcessLatencyMs": 1,
+  "staleFeedIncidents": 0,
+  "bothTokenStreamsObserved": true,
+  "referencePriceStreamObserved": true,
+  "finalBookHealth": {
+    "111111": {
+      "tokenId": "111111",
+      "bestBid": ".48",
+      "bestAsk": ".52",
+      "bidDepthCount": 1,
+      "askDepthCount": 1,
+      "lastSuccessfulUpdateTime": 1785909720106,
+      "healthy": true
+    },
+    "222222": {
+      "tokenId": "222222",
+      "bestBid": ".47",
+      "bestAsk": ".53",
+      "bidDepthCount": 1,
+      "askDepthCount": 1,
+      "lastSuccessfulUpdateTime": 1785909720116,
+      "healthy": true
+    }
+  }
+}

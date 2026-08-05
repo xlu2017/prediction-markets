@@ -1,0 +1,32 @@
+name: Read-only public smoke test
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  record:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.17.1
+          run_install: false
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm read-only:check
+      - run: pnpm market:record --duration-seconds 30
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: polymarket-read-only-smoke-run
+          path: data/polymarket-runs/
+          if-no-files-found: warn
+          retention-days: 7
