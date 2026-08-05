@@ -102,8 +102,8 @@ export class ManagedWebSocket {
     });
   }
 
-  public notifyValidDataMessage(receivedAt: number, connectionGeneration: number): void {
-    if (connectionGeneration !== this.generation) return;
+  public notifyValidDataMessage(receivedAt: number, connectionGeneration: number): boolean {
+    if (connectionGeneration !== this.generation) return false;
     this.staleDetector.observe(receivedAt);
     if (this.gapStartedAt !== null && !this.gapEnded) {
       this.emitLifecycle("DATA_GAP_ENDED", connectionGeneration, {
@@ -113,6 +113,7 @@ export class ManagedWebSocket {
       this.gapStartedAt = null;
       this.gapEnded = true;
     }
+    return true;
   }
 
   private connect(): void {

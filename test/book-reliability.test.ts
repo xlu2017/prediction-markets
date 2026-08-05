@@ -265,6 +265,66 @@ describe("transactional order-book updates", () => {
     );
     expect(tracker.snapshot(110, 50).up?.bestBid).toBe(".485");
   });
+
+  it("reports NORMAL integrity when best bid < best ask", () => {
+    const tracker = new OrderBookTracker(["up"]);
+    tracker.apply(
+      {
+        event_type: "book",
+        asset_id: "up",
+        bids: [{ price: ".48", size: "10" }],
+        asks: [{ price: ".52", size: "5" }],
+      },
+      100,
+      GEN,
+    );
+    expect(tracker.snapshot(100, 50).up?.integrity).toBe("NORMAL");
+  });
+
+  it("reports LOCKED integrity when best bid == best ask", () => {
+    const tracker = new OrderBookTracker(["up"]);
+    tracker.apply(
+      {
+        event_type: "book",
+        asset_id: "up",
+        bids: [{ price: ".50", size: "10" }],
+        asks: [{ price: ".50", size: "5" }],
+      },
+      100,
+      GEN,
+    );
+    expect(tracker.snapshot(100, 50).up?.integrity).toBe("LOCKED");
+  });
+
+  it("reports CROSSED integrity when best bid > best ask", () => {
+    const tracker = new OrderBookTracker(["up"]);
+    tracker.apply(
+      {
+        event_type: "book",
+        asset_id: "up",
+        bids: [{ price: ".55", size: "10" }],
+        asks: [{ price: ".45", size: "5" }],
+      },
+      100,
+      GEN,
+    );
+    expect(tracker.snapshot(100, 50).up?.integrity).toBe("CROSSED");
+  });
+
+  it("reports NORMAL integrity when one side is empty", () => {
+    const tracker = new OrderBookTracker(["up"]);
+    tracker.apply(
+      {
+        event_type: "book",
+        asset_id: "up",
+        bids: [{ price: ".48", size: "10" }],
+        asks: [],
+      },
+      100,
+      GEN,
+    );
+    expect(tracker.snapshot(100, 50).up?.integrity).toBe("NORMAL");
+  });
 });
 
 describe("synchronization epoch and RESYNC_REQUIRED", () => {

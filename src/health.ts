@@ -37,9 +37,14 @@ export class HealthTracker {
   private referenceObserved = false;
   private lastReferenceReceivedAt: number | null = null;
   private lastReferenceConnectionGeneration: number | null = null;
+  private lastReferenceSourceTimestamp: number | null = null;
   private fatalError = false;
   private maxSourceLatency: number | null = null;
   private maxProcessingLatency: number | null = null;
+  private dataGapCount = 0;
+  private closedGapCount = 0;
+  private totalGapDurationMs = 0;
+  private maximumGapDurationMs = 0;
 
   public constructor(
     private readonly runId: string,
@@ -76,12 +81,16 @@ export class HealthTracker {
     }
     if (
       envelope.source === "POLYMARKET_REFERENCE_PRICE" &&
-      envelope.eventType === "REFERENCE_PRICE"
+      envelope.eventType === "REFERENCE_PRICE" &&
+      !envelope.isDuplicate
     ) {
       this.referenceObserved = true;
       this.lastReferenceReceivedAt = envelope.receivedAt;
       if (envelope.connectionGeneration !== null) {
         this.lastReferenceConnectionGeneration = envelope.connectionGeneration;
+      }
+      if (envelope.sourceTimestamp !== null) {
+        this.lastReferenceSourceTimestamp = envelope.sourceTimestamp;
       }
     }
     if (envelope.eventType === "DATA_GAP_STARTED") {
@@ -91,11 +100,21 @@ export class HealthTracker {
           feed,
           startedAt: envelope.receivedAt,
         });
+        this.dataGapCount += 1;
       }
     }
     if (envelope.eventType === "DATA_GAP_ENDED") {
       const feed = feedFromEnvelope(envelope);
-      if (feed !== null) this.openGaps.delete(feed);
+      if (feed !== null) {
+        const openGap = this.openGaps.get(feed);
+        if (openGap !== undefined) {
+          const duration = Math.max(0, envelope.receivedAt - openGap.startedAt);
+          this.totalGapDurationMs += duration;
+          if (duration > this.maximumGapDurationMs) this.maximumGapDurationMs = duration;
+          this.closedGapCount += 1;
+        }
+        this.openGaps.delete(feed);
+      }
     }
   }
 
@@ -186,6 +205,13 @@ export class HealthTracker {
       }
     }
 
+    if (this.closedGapCount > 0) {
+      failures.push({
+        code: "CLOSED_DATA_GAP",
+        message: `${this.closedGapCount} data gap(s) occurred during the run (total ${this.totalGapDurationMs}ms)`,
+      });
+    }
+
     if (this.malformed > 0) {
       failures.push({
         code: "MALFORMED_EVENTS_PRESENT",
@@ -234,6 +260,13 @@ export class HealthTracker {
           tokenId,
         });
       }
+      if (health.integrity === "CROSSED") {
+        failures.push({
+          code: "BOOK_CROSSED",
+          message: `Book for token ${tokenId} is crossed: best bid ${health.bestBid} > best ask ${health.bestAsk}`,
+          tokenId,
+        });
+      }
     }
 
     const usable = failures.length === 0;
@@ -264,10 +297,14 @@ export class HealthTracker {
     for (const [feed, gap] of this.openGaps) openGapsRecord[feed] = gap;
     const finalReferenceAgeMs =
       this.lastReferenceReceivedAt !== null ? nowMs - this.lastReferenceReceivedAt : null;
+    const finalReferenceSourceAgeMs =
+      this.lastReferenceSourceTimestamp !== null ? nowMs - this.lastReferenceSourceTimestamp : null;
     const referenceFresh =
       this.referenceObserved &&
       finalReferenceAgeMs !== null &&
-      finalReferenceAgeMs <= referenceStaleAfterMs;
+      finalReferenceAgeMs <= referenceStaleAfterMs &&
+      finalReferenceSourceAgeMs !== null &&
+      finalReferenceSourceAgeMs <= referenceStaleAfterMs;
     return {
       schemaVersion: 2,
       runId: this.runId,
@@ -288,6 +325,10 @@ export class HealthTracker {
       referencePriceStreamObserved: this.referenceObserved,
       finalBookHealth: bookHealth,
       openGapsByFeed: openGapsRecord,
+      dataGapCount: this.dataGapCount,
+      closedGapCount: this.closedGapCount,
+      totalGapDurationMs: this.totalGapDurationMs,
+      maximumGapDurationMs: this.maximumGapDurationMs,
       captureStatus: capture.status,
       usableForReplay: capture.usable,
       qualityFailures: capture.failures,
@@ -295,7 +336,9 @@ export class HealthTracker {
       referenceStaleAfterMs,
       lastReferenceReceivedAt: this.lastReferenceReceivedAt,
       lastReferenceConnectionGeneration: this.lastReferenceConnectionGeneration,
+      lastReferenceSourceTimestamp: this.lastReferenceSourceTimestamp,
       finalReferenceAgeMs,
+      finalReferenceSourceAgeMs,
       referenceFresh,
     };
   }

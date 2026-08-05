@@ -78,6 +78,7 @@ function setupComplete(books: OrderBookTracker, health: HealthTracker): void {
       eventType: "REFERENCE_PRICE",
       sequence: 3,
       receivedAt: NOW,
+      sourceTimestamp: NOW,
     }),
   );
 }
@@ -141,5 +142,34 @@ describe("reference freshness tracking", () => {
     expect(summary.referenceFresh).toBe(false);
     expect(summary.lastReferenceReceivedAt).toBeNull();
     expect(summary.finalReferenceAgeMs).toBeNull();
+  });
+
+  it("reports referenceFresh=false when source timestamp is old even if receipt is recent", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
+    setupComplete(books, health);
+    const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1, false);
+    expect(summary.lastReferenceSourceTimestamp).toBe(NOW);
+    expect(summary.finalReferenceSourceAgeMs).toBe(100);
+  });
+
+  it("does not update reference freshness on duplicate observations", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
+    setupComplete(books, health);
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 10,
+        receivedAt: NOW + 50_000,
+        sourceTimestamp: NOW + 50_000,
+        isDuplicate: true,
+      }),
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1, false);
+    expect(summary.lastReferenceReceivedAt).toBe(NOW);
+    expect(summary.lastReferenceSourceTimestamp).toBe(NOW);
+    expect(summary.referenceFresh).toBe(true);
   });
 });

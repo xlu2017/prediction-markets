@@ -272,6 +272,24 @@ export class RecorderEventProcessor {
     }
 
     if (frame.rawText.trim() === "") {
+      const envelope = this.sequencer.next({
+        source: frame.source,
+        eventType: "EMPTY_FRAME",
+        marketId: this.market.marketId,
+        conditionId: this.market.conditionId,
+        receivedAt: frame.receivedAt,
+        processedAt: this.now(),
+        connectionGeneration: frame.connectionGeneration,
+        frameId,
+        messageIndex: 0,
+        messageCount: 1,
+        dedupeState: "RECEIVED_NOT_APPLIED",
+        payload: { value: frame.rawText },
+        rawText: frame.rawText,
+        rawMessageText: frame.rawText,
+      });
+      await this.store.append(envelope);
+      this.health.observe(envelope);
       return;
     }
 
@@ -364,6 +382,28 @@ export class RecorderEventProcessor {
       throw new Error("CLOB event is missing required market field");
     }
     if (sourceMarketId !== this.market.conditionId) {
+      const envelope = this.sequencer.next({
+        source: frame.source,
+        eventType: "IGNORED_FOREIGN_MARKET",
+        marketId: this.market.marketId,
+        conditionId: this.market.conditionId,
+        sourceMarketId,
+        tokenId: null,
+        observedTokenIds: clobTokenIds(event).length > 0 ? clobTokenIds(event) : null,
+        sourceTimestamp: timestampFrom(event.timestamp),
+        receivedAt: frame.receivedAt,
+        processedAt: this.now(),
+        connectionGeneration: frame.connectionGeneration,
+        frameId,
+        messageIndex: parsed.messageIndex,
+        messageCount,
+        dedupeState: "RECEIVED_NOT_APPLIED",
+        payload: event,
+        rawText: frame.rawText,
+        rawMessageText: parsed.rawMessageText,
+      });
+      await this.store.append(envelope);
+      this.health.observe(envelope);
       return;
     }
     const sourceTimestamp = timestampFrom(event.timestamp);

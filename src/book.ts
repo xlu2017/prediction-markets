@@ -1,5 +1,5 @@
 import { compareDecimalStrings, exactWireDecimalString } from "./decimal.js";
-import type { BookHealth, BookState } from "./types.js";
+import type { BookHealth, BookIntegrity, BookState } from "./types.js";
 
 type BookSide = Map<string, string>;
 type TokenBook = {
@@ -70,6 +70,16 @@ function best(side: BookSide, direction: "highest" | "lowest"): string | null {
 
 function cloneSide(side: BookSide): BookSide {
   return new Map(side);
+}
+
+function computeIntegrity(bids: BookSide, asks: BookSide): BookIntegrity {
+  const bestBid = best(bids, "highest");
+  const bestAsk = best(asks, "lowest");
+  if (bestBid === null || bestAsk === null) return "NORMAL";
+  const cmp = compareDecimalStrings(bestBid, bestAsk);
+  if (cmp > 0) return "CROSSED";
+  if (cmp === 0) return "LOCKED";
+  return "NORMAL";
 }
 
 export class OrderBookTracker {
@@ -243,6 +253,7 @@ export class OrderBookTracker {
       result[tokenId] = {
         tokenId,
         state,
+        integrity: computeIntegrity(book.bids, book.asks),
         synchronizationEpoch: book.synchronizationEpoch,
         snapshotConnectionGeneration: book.snapshotConnectionGeneration,
         bestBid: best(book.bids, "highest"),

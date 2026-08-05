@@ -65,6 +65,10 @@ describe("run storage", () => {
       referencePriceStreamObserved: false,
       finalBookHealth: {},
       openGapsByFeed: {},
+      dataGapCount: 0,
+      closedGapCount: 0,
+      totalGapDurationMs: 0,
+      maximumGapDurationMs: 0,
       captureStatus: "PARTIAL",
       usableForReplay: false,
       qualityFailures: [
@@ -84,7 +88,9 @@ describe("run storage", () => {
       referenceStaleAfterMs: 10_000,
       lastReferenceReceivedAt: null,
       lastReferenceConnectionGeneration: null,
+      lastReferenceSourceTimestamp: null,
       finalReferenceAgeMs: null,
+      finalReferenceSourceAgeMs: null,
       referenceFresh: false,
     };
     await store.finalize({

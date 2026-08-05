@@ -89,9 +89,16 @@ The in-memory tracker implements a `BookState` machine:
 Updates are transactional: all changes in a batch are validated before any mutation. If any change
 fails validation (unknown token, invalid side, negative size, price out of bounds, duplicate price
 level), the entire batch is rolled back and the book transitions to `INVALID`. Recovery requires a
-new full `book` snapshot from the current connection generation. Crossed and locked books are
-accepted as valid market data — the recorder faithfully captures what the feed sends. Tick size is
-recorded in the manifest for reference but not enforced, as the live feed may send sub-tick prices.
+new full `book` snapshot from the current connection generation. Source prices are always recorded
+exactly as received — the recorder faithfully captures what the feed sends. Tick size is recorded in
+the manifest for reference but not enforced, as the live feed may send sub-tick prices; tick
+enforcement is deferred to later execution logic.
+
+The projection classifies each book's integrity as `NORMAL` (best bid < best ask), `LOCKED` (best
+bid == best ask), or `CROSSED` (best bid > best ask). Locked and crossed states are preserved as
+valid market data, but a `CROSSED` projection triggers a `BOOK_CROSSED` quality failure that
+prevents `usableForReplay` for execution-quality replay. This separates raw event capture (which
+must be faithful) from executable book health (which must be sound).
 
 Pre-mutation rejections (unknown token, invalid side, missing fields, price out of bounds) throw
 before any book backup is created. In this case the prior book state is preserved but the event is
@@ -108,8 +115,9 @@ snapshot.
 The projection stores price and size strings exactly, removes zero-size levels, and computes best
 prices with decimal-string comparison rather than floating point. It validates price bounds (0 <
 price < 1) and duplicate price levels. It reports best bid, best ask, bid/ask level counts, book
-state, synchronization epoch, snapshot generation, last successful update time, and freshness. It is
-not an execution simulator and does not infer fills, queue position, or profitability.
+state, integrity, synchronization epoch, snapshot generation, last successful update time, and
+freshness. It is not an execution simulator and does not infer fills, queue position, or
+profitability.
 
 ## Reconnection, gaps, and stale streams
 
@@ -119,14 +127,33 @@ when the first valid subscribed data message arrives on the current generation, 
 `DATA_GAP_ENDED` with duration. An open-but-silent socket does not close a gap. Valid data messages
 from an old connection generation are ignored for gap-ending purposes.
 
+Gap history is tracked cumulatively: `dataGapCount` counts all gaps that started during the run,
+`closedGapCount` counts gaps that ended, `totalGapDurationMs` sums their durations, and
+`maximumGapDurationMs` tracks the longest gap. Any closed gap produces a `CLOSED_DATA_GAP` quality
+failure, preventing `COMPLETE` status even if the run later resynchronizes. This ensures a run that
+missed events cannot silently become `COMPLETE` after reconnecting.
+
 Staleness checking uses feed-specific thresholds: `clobStaleAfterMs` for the CLOB feed and
 `referenceStaleAfterMs` for the RTDS feed. Freshness is refreshed only by `notifyValidDataMessage`,
 which is called after successful processing, not by raw WebSocket message arrival. This prevents
-non-data frames (e.g., PING/PONG) from masking a silent data stream.
+non-data frames (e.g., PING/PONG) from masking a silent data stream. `notifyValidDataMessage`
+returns a boolean indicating whether the generation was still active; the recorder only updates its
+current CLOB generation when it returns `true`, preventing stale callbacks from overwriting the
+active generation.
+
+Reference (Chainlink) freshness requires both a recent receipt time and a recent canonical source
+timestamp. `lastReferenceReceivedAt` tracks when the last non-duplicate observation was received,
+and `lastReferenceSourceTimestamp` tracks the Chainlink payload timestamp. `referenceFresh` is true
+only when both ages are within `referenceStaleAfterMs`. Duplicate observations do not update
+freshness, preventing an old value retransmitted on a new connection from appearing fresh.
 
 If no valid data arrives within the feed-specific threshold, the feed emits a `STALE_STREAM`
 incident, closes the socket, and schedules a reconnect. Open gaps are tracked in `health.json` under
 `openGapsByFeed`.
+
+Frames that are whitespace-only or belong to a different market condition are recorded as
+`EMPTY_FRAME` and `IGNORED_FOREIGN_MARKET` events respectively, preserving their exact wire content
+for audit purposes. They do not count as malformed and do not refresh feed freshness.
 
 Reconnect scheduling, errors, opens, closes, subscription messages, and stale incidents are all
 recorded.
@@ -135,18 +162,20 @@ recorded.
 
 `health.json` reports a `captureStatus` of `COMPLETE`, `PARTIAL`, or `UNUSABLE` based on:
 
-- `COMPLETE`: both token streams observed, reference stream observed, no open gaps, no malformed
-  events, no stale incidents, all books `SYNCHRONIZED` with current-generation snapshots, no fatal
-  errors.
+- `COMPLETE`: both token streams observed, reference stream observed and fresh, no open or closed
+  gaps, no malformed events, no stale incidents, all books `SYNCHRONIZED` with current-generation
+  snapshots and non-crossed integrity, no fatal errors.
 - `PARTIAL`: at least one quality issue detected (malformed events, stale books, invalid books,
-  resync-required books, stale-generation snapshots, missing reference stream, open gaps).
-- `UNUSABLE`: fatal processor error, or no events captured at all.
+  resync-required books, stale-generation snapshots, missing or stale reference stream, open or
+  closed gaps, crossed books).
+- `UNUSABLE`: fatal processor error, process failure, or no events captured at all.
 
 `usableForReplay` is true only when `captureStatus` is `COMPLETE`. `qualityFailures` lists specific
 `QualityFailure` objects with machine-readable `code` and human-readable `message` fields. Codes
 include `MALFORMED_EVENTS_PRESENT`, `BOOK_STALE`, `BOOK_INVALID`, `BOOK_RESYNC_REQUIRED`,
-`BOOK_SNAPSHOT_STALE_GENERATION`, `REFERENCE_STREAM_MISSING`, `OPEN_GAPS`, `STALE_INCIDENTS`,
-`FATAL_PROCESSOR_ERROR`, and `NO_EVENTS_CAPTURED`.
+`BOOK_SNAPSHOT_STALE_GENERATION`, `BOOK_CROSSED`, `REFERENCE_STREAM_MISSING`,
+`REFERENCE_STREAM_STALE`, `OPEN_DATA_GAP`, `CLOSED_DATA_GAP`, `FATAL_PROCESSOR_ERROR`, and
+`PROCESS_FAILURE`.
 
 ## Secret boundary
 

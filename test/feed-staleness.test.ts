@@ -151,6 +151,7 @@ describe("feed-specific staleness thresholds", () => {
         eventType: "REFERENCE_PRICE",
         sequence: 3,
         receivedAt: NOW + 9_000,
+        sourceTimestamp: NOW + 9_000,
       }),
     );
     const clobStale = 20_000;

@@ -182,10 +182,10 @@ export async function runRecorder(
   const onValidData = (frame: FeedFrame): void => {
     const feed = feedsBySource.get(frame.source);
     if (feed === undefined) return;
-    if (frame.source === "POLYMARKET_CLOB") {
+    const accepted = feed.notifyValidDataMessage(frame.receivedAt, frame.connectionGeneration);
+    if (accepted && frame.source === "POLYMARKET_CLOB") {
       currentClobGeneration = frame.connectionGeneration;
     }
-    feed.notifyValidDataMessage(frame.receivedAt, frame.connectionGeneration);
   };
   const onClobGap = (): void => {
     currentClobGeneration = null;

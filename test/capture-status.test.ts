@@ -72,6 +72,7 @@ function observeReference(health: HealthTracker): void {
       source: "POLYMARKET_REFERENCE_PRICE",
       eventType: "REFERENCE_PRICE",
       sequence: 1,
+      sourceTimestamp: NOW,
     }),
   );
 }
@@ -135,7 +136,7 @@ describe("capture status fail-closed semantics", () => {
     expect(summary.qualityFailures.some((f) => f.code === "BOOK_STALE")).toBe(true);
   });
 
-  it("accepts crossed books without marking capture unusable", () => {
+  it("marks crossed books as PARTIAL with BOOK_CROSSED failure", () => {
     const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupBooks(books);
@@ -151,6 +152,29 @@ describe("capture status fail-closed semantics", () => {
     );
     const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1);
     expect(summary.finalBookHealth["111111"]?.state).toBe("SYNCHRONIZED");
+    expect(summary.finalBookHealth["111111"]?.integrity).toBe("CROSSED");
+    expect(summary.usableForReplay).toBe(false);
+    expect(summary.captureStatus).toBe("PARTIAL");
+    expect(summary.qualityFailures.some((f) => f.code === "BOOK_CROSSED")).toBe(true);
+  });
+
+  it("marks locked books as NORMAL integrity and usable", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
+    setupBooks(books);
+    observeBookSnapshots(health);
+    observeReference(health);
+    books.apply(
+      {
+        event_type: "price_change",
+        price_changes: [{ asset_id: "111111", side: "SELL", price: ".48", size: "5" }],
+      },
+      NOW + 10,
+      1,
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1);
+    expect(summary.finalBookHealth["111111"]?.integrity).toBe("LOCKED");
+    expect(summary.usableForReplay).toBe(true);
   });
 
   it("produces PARTIAL when a book is RESYNC_REQUIRED", () => {

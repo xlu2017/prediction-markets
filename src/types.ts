@@ -58,6 +58,7 @@ export type RawEventEnvelope = {
 export type CompletionStatus = "COMPLETED" | "FAILED" | "RUNNING";
 export type CaptureStatus = "COMPLETE" | "PARTIAL" | "UNUSABLE";
 export type BookState = "UNINITIALIZED" | "SYNCHRONIZED" | "STALE" | "INVALID" | "RESYNC_REQUIRED";
+export type BookIntegrity = "NORMAL" | "LOCKED" | "CROSSED";
 
 export type QualityFailureCode =
   | "MISSING_UP_SNAPSHOT"
@@ -65,11 +66,13 @@ export type QualityFailureCode =
   | "REFERENCE_STREAM_MISSING"
   | "REFERENCE_STREAM_STALE"
   | "OPEN_DATA_GAP"
+  | "CLOSED_DATA_GAP"
   | "MALFORMED_EVENTS_PRESENT"
   | "BOOK_STALE"
   | "BOOK_INVALID"
   | "BOOK_RESYNC_REQUIRED"
   | "BOOK_SNAPSHOT_STALE_GENERATION"
+  | "BOOK_CROSSED"
   | "FATAL_PROCESSOR_ERROR"
   | "PROCESS_FAILURE";
 
@@ -103,6 +106,7 @@ export type RunManifest = {
 export type BookHealth = {
   tokenId: string;
   state: BookState;
+  integrity: BookIntegrity;
   synchronizationEpoch: number;
   snapshotConnectionGeneration: number | null;
   bestBid: string | null;
@@ -136,6 +140,10 @@ export type HealthSummary = {
   referencePriceStreamObserved: boolean;
   finalBookHealth: Record<string, BookHealth>;
   openGapsByFeed: Record<string, OpenGap>;
+  dataGapCount: number;
+  closedGapCount: number;
+  totalGapDurationMs: number;
+  maximumGapDurationMs: number;
   captureStatus: CaptureStatus;
   usableForReplay: boolean;
   qualityFailures: QualityFailure[];
@@ -143,7 +151,9 @@ export type HealthSummary = {
   referenceStaleAfterMs: number;
   lastReferenceReceivedAt: number | null;
   lastReferenceConnectionGeneration: number | null;
+  lastReferenceSourceTimestamp: number | null;
   finalReferenceAgeMs: number | null;
+  finalReferenceSourceAgeMs: number | null;
   referenceFresh: boolean;
 };
 
