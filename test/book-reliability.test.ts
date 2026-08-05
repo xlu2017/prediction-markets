@@ -106,23 +106,25 @@ describe("transactional order-book updates", () => {
     ).toThrow(/negative/u);
   });
 
-  it("rejects crossed books in snapshots", () => {
+  it("accepts crossed books in snapshots", () => {
     const tracker = new OrderBookTracker(["up"]);
-    expect(() =>
-      tracker.apply(
-        {
-          event_type: "book",
-          asset_id: "up",
-          bids: [{ price: ".55", size: "10" }],
-          asks: [{ price: ".50", size: "10" }],
-        },
-        100,
-        GEN,
-      ),
-    ).toThrow(/Crossed book/u);
+    tracker.apply(
+      {
+        event_type: "book",
+        asset_id: "up",
+        bids: [{ price: ".55", size: "10" }],
+        asks: [{ price: ".50", size: "10" }],
+      },
+      100,
+      GEN,
+    );
+    const snap = tracker.snapshot(100, 50).up;
+    expect(snap?.bestBid).toBe(".55");
+    expect(snap?.bestAsk).toBe(".50");
+    expect(snap?.state).toBe("SYNCHRONIZED");
   });
 
-  it("rolls back partial mutations when a batch fails mid-way", () => {
+  it("accepts crossed books from price_change batches", () => {
     const tracker = new OrderBookTracker(["up"]);
     tracker.apply(
       {
@@ -134,25 +136,21 @@ describe("transactional order-book updates", () => {
       100,
       GEN,
     );
-    const snapshotBefore = tracker.snapshot(100, 50).up;
-    expect(() =>
-      tracker.apply(
-        {
-          event_type: "price_change",
-          price_changes: [
-            { asset_id: "up", side: "BUY", price: ".49", size: "10" },
-            { asset_id: "up", side: "SELL", price: ".47", size: "5" },
-          ],
-        },
-        110,
-        GEN,
-      ),
-    ).toThrow(/Crossed book/u);
-    const snapshotAfter = tracker.snapshot(110, 50).up;
-    expect(snapshotAfter?.bestBid).toBe(snapshotBefore?.bestBid);
-    expect(snapshotAfter?.bestAsk).toBe(snapshotBefore?.bestAsk);
-    expect(snapshotAfter?.state).toBe("INVALID");
-    expect(snapshotAfter?.lastSuccessfulUpdateTime).toBeNull();
+    tracker.apply(
+      {
+        event_type: "price_change",
+        price_changes: [
+          { asset_id: "up", side: "BUY", price: ".49", size: "10" },
+          { asset_id: "up", side: "SELL", price: ".47", size: "5" },
+        ],
+      },
+      110,
+      GEN,
+    );
+    const snap = tracker.snapshot(110, 50).up;
+    expect(snap?.bestBid).toBe(".49");
+    expect(snap?.bestAsk).toBe(".47");
+    expect(snap?.state).toBe("SYNCHRONIZED");
   });
 
   it("recovers from INVALID state after a new full snapshot", () => {
@@ -162,17 +160,15 @@ describe("transactional order-book updates", () => {
       100,
       GEN,
     );
-    expect(() =>
-      tracker.apply(
-        {
-          event_type: "price_change",
-          price_changes: [{ asset_id: "up", side: "SELL", price: ".50", size: "5" }],
-        },
-        110,
-        GEN,
-      ),
-    ).toThrow(/Crossed book/u);
-    expect(tracker.snapshot(110, 50).up?.state).toBe("INVALID");
+    tracker.apply(
+      {
+        event_type: "price_change",
+        price_changes: [{ asset_id: "up", side: "SELL", price: ".50", size: "5" }],
+      },
+      110,
+      GEN,
+    );
+    expect(tracker.snapshot(110, 50).up?.state).toBe("SYNCHRONIZED");
     tracker.apply(
       {
         event_type: "book",

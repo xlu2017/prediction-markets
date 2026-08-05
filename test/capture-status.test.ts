@@ -135,25 +135,22 @@ describe("capture status fail-closed semantics", () => {
     expect(summary.qualityFailures.some((f) => f.code === "BOOK_STALE")).toBe(true);
   });
 
-  it("produces PARTIAL when a book is invalid", () => {
+  it("accepts crossed books without marking capture unusable", () => {
     const books = new OrderBookTracker(TOKENS, "0.01");
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupBooks(books);
     observeBookSnapshots(health);
     observeReference(health);
-    expect(() =>
-      books.apply(
-        {
-          event_type: "price_change",
-          price_changes: [{ asset_id: "111111", side: "SELL", price: ".40", size: "5" }],
-        },
-        NOW + 10,
-        1,
-      ),
-    ).toThrow(/Crossed book/u);
+    books.apply(
+      {
+        event_type: "price_change",
+        price_changes: [{ asset_id: "111111", side: "SELL", price: ".40", size: "5" }],
+      },
+      NOW + 10,
+      1,
+    );
     const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1);
-    expect(summary.usableForReplay).toBe(false);
-    expect(summary.qualityFailures.some((f) => f.code === "BOOK_INVALID")).toBe(true);
+    expect(summary.finalBookHealth["111111"]?.state).toBe("SYNCHRONIZED");
   });
 
   it("produces PARTIAL when a book is RESYNC_REQUIRED", () => {

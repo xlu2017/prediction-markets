@@ -87,18 +87,18 @@ The in-memory tracker implements a `BookState` machine:
 - Any state -> `SYNCHRONIZED` (via a fresh `book` snapshot from the current generation)
 
 Updates are transactional: all changes in a batch are validated before any mutation. If any change
-fails validation (unknown token, invalid side, negative size, crossed book, price out of bounds,
-tick-size violation, duplicate price level, crossed book), the entire batch is rolled back and the
-book transitions to `INVALID`. Recovery requires a new full `book` snapshot from the current
-connection generation. Locked markets (best bid == best ask) are accepted; only truly crossed books
-(best bid > best ask) are rejected.
+fails validation (unknown token, invalid side, negative size, price out of bounds, tick-size
+violation, duplicate price level), the entire batch is rolled back and the book transitions to
+`INVALID`. Recovery requires a new full `book` snapshot from the current connection generation.
+Crossed and locked books are accepted as valid market data — the recorder faithfully captures what
+the feed sends.
 
 Pre-mutation rejections (unknown token, invalid side, missing fields, tick-size violation, price out
 of bounds) throw before any book backup is created. In this case the prior book state is preserved
 but the event is recorded as malformed, making the overall capture unusable through
-`MALFORMED_EVENTS_PRESENT`. Only failures during mutation or crossed-book validation (which occur
-after backups are created) transition the book to `INVALID`. This policy ensures that a single
-malformed batch never silently corrupts a previously valid book.
+`MALFORMED_EVENTS_PRESENT`. Only failures during mutation (which occur after backups are created)
+transition the book to `INVALID`. This policy ensures that a single malformed batch never silently
+corrupts a previously valid book.
 
 After a reconnection gap, all books transition to `RESYNC_REQUIRED`. A `book` snapshot from the new
 connection generation is required to restore `SYNCHRONIZED` state. Snapshots from a stale generation

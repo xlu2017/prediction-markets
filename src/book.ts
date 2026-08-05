@@ -85,14 +85,6 @@ function best(side: BookSide, direction: "highest" | "lowest"): string | null {
   return candidate;
 }
 
-function checkNotCrossed(bids: BookSide, asks: BookSide): void {
-  const bestBid = best(bids, "highest");
-  const bestAsk = best(asks, "lowest");
-  if (bestBid !== null && bestAsk !== null && compareDecimalStrings(bestBid, bestAsk) > 0) {
-    throw new Error(`Crossed book: best bid ${bestBid} > best ask ${bestAsk}`);
-  }
-}
-
 function cloneSide(side: BookSide): BookSide {
   return new Map(side);
 }
@@ -148,7 +140,6 @@ export class OrderBookTracker {
     if (book === undefined) throw new Error(`Unknown token ID in book event: ${tokenId}`);
     const bids = buildSide(recordValue(record, "bids"), "book bid", this.tickSize);
     const asks = buildSide(recordValue(record, "asks"), "book ask", this.tickSize);
-    checkNotCrossed(bids, asks);
     book.bids = bids;
     book.asks = asks;
     book.state = "SYNCHRONIZED";
@@ -231,9 +222,6 @@ export class OrderBookTracker {
         entry.book.lastSuccessfulUpdateTime = processedAt;
         entry.book.state = "SYNCHRONIZED";
         updated.add(entry.tokenId);
-      }
-      for (const entry of validated) {
-        checkNotCrossed(entry.book.bids, entry.book.asks);
       }
     } catch (error) {
       for (const [book, backup] of backups) {
