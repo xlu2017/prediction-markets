@@ -294,6 +294,7 @@ describe("transactional order-book updates", () => {
       GEN,
     );
     expect(tracker.snapshot(100, 50).up?.integrity).toBe("LOCKED");
+    expect(tracker.snapshot(100, 50).up?.healthy).toBe(true);
   });
 
   it("reports CROSSED integrity when best bid > best ask", () => {
@@ -309,6 +310,7 @@ describe("transactional order-book updates", () => {
       GEN,
     );
     expect(tracker.snapshot(100, 50).up?.integrity).toBe("CROSSED");
+    expect(tracker.snapshot(100, 50).up?.healthy).toBe(false);
   });
 
   it("reports NORMAL integrity when one side is empty", () => {

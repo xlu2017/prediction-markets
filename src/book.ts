@@ -9,6 +9,8 @@ type TokenBook = {
   bids: BookSide;
   asks: BookSide;
   lastSuccessfulUpdateTime: number | null;
+  crossedIncidentCount: number;
+  wasCrossedSinceLastSnapshot: boolean;
 };
 
 function recordValue(record: Record<string, unknown>, key: string): unknown {
@@ -95,6 +97,8 @@ export class OrderBookTracker {
         bids: new Map(),
         asks: new Map(),
         lastSuccessfulUpdateTime: null,
+        crossedIncidentCount: 0,
+        wasCrossedSinceLastSnapshot: false,
       });
     }
   }
@@ -119,6 +123,16 @@ export class OrderBookTracker {
     }
   }
 
+  private trackCrossedIncident(book: TokenBook): void {
+    const integrity = computeIntegrity(book.bids, book.asks);
+    if (integrity === "CROSSED" && !book.wasCrossedSinceLastSnapshot) {
+      book.crossedIncidentCount += 1;
+      book.wasCrossedSinceLastSnapshot = true;
+    } else if (integrity !== "CROSSED") {
+      book.wasCrossedSinceLastSnapshot = false;
+    }
+  }
+
   private applyBook(
     record: Record<string, unknown>,
     processedAt: number,
@@ -136,6 +150,8 @@ export class OrderBookTracker {
     book.snapshotConnectionGeneration = connectionGeneration;
     book.synchronizationEpoch = this.currentSynchronizationEpoch;
     book.lastSuccessfulUpdateTime = processedAt;
+    book.wasCrossedSinceLastSnapshot = false;
+    this.trackCrossedIncident(book);
     return [tokenId];
   }
 
@@ -221,6 +237,9 @@ export class OrderBookTracker {
       }
       throw error;
     }
+    for (const entry of validated) {
+      this.trackCrossedIncident(entry.book);
+    }
     return [...updated];
   }
 
@@ -250,10 +269,12 @@ export class OrderBookTracker {
       if (state === "SYNCHRONIZED" && lastUpdate !== null && nowMs - lastUpdate > staleAfterMs) {
         state = "STALE";
       }
+      const integrity = computeIntegrity(book.bids, book.asks);
       result[tokenId] = {
         tokenId,
         state,
-        integrity: computeIntegrity(book.bids, book.asks),
+        integrity,
+        crossedIncidentCount: book.crossedIncidentCount,
         synchronizationEpoch: book.synchronizationEpoch,
         snapshotConnectionGeneration: book.snapshotConnectionGeneration,
         bestBid: best(book.bids, "highest"),
@@ -261,7 +282,7 @@ export class OrderBookTracker {
         bidDepthCount: book.bids.size,
         askDepthCount: book.asks.size,
         lastSuccessfulUpdateTime: lastUpdate,
-        healthy: state === "SYNCHRONIZED",
+        healthy: state === "SYNCHRONIZED" && integrity !== "CROSSED",
       };
     }
     return result;

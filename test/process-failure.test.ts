@@ -144,13 +144,44 @@ describe("reference freshness tracking", () => {
     expect(summary.finalReferenceAgeMs).toBeNull();
   });
 
-  it("reports referenceFresh=false when source timestamp is old even if receipt is recent", () => {
+  it("reports referenceFresh=false and REFERENCE_STREAM_STALE when source timestamp is old even if receipt is recent", () => {
     const books = new OrderBookTracker(TOKENS);
     const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
     setupComplete(books, health);
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 10,
+        receivedAt: NOW + 100,
+        sourceTimestamp: NOW - 20_000,
+      }),
+    );
     const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1, false);
-    expect(summary.lastReferenceSourceTimestamp).toBe(NOW);
-    expect(summary.finalReferenceSourceAgeMs).toBe(100);
+    expect(summary.lastReferenceSourceTimestamp).toBe(NOW - 20_000);
+    expect(summary.finalReferenceSourceAgeMs).toBe(20_100);
+    expect(summary.referenceFresh).toBe(false);
+    expect(summary.usableForReplay).toBe(false);
+    expect(summary.qualityFailures.some((f) => f.code === "REFERENCE_STREAM_STALE")).toBe(true);
+  });
+
+  it("reports referenceFresh=false and REFERENCE_CLOCK_SKEW when source timestamp is far in the future", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
+    setupComplete(books, health);
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 10,
+        receivedAt: NOW + 100,
+        sourceTimestamp: NOW + 100_000,
+      }),
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1, false);
+    expect(summary.referenceFresh).toBe(false);
+    expect(summary.usableForReplay).toBe(false);
+    expect(summary.qualityFailures.some((f) => f.code === "REFERENCE_CLOCK_SKEW")).toBe(true);
   });
 
   it("does not update reference freshness on duplicate observations", () => {

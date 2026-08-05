@@ -65,6 +65,7 @@ export type QualityFailureCode =
   | "MISSING_DOWN_SNAPSHOT"
   | "REFERENCE_STREAM_MISSING"
   | "REFERENCE_STREAM_STALE"
+  | "REFERENCE_CLOCK_SKEW"
   | "OPEN_DATA_GAP"
   | "CLOSED_DATA_GAP"
   | "MALFORMED_EVENTS_PRESENT"
@@ -107,6 +108,7 @@ export type BookHealth = {
   tokenId: string;
   state: BookState;
   integrity: BookIntegrity;
+  crossedIncidentCount: number;
   synchronizationEpoch: number;
   snapshotConnectionGeneration: number | null;
   bestBid: string | null;
@@ -155,6 +157,7 @@ export type HealthSummary = {
   finalReferenceAgeMs: number | null;
   finalReferenceSourceAgeMs: number | null;
   referenceFresh: boolean;
+  referenceClockSkewMs: number;
 };
 
 export type LogLevel = "debug" | "error" | "info" | "warn";

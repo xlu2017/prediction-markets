@@ -45,6 +45,7 @@ export class HealthTracker {
   private closedGapCount = 0;
   private totalGapDurationMs = 0;
   private maximumGapDurationMs = 0;
+  private readonly referenceClockSkewMs = 5_000;
 
   public constructor(
     private readonly runId: string,
@@ -185,13 +186,30 @@ export class HealthTracker {
         code: "REFERENCE_STREAM_MISSING",
         message: "Chainlink reference stream not observed",
       });
-    } else if (this.lastReferenceReceivedAt !== null) {
-      const referenceAge = options.nowMs - this.lastReferenceReceivedAt;
-      if (referenceAge > options.referenceStaleAfterMs) {
-        failures.push({
-          code: "REFERENCE_STREAM_STALE",
-          message: `Chainlink reference stream is stale: last observation ${referenceAge}ms ago (threshold ${options.referenceStaleAfterMs}ms)`,
-        });
+    } else {
+      if (this.lastReferenceReceivedAt !== null) {
+        const referenceAge = options.nowMs - this.lastReferenceReceivedAt;
+        if (referenceAge > options.referenceStaleAfterMs) {
+          failures.push({
+            code: "REFERENCE_STREAM_STALE",
+            message: `Chainlink reference stream is stale: last observation ${referenceAge}ms ago by receipt time (threshold ${options.referenceStaleAfterMs}ms)`,
+          });
+        }
+      }
+      if (this.lastReferenceSourceTimestamp !== null) {
+        const sourceAge = options.nowMs - this.lastReferenceSourceTimestamp;
+        if (sourceAge > options.referenceStaleAfterMs) {
+          failures.push({
+            code: "REFERENCE_STREAM_STALE",
+            message: `Chainlink reference stream is stale: last observation ${sourceAge}ms ago by source timestamp (threshold ${options.referenceStaleAfterMs}ms)`,
+          });
+        }
+        if (sourceAge < -this.referenceClockSkewMs) {
+          failures.push({
+            code: "REFERENCE_CLOCK_SKEW",
+            message: `Chainlink reference source timestamp is ${-sourceAge}ms in the future, exceeding clock skew tolerance of ${this.referenceClockSkewMs}ms`,
+          });
+        }
       }
     }
 
@@ -267,6 +285,13 @@ export class HealthTracker {
           tokenId,
         });
       }
+      if (health.crossedIncidentCount > 0 && health.integrity !== "CROSSED") {
+        failures.push({
+          code: "BOOK_CROSSED",
+          message: `Book for token ${tokenId} had ${health.crossedIncidentCount} crossed incident(s) during the run`,
+          tokenId,
+        });
+      }
     }
 
     const usable = failures.length === 0;
@@ -302,8 +327,10 @@ export class HealthTracker {
     const referenceFresh =
       this.referenceObserved &&
       finalReferenceAgeMs !== null &&
+      finalReferenceAgeMs >= 0 &&
       finalReferenceAgeMs <= referenceStaleAfterMs &&
       finalReferenceSourceAgeMs !== null &&
+      finalReferenceSourceAgeMs >= -this.referenceClockSkewMs &&
       finalReferenceSourceAgeMs <= referenceStaleAfterMs;
     return {
       schemaVersion: 2,
@@ -340,6 +367,7 @@ export class HealthTracker {
       finalReferenceAgeMs,
       finalReferenceSourceAgeMs,
       referenceFresh,
+      referenceClockSkewMs: this.referenceClockSkewMs,
     };
   }
 }

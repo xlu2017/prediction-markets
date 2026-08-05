@@ -242,4 +242,76 @@ describe("capture status fail-closed semantics", () => {
       expect(typeof failure.message).toBe("string");
     }
   });
+
+  it("produces PARTIAL when reference source timestamp is old even if receipt is recent", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
+    setupBooks(books);
+    observeBookSnapshots(health);
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 1,
+        receivedAt: NOW + 100,
+        sourceTimestamp: NOW - 20_000,
+      }),
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1);
+    expect(summary.usableForReplay).toBe(false);
+    expect(summary.captureStatus).toBe("PARTIAL");
+    expect(summary.qualityFailures.some((f) => f.code === "REFERENCE_STREAM_STALE")).toBe(true);
+    expect(summary.referenceFresh).toBe(false);
+  });
+
+  it("produces PARTIAL with REFERENCE_CLOCK_SKEW when source timestamp is far in the future", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
+    setupBooks(books);
+    observeBookSnapshots(health);
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 1,
+        receivedAt: NOW + 100,
+        sourceTimestamp: NOW + 100_000,
+      }),
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1);
+    expect(summary.usableForReplay).toBe(false);
+    expect(summary.captureStatus).toBe("PARTIAL");
+    expect(summary.qualityFailures.some((f) => f.code === "REFERENCE_CLOCK_SKEW")).toBe(true);
+    expect(summary.referenceFresh).toBe(false);
+  });
+
+  it("tracks transient crossed incidents even if book returns to normal", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
+    setupBooks(books);
+    observeBookSnapshots(health);
+    observeReference(health);
+    books.apply(
+      {
+        event_type: "price_change",
+        price_changes: [{ asset_id: "111111", side: "SELL", price: ".40", size: "5" }],
+      },
+      NOW + 10,
+      1,
+    );
+    expect(books.snapshot(NOW + 10, 50)["111111"]?.integrity).toBe("CROSSED");
+    books.apply(
+      {
+        event_type: "price_change",
+        price_changes: [{ asset_id: "111111", side: "SELL", price: ".40", size: "0" }],
+      },
+      NOW + 20,
+      1,
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1);
+    expect(summary.finalBookHealth["111111"]?.integrity).toBe("NORMAL");
+    expect(summary.finalBookHealth["111111"]?.crossedIncidentCount).toBe(1);
+    expect(summary.usableForReplay).toBe(false);
+    expect(summary.qualityFailures.some((f) => f.code === "BOOK_CROSSED")).toBe(true);
+  });
 });

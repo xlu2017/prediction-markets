@@ -27,6 +27,7 @@
       "tokenId": "111111",
       "state": "SYNCHRONIZED",
       "integrity": "NORMAL",
+      "crossedIncidentCount": 0,
       "synchronizationEpoch": 0,
       "snapshotConnectionGeneration": 1,
       "bestBid": ".48",
@@ -40,6 +41,7 @@
       "tokenId": "222222",
       "state": "SYNCHRONIZED",
       "integrity": "NORMAL",
+      "crossedIncidentCount": 0,
       "synchronizationEpoch": 0,
       "snapshotConnectionGeneration": 1,
       "bestBid": ".47",
@@ -65,5 +67,6 @@
   "lastReferenceSourceTimestamp": 1785909720120,
   "finalReferenceAgeMs": 1,
   "finalReferenceSourceAgeMs": 6,
-  "referenceFresh": true
+  "referenceFresh": true,
+  "referenceClockSkewMs": 5000
 }

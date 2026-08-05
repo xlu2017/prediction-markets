@@ -15,33 +15,145 @@ const program = new Command()
 program.parse();
 const [runDirectory] = program.args;
 const opts = program.opts();
-const minReferenceObservations = Number(opts.minReferenceObservations ?? 5);
+const rawMin = Number(opts.minReferenceObservations ?? 5);
+if (!Number.isSafeInteger(rawMin) || rawMin < 0) {
+  console.error(
+    JSON.stringify({
+      verified: false,
+      runDirectory,
+      error: `--min-reference-observations must be a non-negative safe integer, got ${String(opts.minReferenceObservations)}`,
+    }),
+  );
+  process.exitCode = 1;
+  throw new Error("invalid argument");
+}
+const minReferenceObservations = rawMin;
+
+function assertString(value: unknown, label: string): string {
+  if (typeof value !== "string") throw new Error(`${label} is not a string`);
+  return value;
+}
+
+function assertNumber(value: unknown, label: string): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new Error(`${label} is not a finite number`);
+  }
+  return value;
+}
+
+function assertBoolean(value: unknown, label: string): boolean {
+  if (typeof value !== "boolean") throw new Error(`${label} is not a boolean`);
+  return value;
+}
+
+function runtimeValidateManifest(raw: unknown): RunManifest {
+  const record = raw as Record<string, unknown>;
+  if (typeof record !== "object") throw new Error("manifest is not an object");
+  if (record.schemaVersion !== 2)
+    throw new Error(`manifest schemaVersion is ${String(record.schemaVersion)}, expected 2`);
+  assertString(record.runId, "manifest.runId");
+  assertString(record.startedAt, "manifest.startedAt");
+  if (
+    record.completionStatus !== "COMPLETED" &&
+    record.completionStatus !== "FAILED" &&
+    record.completionStatus !== "RUNNING"
+  ) {
+    throw new Error(`manifest.completionStatus is invalid: ${String(record.completionStatus)}`);
+  }
+  if (
+    record.captureStatus !== "COMPLETE" &&
+    record.captureStatus !== "PARTIAL" &&
+    record.captureStatus !== "UNUSABLE"
+  ) {
+    throw new Error(`manifest.captureStatus is invalid: ${String(record.captureStatus)}`);
+  }
+  assertBoolean(record.usableForReplay, "manifest.usableForReplay");
+  if (record.finalEventCount !== null && typeof record.finalEventCount !== "number") {
+    throw new Error("manifest.finalEventCount is not a number or null");
+  }
+  const market = record.market as Record<string, unknown>;
+  if (typeof market !== "object") throw new Error("manifest.market is not an object");
+  assertString(market.upTokenId, "manifest.market.upTokenId");
+  assertString(market.downTokenId, "manifest.market.downTokenId");
+  assertString(market.marketId, "manifest.market.marketId");
+  assertString(market.conditionId, "manifest.market.conditionId");
+  return raw as RunManifest;
+}
+
+function runtimeValidateHealth(raw: unknown): HealthSummary {
+  const record = raw as Record<string, unknown>;
+  if (typeof record !== "object") throw new Error("health is not an object");
+  if (record.schemaVersion !== 2)
+    throw new Error(`health schemaVersion is ${String(record.schemaVersion)}, expected 2`);
+  assertString(record.runId, "health.runId");
+  assertNumber(record.totalEventsReceived, "health.totalEventsReceived");
+  assertBoolean(record.usableForReplay, "health.usableForReplay");
+  assertBoolean(record.referenceFresh, "health.referenceFresh");
+  assertNumber(record.referenceClockSkewMs, "health.referenceClockSkewMs");
+  return raw as HealthSummary;
+}
+
+function runtimeValidateEvent(raw: unknown, index: number): RawEventEnvelope {
+  const record = raw as Record<string, unknown>;
+  if (typeof record !== "object") {
+    throw new Error(`events.jsonl line ${index + 1} is not an object`);
+  }
+  if (record.schemaVersion !== 2) {
+    throw new Error(
+      `events.jsonl line ${index + 1}: schemaVersion is ${String(record.schemaVersion)}, expected 2`,
+    );
+  }
+  if (typeof record.sequence !== "number" || !Number.isSafeInteger(record.sequence)) {
+    throw new Error(`events.jsonl line ${index + 1}: sequence is not a safe integer`);
+  }
+  if (typeof record.runId !== "string") {
+    throw new Error(`events.jsonl line ${index + 1}: runId is not a string`);
+  }
+  if (typeof record.eventType !== "string") {
+    throw new Error(`events.jsonl line ${index + 1}: eventType is not a string`);
+  }
+  return raw as RawEventEnvelope;
+}
 
 async function verifyRun(directory: string): Promise<void> {
   const manifestPath = path.join(directory, "manifest.json");
   const healthPath = path.join(directory, "health.json");
   const eventsPath = path.join(directory, "events.jsonl");
 
-  let manifest: RunManifest;
-  let health: HealthSummary;
+  let manifestRaw: unknown;
+  let healthRaw: unknown;
   try {
-    manifest = JSON.parse(await readFile(manifestPath, "utf8")) as RunManifest;
+    manifestRaw = JSON.parse(await readFile(manifestPath, "utf8"));
   } catch {
     throw new Error(`Cannot read manifest at ${manifestPath}`);
   }
   try {
-    health = JSON.parse(await readFile(healthPath, "utf8")) as HealthSummary;
+    healthRaw = JSON.parse(await readFile(healthPath, "utf8"));
   } catch {
     throw new Error(`Cannot read health at ${healthPath}`);
   }
 
-  const errors: string[] = [];
-  const manifestSchemaVersion: unknown = (manifest as { schemaVersion: unknown }).schemaVersion;
-  const healthSchemaVersion: unknown = (health as { schemaVersion: unknown }).schemaVersion;
-
-  if (manifestSchemaVersion !== 2) {
-    errors.push(`manifest schemaVersion is ${String(manifestSchemaVersion)}, expected 2`);
+  let manifest: RunManifest;
+  let health: HealthSummary;
+  try {
+    manifest = runtimeValidateManifest(manifestRaw);
+  } catch (error) {
+    throw new Error(
+      `Manifest validation failed: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
   }
+  try {
+    health = runtimeValidateHealth(healthRaw);
+  } catch (error) {
+    throw new Error(
+      `Health validation failed: ${error instanceof Error ? error.message : String(error)}`,
+      { cause: error },
+    );
+  }
+
+  const errors: string[] = [];
+
   if (manifest.completionStatus !== "COMPLETED") {
     errors.push(`completionStatus is ${manifest.completionStatus}, expected COMPLETED`);
   }
@@ -58,8 +170,8 @@ async function verifyRun(directory: string): Promise<void> {
     errors.push(`finalEventCount is ${manifest.finalEventCount}, expected a positive number`);
   }
 
-  if (healthSchemaVersion !== 2) {
-    errors.push(`health schemaVersion is ${String(healthSchemaVersion)}, expected 2`);
+  if (health.runId !== manifest.runId) {
+    errors.push(`health.runId ${health.runId} does not match manifest.runId ${manifest.runId}`);
   }
   if (health.captureStatus !== "COMPLETE") {
     errors.push(`health captureStatus is ${health.captureStatus}, expected COMPLETE`);
@@ -108,6 +220,9 @@ async function verifyRun(directory: string): Promise<void> {
         `book for token ${tokenId} is CROSSED (bid ${book.bestBid} > ask ${book.bestAsk})`,
       );
     }
+    if (book.crossedIncidentCount > 0) {
+      errors.push(`book for token ${tokenId} had ${book.crossedIncidentCount} crossed incident(s)`);
+    }
     if (!expectedTokenIds.has(tokenId)) {
       errors.push(`book health has unexpected token ID ${tokenId}`);
     }
@@ -139,10 +254,12 @@ async function verifyRun(directory: string): Promise<void> {
         continue;
       }
       try {
-        const parsed = JSON.parse(line) as RawEventEnvelope;
-        events.push(parsed);
-      } catch {
-        errors.push(`events.jsonl line ${i + 1} is not valid JSON`);
+        const parsed = JSON.parse(line) as unknown;
+        events.push(runtimeValidateEvent(parsed, i));
+      } catch (error) {
+        errors.push(
+          `events.jsonl line ${i + 1}: ${error instanceof Error ? error.message : "parse error"}`,
+        );
         parseErrors += 1;
       }
     }
@@ -150,6 +267,11 @@ async function verifyRun(directory: string): Promise<void> {
       if (events.length !== manifest.finalEventCount) {
         errors.push(
           `events.jsonl line count ${events.length} does not match manifest.finalEventCount ${manifest.finalEventCount}`,
+        );
+      }
+      if (events.length !== health.totalEventsReceived) {
+        errors.push(
+          `events.jsonl line count ${events.length} does not match health.totalEventsReceived ${health.totalEventsReceived}`,
         );
       }
       let expectedSeq = 1;
@@ -192,16 +314,39 @@ async function verifyRun(directory: string): Promise<void> {
           }
         }
       }
-      const referenceObs = new Set<string | number>();
+      // Recompute reference freshness from events rather than trusting health.referenceFresh
+      const referenceObs = new Set<number>();
+      let lastRefReceivedAt: number | null = null;
+      let lastRefSourceTimestamp: number | null = null;
       for (const event of events) {
         if (event.eventType === "REFERENCE_PRICE" && !event.isDuplicate) {
           if (event.sourceTimestamp !== null) referenceObs.add(event.sourceTimestamp);
+          lastRefReceivedAt = event.receivedAt;
+          if (event.sourceTimestamp !== null) lastRefSourceTimestamp = event.sourceTimestamp;
         }
       }
       if (referenceObs.size < minReferenceObservations) {
         errors.push(
           `unique Chainlink reference observations ${referenceObs.size} < minimum ${minReferenceObservations}`,
         );
+      }
+      // Recompute freshness using the endedAt from health
+      const endedAtMs = health.endedAt !== null ? Date.parse(health.endedAt) : null;
+      if (endedAtMs !== null && lastRefReceivedAt !== null && lastRefSourceTimestamp !== null) {
+        const receiptAge = endedAtMs - lastRefReceivedAt;
+        const sourceAge = endedAtMs - lastRefSourceTimestamp;
+        const staleAfter = health.referenceStaleAfterMs;
+        const skewTolerance = health.referenceClockSkewMs;
+        if (receiptAge < 0 || receiptAge > staleAfter) {
+          errors.push(
+            `recomputed reference receipt age ${receiptAge}ms is outside [0, ${staleAfter}ms]`,
+          );
+        }
+        if (sourceAge < -skewTolerance || sourceAge > staleAfter) {
+          errors.push(
+            `recomputed reference source age ${sourceAge}ms is outside [-${skewTolerance}ms, ${staleAfter}ms]`,
+          );
+        }
       }
     }
   }
@@ -227,12 +372,14 @@ try {
   if (runDirectory === undefined) throw new Error("runDirectory argument is required");
   await verifyRun(runDirectory);
 } catch (error) {
-  console.error(
-    JSON.stringify({
-      verified: false,
-      runDirectory,
-      error: error instanceof Error ? error.message : String(error),
-    }),
-  );
-  process.exitCode = 1;
+  if (!process.exitCode) {
+    console.error(
+      JSON.stringify({
+        verified: false,
+        runDirectory,
+        error: error instanceof Error ? error.message : String(error),
+      }),
+    );
+    process.exitCode = 1;
+  }
 }

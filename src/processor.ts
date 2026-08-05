@@ -165,6 +165,7 @@ export class RecorderEventProcessor {
   private frameCounter = 0;
   private queue: Promise<void> = Promise.resolve();
   private fatalError: Error | null = null;
+  private clobResyncPending = false;
 
   public constructor(
     runId: string,
@@ -193,15 +194,13 @@ export class RecorderEventProcessor {
         event.eventType === "DATA_GAP_STARTED" &&
         (event.payload as Record<string, unknown>).feed === "clob-market"
       ) {
-        this.books.requireResync();
-        this.onClobGap?.();
+        this.requireClobResync();
       }
       if (
         event.eventType === "STALE_STREAM" &&
         (event.payload as Record<string, unknown>).feed === "clob-market"
       ) {
-        this.books.requireResync();
-        this.onClobGap?.();
+        this.requireClobResync();
       }
       const envelope = this.sequencer.next({
         source: event.source,
@@ -216,6 +215,13 @@ export class RecorderEventProcessor {
       await this.store.append(envelope);
       this.health.observe(envelope);
     });
+  }
+
+  private requireClobResync(): void {
+    if (this.clobResyncPending) return;
+    this.clobResyncPending = true;
+    this.books.requireResync();
+    this.onClobGap?.();
   }
 
   public enqueueMarketMetadata(receivedAt: number): void {
@@ -452,7 +458,10 @@ export class RecorderEventProcessor {
     await this.store.append(envelope);
     this.health.observe(envelope, tokens);
     if (isDuplicate) this.health.duplicateEvent();
-    else this.onValidData?.(frame);
+    else {
+      this.clobResyncPending = false;
+      this.onValidData?.(frame);
+    }
   }
 
   private async processReference(

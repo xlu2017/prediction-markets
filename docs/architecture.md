@@ -98,7 +98,10 @@ The projection classifies each book's integrity as `NORMAL` (best bid < best ask
 bid == best ask), or `CROSSED` (best bid > best ask). Locked and crossed states are preserved as
 valid market data, but a `CROSSED` projection triggers a `BOOK_CROSSED` quality failure that
 prevents `usableForReplay` for execution-quality replay. This separates raw event capture (which
-must be faithful) from executable book health (which must be sound).
+must be faithful) from executable book health (which must be sound). Crossed incidents are tracked
+cumulatively per token via `crossedIncidentCount`: a book that becomes crossed during recording and
+later returns to normal still produces a `BOOK_CROSSED` quality failure. `BookHealth.healthy` is
+true only when the book is `SYNCHRONIZED` and integrity is not `CROSSED`.
 
 Pre-mutation rejections (unknown token, invalid side, missing fields, price out of bounds) throw
 before any book backup is created. In this case the prior book state is preserved but the event is
@@ -144,12 +147,20 @@ active generation.
 Reference (Chainlink) freshness requires both a recent receipt time and a recent canonical source
 timestamp. `lastReferenceReceivedAt` tracks when the last non-duplicate observation was received,
 and `lastReferenceSourceTimestamp` tracks the Chainlink payload timestamp. `referenceFresh` is true
-only when both ages are within `referenceStaleAfterMs`. Duplicate observations do not update
-freshness, preventing an old value retransmitted on a new connection from appearing fresh.
+only when both ages are within `referenceStaleAfterMs` and the source timestamp is not beyond
+`referenceClockSkewMs` in the future. Duplicate observations do not update freshness, preventing an
+old value retransmitted on a new connection from appearing fresh. `computeCaptureStatus` checks both
+ages independently — a stale source timestamp produces `REFERENCE_STREAM_STALE` even if the receipt
+time is recent, and a future source timestamp beyond the skew tolerance produces
+`REFERENCE_CLOCK_SKEW`. This prevents contradictory output where `captureStatus` is `COMPLETE` but
+`referenceFresh` is false.
 
 If no valid data arrives within the feed-specific threshold, the feed emits a `STALE_STREAM`
 incident, closes the socket, and schedules a reconnect. Open gaps are tracked in `health.json` under
-`openGapsByFeed`.
+`openGapsByFeed`. A stale CLOB socket that closes and emits `DATA_GAP_STARTED` does not increment
+the synchronization epoch twice: the processor uses a `clobResyncPending` flag so that both the
+`STALE_STREAM` and the subsequent `DATA_GAP_STARTED` from the same outage count as one resync. The
+flag is cleared when a valid CLOB book event is applied.
 
 Frames that are whitespace-only or belong to a different market condition are recorded as
 `EMPTY_FRAME` and `IGNORED_FOREIGN_MARKET` events respectively, preserving their exact wire content
@@ -174,8 +185,8 @@ recorded.
 `QualityFailure` objects with machine-readable `code` and human-readable `message` fields. Codes
 include `MALFORMED_EVENTS_PRESENT`, `BOOK_STALE`, `BOOK_INVALID`, `BOOK_RESYNC_REQUIRED`,
 `BOOK_SNAPSHOT_STALE_GENERATION`, `BOOK_CROSSED`, `REFERENCE_STREAM_MISSING`,
-`REFERENCE_STREAM_STALE`, `OPEN_DATA_GAP`, `CLOSED_DATA_GAP`, `FATAL_PROCESSOR_ERROR`, and
-`PROCESS_FAILURE`.
+`REFERENCE_STREAM_STALE`, `REFERENCE_CLOCK_SKEW`, `OPEN_DATA_GAP`, `CLOSED_DATA_GAP`,
+`FATAL_PROCESSOR_ERROR`, and `PROCESS_FAILURE`.
 
 ## Secret boundary
 
