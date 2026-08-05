@@ -107,8 +107,9 @@ receive latencies are preserved for diagnosis rather than clamped to zero.
 `QualityFailure` objects with machine-readable `code` and human-readable `message` fields. Codes
 include `MALFORMED_EVENTS_PRESENT`, `BOOK_STALE`, `BOOK_INVALID`, `BOOK_RESYNC_REQUIRED`,
 `BOOK_SNAPSHOT_STALE_GENERATION`, `BOOK_CROSSED`, `REFERENCE_STREAM_MISSING`,
-`REFERENCE_STREAM_STALE`, `REFERENCE_CLOCK_SKEW`, `OPEN_DATA_GAP`, `CLOSED_DATA_GAP`,
-`FATAL_PROCESSOR_ERROR`, and `PROCESS_FAILURE`.
+`REFERENCE_STREAM_STALE`, `REFERENCE_CLOCK_SKEW`, `REFERENCE_TIMESTAMP_MISSING`,
+`REFERENCE_LOCAL_CLOCK_SKEW`, `OPEN_DATA_GAP`, `CLOSED_DATA_GAP`, `FATAL_PROCESSOR_ERROR`, and
+`PROCESS_FAILURE`.
 
 Each book health entry includes an `integrity` field of `NORMAL` (best bid < best ask), `LOCKED`
 (best bid == best ask), or `CROSSED` (best bid > best ask), and a `crossedIncidentCount` tracking
@@ -127,10 +128,13 @@ time of the last valid non-duplicate Chainlink observation, or null),
 `finalReferenceAgeMs` (age of the last observation at finalization by receipt time, or null),
 `finalReferenceSourceAgeMs` (age by source timestamp, or null), `referenceFresh` (true only if the
 reference was observed, both ages are within the staleness threshold, and the source timestamp is
-not beyond the clock skew tolerance), and `referenceClockSkewMs` (tolerance for future source
-timestamps, default 5000ms). `computeCaptureStatus` independently checks both ages, producing
-`REFERENCE_STREAM_STALE` for stale source timestamps and `REFERENCE_CLOCK_SKEW` for future
-timestamps beyond the tolerance.
+not beyond the clock skew tolerance), `referenceClockSkewMs` (tolerance for future source
+timestamps, default 5000ms), and `referenceTimestampAnomalyCount` (cumulative count of reference
+observations with missing or extreme source timestamps). A single shared `evaluateReferenceQuality`
+predicate is used for both `computeCaptureStatus` and `referenceFresh`, ensuring they can never
+contradict each other. Missing source timestamps produce `REFERENCE_TIMESTAMP_MISSING`, stale source
+timestamps produce `REFERENCE_STREAM_STALE`, future source timestamps beyond the skew tolerance
+produce `REFERENCE_CLOCK_SKEW`, and negative receipt ages produce `REFERENCE_LOCAL_CLOCK_SKEW`.
 
 ## Clock semantics
 

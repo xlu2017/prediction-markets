@@ -93,6 +93,7 @@ describe("run storage", () => {
       finalReferenceSourceAgeMs: null,
       referenceFresh: false,
       referenceClockSkewMs: 5_000,
+      referenceTimestampAnomalyCount: 0,
     };
     await store.finalize({
       status: "COMPLETED",

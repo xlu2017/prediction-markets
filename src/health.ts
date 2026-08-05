@@ -46,6 +46,7 @@ export class HealthTracker {
   private totalGapDurationMs = 0;
   private maximumGapDurationMs = 0;
   private readonly referenceClockSkewMs = 5_000;
+  private referenceTimestampAnomalyCount = 0;
 
   public constructor(
     private readonly runId: string,
@@ -92,6 +93,12 @@ export class HealthTracker {
       }
       if (envelope.sourceTimestamp !== null) {
         this.lastReferenceSourceTimestamp = envelope.sourceTimestamp;
+        const sourceAge = envelope.receivedAt - envelope.sourceTimestamp;
+        if (sourceAge < -this.referenceClockSkewMs || sourceAge > this.referenceClockSkewMs * 6) {
+          this.referenceTimestampAnomalyCount += 1;
+        }
+      } else {
+        this.referenceTimestampAnomalyCount += 1;
       }
     }
     if (envelope.eventType === "DATA_GAP_STARTED") {
@@ -147,6 +154,65 @@ export class HealthTracker {
     return this.openGaps.size;
   }
 
+  private evaluateReferenceQuality(
+    nowMs: number,
+    referenceStaleAfterMs: number,
+  ): {
+    fresh: boolean;
+    failures: QualityFailure[];
+  } {
+    const failures: QualityFailure[] = [];
+    if (!this.referenceObserved) {
+      failures.push({
+        code: "REFERENCE_STREAM_MISSING",
+        message: "Chainlink reference stream not observed",
+      });
+      return { fresh: false, failures };
+    }
+    if (this.lastReferenceSourceTimestamp === null) {
+      failures.push({
+        code: "REFERENCE_TIMESTAMP_MISSING",
+        message: "Chainlink reference observation has no canonical source timestamp",
+      });
+    }
+    if (this.lastReferenceReceivedAt !== null) {
+      const receiptAge = nowMs - this.lastReferenceReceivedAt;
+      if (receiptAge < 0) {
+        failures.push({
+          code: "REFERENCE_LOCAL_CLOCK_SKEW",
+          message: `Chainlink reference receipt time is ${-receiptAge}ms in the future relative to finalization time`,
+        });
+      } else if (receiptAge > referenceStaleAfterMs) {
+        failures.push({
+          code: "REFERENCE_STREAM_STALE",
+          message: `Chainlink reference stream is stale: last observation ${receiptAge}ms ago by receipt time (threshold ${referenceStaleAfterMs}ms)`,
+        });
+      }
+    }
+    if (this.lastReferenceSourceTimestamp !== null) {
+      const sourceAge = nowMs - this.lastReferenceSourceTimestamp;
+      if (sourceAge > referenceStaleAfterMs) {
+        failures.push({
+          code: "REFERENCE_STREAM_STALE",
+          message: `Chainlink reference stream is stale: last observation ${sourceAge}ms ago by source timestamp (threshold ${referenceStaleAfterMs}ms)`,
+        });
+      }
+      if (sourceAge < -this.referenceClockSkewMs) {
+        failures.push({
+          code: "REFERENCE_CLOCK_SKEW",
+          message: `Chainlink reference source timestamp is ${-sourceAge}ms in the future, exceeding clock skew tolerance of ${this.referenceClockSkewMs}ms`,
+        });
+      }
+    }
+    if (this.referenceTimestampAnomalyCount > 0) {
+      failures.push({
+        code: "REFERENCE_TIMESTAMP_MISSING",
+        message: `${this.referenceTimestampAnomalyCount} reference timestamp anomaly(ies) occurred during the run`,
+      });
+    }
+    return { fresh: failures.length === 0, failures };
+  }
+
   public computeCaptureStatus(
     bookHealth: Record<string, BookHealth>,
     currentClobGeneration: number | null,
@@ -181,37 +247,8 @@ export class HealthTracker {
       }
     }
 
-    if (!this.referenceObserved) {
-      failures.push({
-        code: "REFERENCE_STREAM_MISSING",
-        message: "Chainlink reference stream not observed",
-      });
-    } else {
-      if (this.lastReferenceReceivedAt !== null) {
-        const referenceAge = options.nowMs - this.lastReferenceReceivedAt;
-        if (referenceAge > options.referenceStaleAfterMs) {
-          failures.push({
-            code: "REFERENCE_STREAM_STALE",
-            message: `Chainlink reference stream is stale: last observation ${referenceAge}ms ago by receipt time (threshold ${options.referenceStaleAfterMs}ms)`,
-          });
-        }
-      }
-      if (this.lastReferenceSourceTimestamp !== null) {
-        const sourceAge = options.nowMs - this.lastReferenceSourceTimestamp;
-        if (sourceAge > options.referenceStaleAfterMs) {
-          failures.push({
-            code: "REFERENCE_STREAM_STALE",
-            message: `Chainlink reference stream is stale: last observation ${sourceAge}ms ago by source timestamp (threshold ${options.referenceStaleAfterMs}ms)`,
-          });
-        }
-        if (sourceAge < -this.referenceClockSkewMs) {
-          failures.push({
-            code: "REFERENCE_CLOCK_SKEW",
-            message: `Chainlink reference source timestamp is ${-sourceAge}ms in the future, exceeding clock skew tolerance of ${this.referenceClockSkewMs}ms`,
-          });
-        }
-      }
-    }
+    const refQuality = this.evaluateReferenceQuality(options.nowMs, options.referenceStaleAfterMs);
+    failures.push(...refQuality.failures);
 
     if (this.openGaps.size > 0) {
       for (const [feed] of this.openGaps) {
@@ -324,14 +361,8 @@ export class HealthTracker {
       this.lastReferenceReceivedAt !== null ? nowMs - this.lastReferenceReceivedAt : null;
     const finalReferenceSourceAgeMs =
       this.lastReferenceSourceTimestamp !== null ? nowMs - this.lastReferenceSourceTimestamp : null;
-    const referenceFresh =
-      this.referenceObserved &&
-      finalReferenceAgeMs !== null &&
-      finalReferenceAgeMs >= 0 &&
-      finalReferenceAgeMs <= referenceStaleAfterMs &&
-      finalReferenceSourceAgeMs !== null &&
-      finalReferenceSourceAgeMs >= -this.referenceClockSkewMs &&
-      finalReferenceSourceAgeMs <= referenceStaleAfterMs;
+    const refQuality = this.evaluateReferenceQuality(nowMs, referenceStaleAfterMs);
+    const referenceFresh = refQuality.fresh;
     return {
       schemaVersion: 2,
       runId: this.runId,
@@ -368,6 +399,7 @@ export class HealthTracker {
       finalReferenceSourceAgeMs,
       referenceFresh,
       referenceClockSkewMs: this.referenceClockSkewMs,
+      referenceTimestampAnomalyCount: this.referenceTimestampAnomalyCount,
     };
   }
 }

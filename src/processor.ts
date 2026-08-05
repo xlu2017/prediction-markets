@@ -459,7 +459,9 @@ export class RecorderEventProcessor {
     this.health.observe(envelope, tokens);
     if (isDuplicate) this.health.duplicateEvent();
     else {
-      this.clobResyncPending = false;
+      if (eventType === "book" || eventType === "price_change") {
+        this.clobResyncPending = false;
+      }
       this.onValidData?.(frame);
     }
   }

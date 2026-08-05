@@ -314,4 +314,80 @@ describe("capture status fail-closed semantics", () => {
     expect(summary.usableForReplay).toBe(false);
     expect(summary.qualityFailures.some((f) => f.code === "BOOK_CROSSED")).toBe(true);
   });
+
+  it("produces PARTIAL with REFERENCE_TIMESTAMP_MISSING when reference has no source timestamp", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
+    setupBooks(books);
+    observeBookSnapshots(health);
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 1,
+        receivedAt: NOW,
+        sourceTimestamp: null,
+      }),
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1);
+    expect(summary.usableForReplay).toBe(false);
+    expect(summary.captureStatus).toBe("PARTIAL");
+    expect(summary.qualityFailures.some((f) => f.code === "REFERENCE_TIMESTAMP_MISSING")).toBe(
+      true,
+    );
+    expect(summary.referenceFresh).toBe(false);
+    expect(summary.referenceTimestampAnomalyCount).toBe(1);
+  });
+
+  it("produces PARTIAL with REFERENCE_LOCAL_CLOCK_SKEW when receipt age is negative", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
+    setupBooks(books);
+    observeBookSnapshots(health);
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 1,
+        receivedAt: NOW + 1_000,
+        sourceTimestamp: NOW,
+      }),
+    );
+    const summary = health.summary(null, NOW, 15_000, 10_000, 1);
+    expect(summary.usableForReplay).toBe(false);
+    expect(summary.captureStatus).toBe("PARTIAL");
+    expect(summary.qualityFailures.some((f) => f.code === "REFERENCE_LOCAL_CLOCK_SKEW")).toBe(true);
+    expect(summary.referenceFresh).toBe(false);
+  });
+
+  it("tracks reference timestamp anomalies cumulatively even if later observations are valid", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books);
+    setupBooks(books);
+    observeBookSnapshots(health);
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 1,
+        receivedAt: NOW,
+        sourceTimestamp: null,
+      }),
+    );
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 2,
+        receivedAt: NOW + 50,
+        sourceTimestamp: NOW + 50,
+      }),
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1);
+    expect(summary.referenceTimestampAnomalyCount).toBe(1);
+    expect(summary.usableForReplay).toBe(false);
+    expect(summary.qualityFailures.some((f) => f.code === "REFERENCE_TIMESTAMP_MISSING")).toBe(
+      true,
+    );
+  });
 });

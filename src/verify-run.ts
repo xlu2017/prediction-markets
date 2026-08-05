@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { Command } from "commander";
 
-import type { HealthSummary, RawEventEnvelope, RunManifest } from "./types.js";
+import type { BookHealth, HealthSummary, RawEventEnvelope, RunManifest } from "./types.js";
 
 const program = new Command()
   .name("market:verify-run")
@@ -16,12 +16,12 @@ program.parse();
 const [runDirectory] = program.args;
 const opts = program.opts();
 const rawMin = Number(opts.minReferenceObservations ?? 5);
-if (!Number.isSafeInteger(rawMin) || rawMin < 0) {
+if (!Number.isSafeInteger(rawMin) || rawMin <= 0) {
   console.error(
     JSON.stringify({
       verified: false,
       runDirectory,
-      error: `--min-reference-observations must be a non-negative safe integer, got ${String(opts.minReferenceObservations)}`,
+      error: `--min-reference-observations must be a positive safe integer, got ${String(opts.minReferenceObservations)}`,
     }),
   );
   process.exitCode = 1;
@@ -41,9 +41,26 @@ function assertNumber(value: unknown, label: string): number {
   return value;
 }
 
+function assertPositiveNumber(value: unknown, label: string): number {
+  const n = assertNumber(value, label);
+  if (n <= 0) throw new Error(`${label} is not a positive number`);
+  return n;
+}
+
 function assertBoolean(value: unknown, label: string): boolean {
   if (typeof value !== "boolean") throw new Error(`${label} is not a boolean`);
   return value;
+}
+
+function assertIsoTimestamp(value: unknown, label: string): string {
+  const s = assertString(value, label);
+  if (Number.isNaN(Date.parse(s))) throw new Error(`${label} is not a valid ISO timestamp: ${s}`);
+  return s;
+}
+
+function assertOptionalNumber(value: unknown, label: string): number | null {
+  if (value === null) return null;
+  return assertNumber(value, label);
 }
 
 function runtimeValidateManifest(raw: unknown): RunManifest {
@@ -52,7 +69,7 @@ function runtimeValidateManifest(raw: unknown): RunManifest {
   if (record.schemaVersion !== 2)
     throw new Error(`manifest schemaVersion is ${String(record.schemaVersion)}, expected 2`);
   assertString(record.runId, "manifest.runId");
-  assertString(record.startedAt, "manifest.startedAt");
+  assertIsoTimestamp(record.startedAt, "manifest.startedAt");
   if (
     record.completionStatus !== "COMPLETED" &&
     record.completionStatus !== "FAILED" &&
@@ -80,16 +97,57 @@ function runtimeValidateManifest(raw: unknown): RunManifest {
   return raw as RunManifest;
 }
 
+function runtimeValidateBookHealth(raw: unknown, tokenId: string): BookHealth {
+  const record = raw as Record<string, unknown>;
+  if (typeof record !== "object") throw new Error(`book health for ${tokenId} is not an object`);
+  assertString(record.tokenId, `book.${tokenId}.tokenId`);
+  assertString(record.state, `book.${tokenId}.state`);
+  assertString(record.integrity, `book.${tokenId}.integrity`);
+  assertNumber(record.crossedIncidentCount, `book.${tokenId}.crossedIncidentCount`);
+  assertNumber(record.synchronizationEpoch, `book.${tokenId}.synchronizationEpoch`);
+  assertOptionalNumber(
+    record.snapshotConnectionGeneration,
+    `book.${tokenId}.snapshotConnectionGeneration`,
+  );
+  assertOptionalNumber(record.bestBid, `book.${tokenId}.bestBid`);
+  assertOptionalNumber(record.bestAsk, `book.${tokenId}.bestAsk`);
+  assertNumber(record.bidDepthCount, `book.${tokenId}.bidDepthCount`);
+  assertNumber(record.askDepthCount, `book.${tokenId}.askDepthCount`);
+  assertOptionalNumber(record.lastSuccessfulUpdateTime, `book.${tokenId}.lastSuccessfulUpdateTime`);
+  assertBoolean(record.healthy, `book.${tokenId}.healthy`);
+  return raw as BookHealth;
+}
+
 function runtimeValidateHealth(raw: unknown): HealthSummary {
   const record = raw as Record<string, unknown>;
   if (typeof record !== "object") throw new Error("health is not an object");
   if (record.schemaVersion !== 2)
     throw new Error(`health schemaVersion is ${String(record.schemaVersion)}, expected 2`);
   assertString(record.runId, "health.runId");
+  assertIsoTimestamp(record.startedAt, "health.startedAt");
+  if (record.endedAt !== null) assertIsoTimestamp(record.endedAt, "health.endedAt");
   assertNumber(record.totalEventsReceived, "health.totalEventsReceived");
+  assertNumber(record.malformedEventCount, "health.malformedEventCount");
+  assertNumber(record.duplicateEventCount, "health.duplicateEventCount");
+  assertNumber(record.reconnectCount, "health.reconnectCount");
+  assertNumber(record.staleFeedIncidents, "health.staleFeedIncidents");
+  assertBoolean(record.bothTokenStreamsObserved, "health.bothTokenStreamsObserved");
+  assertBoolean(record.referencePriceStreamObserved, "health.referencePriceStreamObserved");
   assertBoolean(record.usableForReplay, "health.usableForReplay");
   assertBoolean(record.referenceFresh, "health.referenceFresh");
-  assertNumber(record.referenceClockSkewMs, "health.referenceClockSkewMs");
+  assertPositiveNumber(record.clobStaleAfterMs, "health.clobStaleAfterMs");
+  assertPositiveNumber(record.referenceStaleAfterMs, "health.referenceStaleAfterMs");
+  assertPositiveNumber(record.referenceClockSkewMs, "health.referenceClockSkewMs");
+  assertNumber(record.referenceTimestampAnomalyCount, "health.referenceTimestampAnomalyCount");
+  assertOptionalNumber(record.lastReferenceReceivedAt, "health.lastReferenceReceivedAt");
+  assertOptionalNumber(record.lastReferenceSourceTimestamp, "health.lastReferenceSourceTimestamp");
+  assertOptionalNumber(record.finalReferenceAgeMs, "health.finalReferenceAgeMs");
+  assertOptionalNumber(record.finalReferenceSourceAgeMs, "health.finalReferenceSourceAgeMs");
+  const bookHealth = record.finalBookHealth as Record<string, unknown>;
+  if (typeof bookHealth !== "object") throw new Error("health.finalBookHealth is not an object");
+  for (const [tokenId, book] of Object.entries(bookHealth)) {
+    runtimeValidateBookHealth(book, tokenId);
+  }
   return raw as HealthSummary;
 }
 
@@ -111,6 +169,15 @@ function runtimeValidateEvent(raw: unknown, index: number): RawEventEnvelope {
   }
   if (typeof record.eventType !== "string") {
     throw new Error(`events.jsonl line ${index + 1}: eventType is not a string`);
+  }
+  if (typeof record.receivedAt !== "number" || !Number.isFinite(record.receivedAt)) {
+    throw new Error(`events.jsonl line ${index + 1}: receivedAt is not a finite number`);
+  }
+  if (typeof record.processedAt !== "number" || !Number.isFinite(record.processedAt)) {
+    throw new Error(`events.jsonl line ${index + 1}: processedAt is not a finite number`);
+  }
+  if (record.sourceTimestamp !== null && typeof record.sourceTimestamp !== "number") {
+    throw new Error(`events.jsonl line ${index + 1}: sourceTimestamp is not a number or null`);
   }
   return raw as RawEventEnvelope;
 }
@@ -187,6 +254,11 @@ async function verifyRun(directory: string): Promise<void> {
   }
   if (!health.referenceFresh) {
     errors.push("referenceFresh is false");
+  }
+  if (health.referenceTimestampAnomalyCount > 0) {
+    errors.push(
+      `referenceTimestampAnomalyCount is ${health.referenceTimestampAnomalyCount}, expected 0`,
+    );
   }
   if (health.malformedEventCount > 0) {
     errors.push(`malformedEventCount is ${health.malformedEventCount}, expected 0`);
@@ -318,11 +390,13 @@ async function verifyRun(directory: string): Promise<void> {
       const referenceObs = new Set<number>();
       let lastRefReceivedAt: number | null = null;
       let lastRefSourceTimestamp: number | null = null;
+      let refAnomalyCount = 0;
       for (const event of events) {
         if (event.eventType === "REFERENCE_PRICE" && !event.isDuplicate) {
           if (event.sourceTimestamp !== null) referenceObs.add(event.sourceTimestamp);
           lastRefReceivedAt = event.receivedAt;
           if (event.sourceTimestamp !== null) lastRefSourceTimestamp = event.sourceTimestamp;
+          else refAnomalyCount += 1;
         }
       }
       if (referenceObs.size < minReferenceObservations) {
@@ -331,22 +405,40 @@ async function verifyRun(directory: string): Promise<void> {
         );
       }
       // Recompute freshness using the endedAt from health
-      const endedAtMs = health.endedAt !== null ? Date.parse(health.endedAt) : null;
-      if (endedAtMs !== null && lastRefReceivedAt !== null && lastRefSourceTimestamp !== null) {
-        const receiptAge = endedAtMs - lastRefReceivedAt;
-        const sourceAge = endedAtMs - lastRefSourceTimestamp;
-        const staleAfter = health.referenceStaleAfterMs;
-        const skewTolerance = health.referenceClockSkewMs;
-        if (receiptAge < 0 || receiptAge > staleAfter) {
-          errors.push(
-            `recomputed reference receipt age ${receiptAge}ms is outside [0, ${staleAfter}ms]`,
-          );
+      if (health.endedAt !== null) {
+        const endedAtMs = Date.parse(health.endedAt);
+        if (Number.isNaN(endedAtMs)) {
+          errors.push(`health.endedAt is not a valid timestamp: ${health.endedAt}`);
+        } else if (lastRefReceivedAt !== null) {
+          const receiptAge = endedAtMs - lastRefReceivedAt;
+          if (receiptAge < 0) {
+            errors.push(
+              `recomputed reference receipt age ${receiptAge}ms is negative (local clock skew)`,
+            );
+          } else if (receiptAge > health.referenceStaleAfterMs) {
+            errors.push(
+              `recomputed reference receipt age ${receiptAge}ms exceeds staleness threshold ${health.referenceStaleAfterMs}ms`,
+            );
+          }
         }
-        if (sourceAge < -skewTolerance || sourceAge > staleAfter) {
-          errors.push(
-            `recomputed reference source age ${sourceAge}ms is outside [-${skewTolerance}ms, ${staleAfter}ms]`,
-          );
+        if (lastRefSourceTimestamp !== null) {
+          const sourceAge = endedAtMs - lastRefSourceTimestamp;
+          if (sourceAge < -health.referenceClockSkewMs) {
+            errors.push(
+              `recomputed reference source age ${sourceAge}ms is beyond future clock skew tolerance -${health.referenceClockSkewMs}ms`,
+            );
+          } else if (sourceAge > health.referenceStaleAfterMs) {
+            errors.push(
+              `recomputed reference source age ${sourceAge}ms exceeds staleness threshold ${health.referenceStaleAfterMs}ms`,
+            );
+          }
         }
+        if (lastRefSourceTimestamp === null && lastRefReceivedAt !== null) {
+          errors.push("recomputed reference has no canonical source timestamp");
+        }
+      }
+      if (refAnomalyCount > 0) {
+        errors.push(`recomputed reference timestamp anomaly count ${refAnomalyCount} > 0`);
       }
     }
   }

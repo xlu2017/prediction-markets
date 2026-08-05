@@ -66,6 +66,8 @@ export type QualityFailureCode =
   | "REFERENCE_STREAM_MISSING"
   | "REFERENCE_STREAM_STALE"
   | "REFERENCE_CLOCK_SKEW"
+  | "REFERENCE_TIMESTAMP_MISSING"
+  | "REFERENCE_LOCAL_CLOCK_SKEW"
   | "OPEN_DATA_GAP"
   | "CLOSED_DATA_GAP"
   | "MALFORMED_EVENTS_PRESENT"
@@ -158,6 +160,7 @@ export type HealthSummary = {
   finalReferenceSourceAgeMs: number | null;
   referenceFresh: boolean;
   referenceClockSkewMs: number;
+  referenceTimestampAnomalyCount: number;
 };
 
 export type LogLevel = "debug" | "error" | "info" | "warn";
