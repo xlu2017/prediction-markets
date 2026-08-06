@@ -263,7 +263,9 @@ def _build_expected_ledger(cat_dir: Path, up_id, down_id) -> list[dict]:
     return ledger
 
 
-def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
+def run_backtest_proof(
+    catalog_directory: str | Path, *, allow_unverified: bool = False
+) -> BacktestProofResult:
     """Run a Nautilus BacktestNode against the converted catalog.
 
     Returns a BacktestProofResult with evidence that the engine ran, received
@@ -271,6 +273,14 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
     order, simulated a fill, and maintained portfolio state.
     """
     cat_dir = Path(catalog_directory)
+
+    # Fail closed on any catalog integrity mismatch before loading the engine.
+    try:
+        from .replay import _verify_catalog_integrity
+
+        _verify_catalog_integrity(cat_dir, allow_unverified=allow_unverified)
+    except ValueError as e:
+        return BacktestProofResult(ran=False, error=f"integrity verification failed: {e}")
 
     try:
         from nautilus_trader.backtest.node import (

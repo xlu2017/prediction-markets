@@ -132,7 +132,11 @@ quote, an exchange mark price, or a fill. It is a custom Nautilus data type (see
 ### NormalizedLifecycleEvent
 
 ```text
-kind               "CONNECTION_GENERATION" | "RESYNC_BOUNDARY" | "MARKET_DISCOVERED"
+kind               "MARKET_DISCOVERED" | "CONNECTION_ATTEMPT" | "CONNECTION_OPEN" |
+                   "SUBSCRIPTION_SENT" | "CONNECTION_ERROR" | "CONNECTION_CLOSED" |
+                   "DATA_GAP_STARTED" | "DATA_GAP_ENDED" | "RECONNECT_SCHEDULED" |
+                   "STALE_STREAM" | "BOOK_RESYNC_REQUIRED" | any Polymarket lifecycle
+                   event name that is preserved for audit only
 generation         int|null
 detail             str|null
 ```
@@ -185,9 +189,43 @@ rawMessageText     str|null
    preserved as their original string lexeme in the audit sidecar and in the reference-price custom
    type's `value` field.
 4. The reader validates decimals as strings before any Nautilus construction.
-5. Nautilus `Price`/`Quantity` are internally fixed-point (integer mantissa + precision); the string
+5. The converter derives the smallest `10**n` `price_increment` and `size_increment` that can
+   represent every source price and quantity exactly. This uses the most-negative base-10 exponent
+   observed across `tickSize`, snapshot levels, deltas, and trades.
+6. Every source price and quantity is round-tripped through the selected `Price`/`Quantity` precision
+   before the catalog is written. Any value that would be quantized raises `ValueError` and aborts
+   conversion, so sub-tick prices and sizes are never silently lost.
+7. Nautilus `Price`/`Quantity` are internally fixed-point (integer mantissa + precision); the string
    parse preserves the source precision up to the instrument's `price_precision`/ `size_precision`.
    Precision loss, if any, is recorded in the conversion report.
+
+## Integrity manifest
+
+A single `integrity-manifest.json` is written to the catalog root before any catalog data is read.
+It is a cryptographic commitment to every input and artifact that contributes to replay output:
+
+- `sourceCorpusHash`: raw `events.jsonl` SHA-256.
+- `sourceEventsHash`: identical to `sourceCorpusHash`.
+- `sourceCorpusLineCount`: number of raw event lines.
+- `lineageSidecarHash`: canonical hash of `lineage.parquet`.
+- `auditSidecarHash`: canonical hash of `audit.parquet`.
+- `expectedFinalBooksHash`: canonical hash of `expected-final-books.json`.
+- `conversionReportHash`: canonical hash of `conversion-report.json`.
+- `normalizedSourceInputHash`: hash of `normalized-source-input.json`, containing all normalized
+  records and the effective replay configuration.
+- `normalizedEngineInputHash`: hash over the actual Nautilus catalog input (instruments, deltas,
+  trades, reference, lifecycle) in canonical order.
+- `strategyVisibleInputHash`: hash over the strategy-visible stream (UP/DOWN book events and
+  reference prices).
+- `instrumentCatalogHash`: hash over the instrument catalog.
+- `recordCounts`: counts of instruments, engine inputs, and strategy-visible inputs.
+- `effectivePriceIncrement`, `effectiveSizeIncrement`, `effectivePricePrecision`,
+  `effectiveSizePrecision`, `sourceTickSize`: the exact price/quantity precision chosen at
+  conversion time.
+
+`replay_catalog` and `run_backtest_proof` fail closed by recomputing all manifest fields and raising
+`ValueError` on any mismatch. This protects against tampering with catalog data, sidecars, the source
+event corpus, the conversion report, or the integrity manifest itself.
 
 ## Event-ordering rules
 
@@ -205,7 +243,7 @@ rawMessageText     str|null
   `NormalizedAuditEvent` of kind `DEDUPLICATED_COPY` and **not** fed to the trading engine, because
   the unique copy already produced the book effect.
 - `dedupeState == RECEIVED_NOT_APPLIED`: converted to `NormalizedAuditEvent` kind
-  `DEDUPLICATED_COPY`; not fed to the engine.
+  `REJECTED_NOT_APPLIED`; not fed to the engine.
 - `dedupeState == UNIQUE_APPLIED`: converted normally.
 - `duplicateOfSequence` is retained in lineage for traceability.
 
@@ -231,8 +269,9 @@ rawMessageText     str|null
 
 - Every Nautilus event constructed from a normalized record carries the `Lineage` fields in a
   sidecar table keyed by `(runId, sequence)`.
-- The catalog stores a `lineage.parquet` sidecar alongside the data catalog, mapping each Nautilus
-  event row to its source `sequence` and envelope fields.
+- The catalog stores `lineage.parquet`, `audit.parquet`, `expected-final-books.json`,
+  `conversion-report.json`, `normalized-source-input.json`, and `integrity-manifest.json` sidecars
+  alongside the Parquet data catalog.
 - A round-trip test (Phase 10) proves every normalized event can be traced back to its source
   envelope `sequence`.
 - The conversion report (Phase 7) emits `firstSourceSequence` and `lastSourceSequence` and requires

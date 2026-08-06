@@ -12,13 +12,13 @@ connected.
 
 from __future__ import annotations
 
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .backtest import REPLAY_CONFIG
-from .hashes import hash_value
+from .hashes import hash_json_file, hash_parquet_rows, hash_value
 from .models import LifecycleEvent, ReferencePriceUpdate
 
 _MS_TO_NS = 1_000_000
@@ -207,9 +207,7 @@ def _catalog_integrity_fields(
     strategy_input_stream = [
         e for e in input_stream if e.get("side") in {"UP", "DOWN", "REFERENCE"}
     ]
-    normalized_engine_input_hash = hash_value(
-        [engine_input_stream, instrument_records, REPLAY_CONFIG]
-    )
+    normalized_engine_input_hash = hash_value([engine_input_stream, instrument_records])
     strategy_visible_input_hash = hash_value(strategy_input_stream)
 
     return {
@@ -232,28 +230,6 @@ def _read_integrity_manifest(cat_dir: Path) -> dict:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
-def _read_source_corpus_hash(cat_dir: Path) -> tuple[str, str, int, dict]:
-    """Read and validate the persisted source-corpus integrity artifact."""
-    path = cat_dir / "source-corpus-hash.json"
-    if not path.exists():
-        raise ValueError(f"source-corpus-hash.json missing in {cat_dir}")
-    data = json.loads(path.read_text(encoding="utf-8"))
-
-    def _require_hex(name: str, value: Any) -> str:
-        if not isinstance(value, str) or len(value) != 64:
-            raise ValueError(f"invalid {name} in {path}")
-        if any(c not in "0123456789abcdef" for c in value):
-            raise ValueError(f"invalid {name} in {path}")
-        return value
-
-    source_corpus_hash = _require_hex("sourceCorpusHash", data.get("sourceCorpusHash"))
-    source_events_hash = _require_hex("sourceEventsHash", data.get("sourceEventsHash"))
-    line_count = data.get("sourceCorpusLineCount", 0)
-    if not isinstance(line_count, int) or line_count < 0:
-        raise ValueError(f"invalid sourceCorpusLineCount in {path}")
-    return source_corpus_hash, source_events_hash, line_count, data.get("verifierParameters", {})
-
-
 def _read_conversion_report(cat_dir: Path) -> dict:
     path = cat_dir / "conversion-report.json"
     if not path.exists():
@@ -262,6 +238,140 @@ def _read_conversion_report(cat_dir: Path) -> dict:
     if "sourceRunId" not in data:
         raise ValueError("sourceRunId missing in conversion-report.json")
     return data
+
+
+def _source_run_path(cat_dir: Path) -> Path | None:
+    """Locate the original source run from the conversion report."""
+    try:
+        report = _read_conversion_report(cat_dir)
+    except ValueError:
+        return None
+    source_path = report.get("sourceRunPath")
+    if not source_path:
+        return None
+    return Path(source_path)
+
+
+def _recompute_source_corpus_hash(source_run_path: Path) -> tuple[str, int]:
+    """Recompute the raw events.jsonl SHA-256 from the source run."""
+    events_path = source_run_path / "events.jsonl"
+    if not events_path.exists():
+        raise ValueError(f"source events.jsonl missing at {events_path}")
+    raw = events_path.read_bytes()
+    return hashlib.sha256(raw).hexdigest(), len(raw.splitlines())
+
+
+def _recompute_effective_increments(instruments: list) -> dict[str, Any]:
+    """Recompute effective increments/precisions from catalog instruments."""
+    from decimal import Decimal
+
+    if not instruments:
+        return {}
+    instr = instruments[0]
+    return {
+        "effectivePriceIncrement": Decimal(str(instr.price_increment)),
+        "effectiveSizeIncrement": Decimal(str(instr.size_increment)),
+        "effectivePricePrecision": instr.price_precision,
+        "effectiveSizePrecision": instr.size_precision,
+    }
+
+
+def _verify_catalog_integrity(cat_dir: Path, *, allow_unverified: bool = False) -> dict:
+    """Recompute every integrity manifest commitment and raise ValueError on any mismatch.
+
+    This is a fail-closed gate: it runs before any lineage loading, book comparison,
+    deterministic replay, or BacktestNode execution.
+    """
+    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+
+    manifest = _read_integrity_manifest(cat_dir)
+    report = _read_conversion_report(cat_dir)
+
+    if manifest.get("runId") != report.get("sourceRunId"):
+        raise ValueError(
+            f"runId mismatch: integrity manifest {manifest.get('runId')!r} "
+            f"vs conversion report {report.get('sourceRunId')!r}"
+        )
+
+    if not manifest.get("verifierParameters", {}).get("verify") and not allow_unverified:
+        raise ValueError("catalog was converted with verification disabled")
+
+    if manifest.get("verifierParameters") != report.get("verifierParameters"):
+        raise ValueError("verifier parameters mismatch")
+
+    # Source corpus hash: raw events.jsonl SHA-256.
+    source_path = _source_run_path(cat_dir)
+    if source_path is None:
+        raise ValueError("source run path not available for source corpus recompute")
+    source_corpus_hash, source_line_count = _recompute_source_corpus_hash(source_path)
+    if source_corpus_hash != manifest.get("sourceCorpusHash"):
+        raise ValueError("sourceCorpusHash mismatch")
+    if source_line_count != manifest.get("sourceCorpusLineCount", 0):
+        raise ValueError("sourceCorpusLineCount mismatch")
+
+    # Pre-catalog source input hash.
+    source_input_path = cat_dir / "normalized-source-input.json"
+    if not source_input_path.exists():
+        raise ValueError("normalized-source-input.json missing")
+    source_input_data = json.loads(source_input_path.read_text(encoding="utf-8"))
+    if hash_value(source_input_data) != manifest.get("normalizedSourceInputHash"):
+        raise ValueError("normalizedSourceInputHash mismatch")
+
+    # Sidecar and report hashes.
+    if hash_parquet_rows(cat_dir / "lineage.parquet") != manifest.get("lineageSidecarHash"):
+        raise ValueError("lineageSidecarHash mismatch")
+    if hash_parquet_rows(cat_dir / "audit.parquet") != manifest.get("auditSidecarHash"):
+        raise ValueError("auditSidecarHash mismatch")
+    if hash_json_file(cat_dir / "expected-final-books.json") != manifest.get("expectedFinalBooksHash"):
+        raise ValueError("expectedFinalBooksHash mismatch")
+    if hash_json_file(cat_dir / "conversion-report.json") != manifest.get("conversionReportHash"):
+        raise ValueError("conversionReportHash mismatch")
+
+    # Catalog-level engine-input hash.
+    cat = ParquetDataCatalog(str(cat_dir))
+    instruments, up_instr, down_instr, up_deltas, down_deltas = _catalog_read(cat)
+    input_stream = _build_input_stream(up_deltas, down_deltas, up_instr, down_instr, cat, cat_dir)
+    catalog_fields = _catalog_integrity_fields(input_stream, instruments, source_line_count)
+    for key in (
+        "instrumentCatalogHash",
+        "normalizedEngineInputHash",
+        "strategyVisibleInputHash",
+        "recordCounts",
+    ):
+        if catalog_fields.get(key) != manifest.get(key):
+            raise ValueError(f"{key} mismatch: expected {catalog_fields.get(key)!r}, got {manifest.get(key)!r}")
+
+    # Effective increment/precision values.
+    from decimal import Decimal
+
+    for key, expected in _recompute_effective_increments(instruments).items():
+        stored = manifest.get(key)
+        if key in ("effectivePriceIncrement", "effectiveSizeIncrement"):
+            try:
+                stored_dec = Decimal(stored) if stored is not None else None
+            except Exception:
+                stored_dec = None
+            if stored_dec is None or stored_dec != expected:
+                raise ValueError(f"{key} mismatch: expected {expected!r}, got {stored!r}")
+        elif stored != expected:
+            raise ValueError(f"{key} mismatch: expected {expected!r}, got {stored!r}")
+
+    # sourceTickSize from source market if available, else from source input sidecar.
+    source_tick_size = None
+    market_path = source_path / "market.json"
+    if market_path.exists():
+        market_data = json.loads(market_path.read_text(encoding="utf-8"))
+        market = market_data.get("market") or market_data
+        if isinstance(market, dict):
+            source_tick_size = market.get("tickSize")
+    if source_tick_size is None:
+        source_tick_size = source_input_data.get("effectiveReplayConfig", {}).get("sourceTickSize")
+    if source_tick_size != manifest.get("sourceTickSize"):
+        raise ValueError(
+            f"sourceTickSize mismatch: expected {source_tick_size!r}, got {manifest.get('sourceTickSize')!r}"
+        )
+
+    return manifest
 
 
 def replay_catalog(
@@ -278,8 +388,9 @@ def replay_catalog(
     from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
     cat_dir = Path(catalog_directory)
-    cat = ParquetDataCatalog(str(cat_dir))
+    integrity_manifest = _verify_catalog_integrity(cat_dir, allow_unverified=allow_unverified)
 
+    cat = ParquetDataCatalog(str(cat_dir))
     instruments, up_instr, down_instr, up_deltas, down_deltas = _catalog_read(cat)
 
     up_book = OrderBook(up_instr.id, book_type=BookType.L2_MBP)
@@ -352,37 +463,13 @@ def replay_catalog(
 
     input_stream = _build_input_stream(up_deltas, down_deltas, up_instr, down_instr, cat, cat_dir)
 
-    source_corpus_hash, source_events_hash, source_line_count, verifier_parameters = (
-        _read_source_corpus_hash(cat_dir)
+    catalog_fields = _catalog_integrity_fields(
+        input_stream, instruments, integrity_manifest.get("sourceCorpusLineCount", 0)
     )
-    integrity_manifest = _read_integrity_manifest(cat_dir)
-    conversion_report = _read_conversion_report(cat_dir)
-
-    if not integrity_manifest.get("verifierParameters", {}).get("verify") and not allow_unverified:
-        raise ValueError("catalog was converted with verification disabled")
-
-    if integrity_manifest.get("runId") != conversion_report.get("sourceRunId"):
-        raise ValueError(
-            f"runId mismatch: integrity manifest {integrity_manifest.get('runId')!r} "
-            f"vs conversion report {conversion_report.get('sourceRunId')!r}"
-        )
-
-    if integrity_manifest.get("sourceCorpusHash") != source_corpus_hash:
-        raise ValueError("source corpus hash mismatch")
-    if integrity_manifest.get("sourceEventsHash") != source_events_hash:
-        raise ValueError("source events hash mismatch")
-    if integrity_manifest.get("verifierParameters") != verifier_parameters:
-        raise ValueError("verifier parameters mismatch")
-
-    catalog_fields = _catalog_integrity_fields(input_stream, instruments, source_line_count)
-    for key, expected in catalog_fields.items():
-        stored = integrity_manifest.get(key)
-        if stored != expected:
-            raise ValueError(f"integrity mismatch for {key}: expected {expected!r}, got {stored!r}")
 
     return ReplayResult(
-        run_id=integrity_manifest.get("runId", conversion_report.get("sourceRunId", "")),
-        source_corpus_hash=source_corpus_hash,
+        run_id=integrity_manifest.get("runId", ""),
+        source_corpus_hash=integrity_manifest.get("sourceCorpusHash", ""),
         normalized_engine_input_hash=catalog_fields["normalizedEngineInputHash"],
         strategy_visible_input_hash=catalog_fields["strategyVisibleInputHash"],
         up_book_after_each_event=up_after,
@@ -439,12 +526,19 @@ def _to_dict(obj: Any) -> dict:
 
 
 def _instrument_token_map(cat_dir: Path) -> dict[str, str]:
-    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+    """Map instrument outcome (UP/DOWN) to the original source token id."""
+    import pyarrow.parquet as pq
 
-    cat = ParquetDataCatalog(str(cat_dir))
+    lineage_path = cat_dir / "lineage.parquet"
     out: dict[str, str] = {}
-    for instr in cat.instruments():
-        out[instr.outcome] = instr.raw_symbol.value
+    if not lineage_path.exists():
+        return out
+    for row in pq.read_table(lineage_path).to_pylist():
+        if row.get("recordType") == "Instrument":
+            outcome = row.get("outcome")
+            token_id = row.get("tokenId") or row.get("resolvedTokenId")
+            if outcome and token_id:
+                out[outcome] = token_id
     return out
 
 

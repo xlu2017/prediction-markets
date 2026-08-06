@@ -226,8 +226,8 @@ def test_hash_sensitivity_event_reordering_changes_hashes(tmp_path: Path) -> Non
     assert h_mod["strategyVisibleInputHash"] != h_base["strategyVisibleInputHash"]
 
 
-def test_replay_fails_closed_when_source_corpus_hash_missing(tmp_path: Path) -> None:
-    """Replay must raise when the source-corpus integrity artifact is missing."""
+def test_replay_fails_closed_when_source_events_missing(tmp_path: Path) -> None:
+    """Replay must raise when the source events.jsonl is missing."""
     base = F.sample_events()
     run_dir = tmp_path / "run"
     cat_dir = tmp_path / "catalog"
@@ -235,13 +235,13 @@ def test_replay_fails_closed_when_source_corpus_hash_missing(tmp_path: Path) -> 
     manifest = F.base_manifest(m, finalEventCount=4)
     F.write_run(run_dir, manifest, F.base_health(), base, market=m)
     convert_run(run_dir, cat_dir, verify=False, min_reference_observations=1)
-    (cat_dir / "source-corpus-hash.json").unlink()
-    with pytest.raises(ValueError, match="source-corpus-hash.json missing"):
+    (run_dir / "events.jsonl").unlink()
+    with pytest.raises(ValueError, match="source events.jsonl missing"):
         replay_catalog(cat_dir, allow_unverified=True)
 
 
-def test_replay_rejects_malformed_source_corpus_hash(tmp_path: Path) -> None:
-    """Replay must reject a non-64-character-hex source corpus hash."""
+def test_replay_rejects_tampered_source_corpus_hash(tmp_path: Path) -> None:
+    """Replay must detect a tampered source corpus hash in the integrity manifest."""
     base = F.sample_events()
     run_dir = tmp_path / "run"
     cat_dir = tmp_path / "catalog"
@@ -249,10 +249,11 @@ def test_replay_rejects_malformed_source_corpus_hash(tmp_path: Path) -> None:
     manifest = F.base_manifest(m, finalEventCount=4)
     F.write_run(run_dir, manifest, F.base_health(), base, market=m)
     convert_run(run_dir, cat_dir, verify=False, min_reference_observations=1)
-    (cat_dir / "source-corpus-hash.json").write_text(
-        json.dumps({"sourceCorpusHash": "deadbeef"}), encoding="utf-8"
-    )
-    with pytest.raises(ValueError, match="invalid sourceCorpusHash"):
+    manifest_path = cat_dir / "integrity-manifest.json"
+    stored = json.loads(manifest_path.read_text(encoding="utf-8"))
+    stored["sourceCorpusHash"] = "deadbeef"
+    manifest_path.write_text(json.dumps(stored, indent=2), encoding="utf-8")
+    with pytest.raises(ValueError, match="sourceCorpusHash mismatch"):
         replay_catalog(cat_dir, allow_unverified=True)
 
 
@@ -280,11 +281,7 @@ def test_replay_rejects_tampered_catalog(tmp_path: Path) -> None:
     F.write_run(run_dir, manifest, F.base_health(), base, market=m)
     convert_run(run_dir, cat_dir, verify=False, min_reference_observations=1)
 
-    up_path = next(
-        p
-        for p in cat_dir.rglob("*.parquet")
-        if "111111" in str(p) and "order_book_deltas" in str(p)
-    )
+    up_path = next(p for p in cat_dir.rglob("*.parquet") if "order_book_deltas" in str(p))
     table = pq.read_table(up_path)
     rows = table.to_pydict()
     for i, side in enumerate(rows["side"]):
@@ -294,5 +291,5 @@ def test_replay_rejects_tampered_catalog(tmp_path: Path) -> None:
     new_table = pa.Table.from_pydict(rows, schema=table.schema)
     pq.write_table(new_table, up_path)
 
-    with pytest.raises(ValueError, match="integrity mismatch"):
+    with pytest.raises(ValueError, match="mismatch"):
         replay_catalog(cat_dir, allow_unverified=True)

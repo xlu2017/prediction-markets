@@ -20,7 +20,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .hashes import hash_value
+from .hashes import canonical_json, hash_json_file, hash_parquet_rows, hash_value
 from .models import (
     Level,
     LifecycleEvent,
@@ -80,7 +80,16 @@ def _catalog_record_id(
 
 
 def _instrument_id(condition_id: str, token_id: str) -> str:
+    """Canonical long instrument identifier used in the normalized intermediate format."""
     return f"{condition_id}-{token_id}.{POLYMARKET_VENUE}"
+
+
+def _short_instrument_symbol(condition_id: str, token_id: str) -> str:
+    """Short, stable Nautilus symbol for the instrument ID to avoid filesystem path limits."""
+    import hashlib
+
+    digest = hashlib.sha256(f"{condition_id}:{token_id}".encode("utf-8")).hexdigest()
+    return f"pm{digest[:20]}"  # 22 chars, enough for uniqueness and short paths
 
 
 def _ts_event_ms(env_source_ts: int | None, env_received_at: int) -> int:
@@ -229,6 +238,44 @@ def normalize_event(env, instruments_by_token: dict[str, NormalizedInstrument]) 
         ]
 
     if env.source == "POLYMARKET_REFERENCE_PRICE":
+        et = env.eventType
+        if et in (
+            "CONNECTION_ATTEMPT",
+            "CONNECTION_OPEN",
+            "SUBSCRIPTION_SENT",
+            "SUBSCRIBE",
+            "CONNECTION_ERROR",
+            "CONNECTION_CLOSED",
+            "DATA_GAP_STARTED",
+            "DATA_GAP_ENDED",
+            "RECONNECT_SCHEDULED",
+            "STALE_STREAM",
+            "BOOK_RESYNC_REQUIRED",
+        ):
+            return [
+                NormalizedLifecycleEvent(
+                    lineage=lin,
+                    kind=et,
+                    generation=env.connectionGeneration,
+                    detail=str(env.dedupeReason or ""),
+                    payloadJson=json.dumps(env.payload, sort_keys=True, default=str)
+                    if env.payload is not None
+                    else "",
+                )
+            ]
+        if et in ("EMPTY_FRAME", "IGNORED_FOREIGN_MARKET", "PING", "PONG"):
+            return [
+                NormalizedAuditEvent(
+                    lineage=lin,
+                    kind=et,
+                    originalEventType=et,
+                    originalPayload=env.payload,
+                    rawText=env.rawText,
+                    rawMessageText=env.rawMessageText,
+                )
+            ]
+        if et != "REFERENCE_PRICE":
+            return [_audit_unsupported(env, lin, f"unsupported reference price eventType {et}")]
         payload = env.payload if isinstance(env.payload, dict) else {}
         inner_raw = payload.get("payload")
         inner: dict = inner_raw if isinstance(inner_raw, dict) else {}
@@ -463,37 +510,43 @@ def normalize_run(run: RunDirectory) -> NormalizedRun:
 # --- Nautilus construction ------------------------------------------------------
 
 
-def _build_binary_option(instr: NormalizedInstrument):
+def _build_binary_option(
+    instr: NormalizedInstrument,
+    *,
+    price_increment: Decimal,
+    size_increment: Decimal,
+    price_precision: int,
+    size_precision: int,
+):
     from nautilus_trader.model.currencies import pUSD
     from nautilus_trader.model.enums import AssetClass
     from nautilus_trader.model.identifiers import InstrumentId, Symbol
     from nautilus_trader.model.instruments import BinaryOption
     from nautilus_trader.model.objects import Price, Quantity
 
-    iid = InstrumentId.from_str(instr.instrumentId)
-    price_increment = Price.from_str(instr.tickSize) if instr.tickSize else Price.from_str("0.01")
-    size_increment = Quantity.from_str("0.000001")
-    expiration_ns = _iso_to_ns(instr.closesAt)
-    ts_init = _iso_to_ns(instr.opensAt) or 0
+    short_symbol = _short_instrument_symbol(instr.conditionId, instr.tokenId)
+    iid = InstrumentId.from_str(f"{short_symbol}.{POLYMARKET_VENUE}")
+    price_str = f"{price_increment:.{price_precision}f}"
+    size_str = f"{size_increment:.{size_precision}f}"
     return BinaryOption(
         instrument_id=iid,
-        raw_symbol=Symbol(instr.tokenId),
+        raw_symbol=Symbol(short_symbol),
         outcome=instr.outcome,
         description=instr.question or instr.slug,
         asset_class=AssetClass.ALTERNATIVE,
         currency=pUSD,
-        price_increment=price_increment,
-        price_precision=price_increment.precision,
-        size_increment=size_increment,
-        size_precision=size_increment.precision,
+        price_increment=Price.from_str(price_str),
+        price_precision=price_precision,
+        size_increment=Quantity.from_str(size_str),
+        size_precision=size_precision,
         activation_ns=0,
-        expiration_ns=expiration_ns,
+        expiration_ns=_iso_to_ns(instr.closesAt),
         max_quantity=None,
         min_quantity=None,
         maker_fee=Decimal("0"),
         taker_fee=Decimal("0"),
-        ts_init=ts_init,
-        ts_event=ts_init,
+        ts_init=_iso_to_ns(instr.opensAt) or 0,
+        ts_event=_iso_to_ns(instr.opensAt) or 0,
     )
 
 
@@ -508,6 +561,162 @@ def _iso_to_ns(iso: str) -> int:
 
 def _ms_to_ns(ms: int | None) -> int:
     return int(ms) * _MS_TO_NS if ms is not None else 0
+
+
+def _decimal_exponent(value: str) -> int:
+    """Return the base-10 exponent of a decimal lexeme.
+
+    ``Decimal(value).as_tuple().exponent`` is negative for fractional values.
+    The most-negative exponent in a set of prices/quantities is the smallest
+    power-of-10 unit needed to represent every value exactly.
+    """
+    return Decimal(value).as_tuple().exponent
+
+
+def _derive_effective_increments(normalized: NormalizedRun) -> tuple[Decimal, Decimal, int, int]:
+    """Find the smallest ``10**n`` increments that preserve every source price and quantity."""
+    price_exponents: list[int] = []
+    size_exponents: list[int] = []
+
+    for instr in normalized.instruments:
+        if instr.tickSize is not None:
+            price_exponents.append(_decimal_exponent(instr.tickSize))
+
+    for snap in normalized.snapshots:
+        for lv in [*snap.bids, *snap.asks]:
+            price_exponents.append(_decimal_exponent(lv.price))
+            size_exponents.append(_decimal_exponent(lv.size))
+
+    for d in normalized.deltas:
+        price_exponents.append(_decimal_exponent(d.price))
+        size_exponents.append(_decimal_exponent(d.size))
+
+    for t in normalized.trades:
+        price_exponents.append(_decimal_exponent(t.price))
+        size_exponents.append(_decimal_exponent(t.size))
+
+    default_price_exp = -2
+    default_size_exp = -6
+    if not price_exponents:
+        price_exponents.append(default_price_exp)
+    if not size_exponents:
+        size_exponents.append(default_size_exp)
+
+    min_price_exp = min(price_exponents)
+    min_size_exp = min(size_exponents)
+
+    price_increment = Decimal(10) ** min_price_exp
+    size_increment = Decimal(10) ** min_size_exp
+
+    return price_increment, size_increment, -min_price_exp, -min_size_exp
+
+
+def _build_source_input(normalized: NormalizedRun, effective_replay_config: dict) -> dict:
+    """Canonical pre-catalog normalized source records for the source-input commitment."""
+    records: list[dict] = []
+
+    for instr in normalized.instruments:
+        records.append(
+            {
+                "recordType": "Instrument",
+                "lineage": instr.lineage.to_dict(),
+                "instrumentId": instr.instrumentId,
+                "conditionId": instr.conditionId,
+                "tokenId": instr.tokenId,
+                "outcome": instr.outcome,
+                "slug": instr.slug,
+                "question": instr.question,
+                "opensAt": instr.opensAt,
+                "closesAt": instr.closesAt,
+                "tickSize": instr.tickSize,
+                "minOrderSize": instr.minOrderSize,
+                "collateralCurrency": instr.collateralCurrency,
+                "rawGammaText": instr.rawGammaText,
+            }
+        )
+
+    for snap in normalized.snapshots:
+        records.append(
+            {
+                "recordType": "BookSnapshot",
+                "lineage": snap.lineage.to_dict(),
+                "instrumentId": snap.instrumentId,
+                "bids": [{"price": lv.price, "size": lv.size} for lv in snap.bids],
+                "asks": [{"price": lv.price, "size": lv.size} for lv in snap.asks],
+                "sourceTimestamp": snap.sourceTimestamp,
+            }
+        )
+
+    for d in normalized.deltas:
+        records.append(
+            {
+                "recordType": "BookDelta",
+                "lineage": d.lineage.to_dict(),
+                "instrumentId": d.instrumentId,
+                "side": d.side,
+                "price": d.price,
+                "size": d.size,
+                "sourceTimestamp": d.sourceTimestamp,
+            }
+        )
+
+    for t in normalized.trades:
+        records.append(
+            {
+                "recordType": "Trade",
+                "lineage": t.lineage.to_dict(),
+                "instrumentId": t.instrumentId,
+                "price": t.price,
+                "size": t.size,
+                "aggressorSide": t.aggressorSide,
+                "sourceTimestamp": t.sourceTimestamp,
+            }
+        )
+
+    for r in normalized.references:
+        records.append(
+            {
+                "recordType": "ReferencePrice",
+                "lineage": r.lineage.to_dict(),
+                "symbol": r.symbol,
+                "topic": r.topic,
+                "value": r.value,
+                "topLevelSourceTimestamp": r.topLevelSourceTimestamp,
+                "payloadSourceTimestamp": r.payloadSourceTimestamp,
+                "sourceTimestamp": r.sourceTimestamp,
+            }
+        )
+
+    for ev in normalized.lifecycle:
+        records.append(
+            {
+                "recordType": "LifecycleEvent",
+                "lineage": ev.lineage.to_dict(),
+                "kind": ev.kind,
+                "generation": ev.generation,
+                "detail": ev.detail,
+                "payloadJson": ev.payloadJson,
+            }
+        )
+
+    for a in normalized.audit:
+        records.append(
+            {
+                "recordType": "AuditEvent",
+                "lineage": a.lineage.to_dict(),
+                "kind": a.kind,
+                "originalEventType": a.originalEventType,
+                "originalPayload": a.originalPayload,
+                "rawText": a.rawText,
+                "rawMessageText": a.rawMessageText,
+            }
+        )
+
+    records.sort(
+        key=lambda r: (r["lineage"]["sourceSequence"], r["lineage"]["childIndex"], r["recordType"])
+    )
+
+    return {"records": records, "effectiveReplayConfig": effective_replay_config}
 
 
 def _snapshot_to_deltas(
@@ -691,7 +900,7 @@ def _trade_to_nautilus(
         agg = AggressorSide.BUYER
     elif t.aggressorSide == "SELL":
         agg = AggressorSide.SELLER
-    trade_id = TradeId(f"{t.lineage.runId}-{t.lineage.sourceSequence}-{t.lineage.childIndex}")
+    trade_id = TradeId(f"{t.lineage.sourceSequence}-{t.lineage.childIndex}")
     trade = TradeTick(
         instrument_id=iid,
         price=instr.make_price(Decimal(t.price)),
@@ -752,39 +961,55 @@ def _lifecycle_to_nautilus(
     return cd, lineage_rows
 
 
-def _check_precision(
-    source_price: str, instr, context: str, lineage: Lineage, issues: list[dict]
+def _check_round_trip(
+    source_value: str,
+    instr,
+    make_method,
+    field_name: str,
+    context: str,
+    lineage: Lineage,
+    issues: list[dict],
 ) -> None:
-    """Check if a source decimal price round-trips through instrument tick precision."""
+    """Check if a source decimal price/quantity round-trips through the instrument increment."""
     try:
-        src = Decimal(source_price)
-        made = instr.make_price(src)
+        src = Decimal(source_value)
+        made = make_method(src)
         rt = Decimal(str(made))
         if rt != src:
             issues.append(
                 {
-                    "context": context,
+                    "context": f"{context}:{field_name}",
                     "sourceSequence": lineage.sourceSequence,
                     "childIndex": lineage.childIndex,
-                    "sourcePrice": source_price,
-                    "instrumentPrice": str(made),
-                    "tickSize": str(instr.price_increment),
+                    f"source{field_name.capitalize()}": source_value,
+                    f"instrument{field_name.capitalize()}": str(made),
+                    "effectiveIncrement": str(getattr(instr, f"{field_name}_increment")),
                 }
             )
-    except Exception:
+    except Exception as exc:
         issues.append(
             {
-                "context": context,
+                "context": f"{context}:{field_name}",
                 "sourceSequence": lineage.sourceSequence,
                 "childIndex": lineage.childIndex,
-                "sourcePrice": source_price,
-                "error": "precision check failed",
+                f"source{field_name.capitalize()}": source_value,
+                "error": f"{field_name} round-trip check failed: {exc}",
             }
         )
 
 
-def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> dict:
-    """Write normalized records into a Nautilus Parquet catalog + lineage sidecar.
+def write_catalog(
+    normalized: NormalizedRun,
+    catalog_directory: str | Path,
+    *,
+    source_events_hash: str,
+    source_corpus_line_count: int,
+    expected_final_books: dict[str, Any],
+    verifier_parameters: dict[str, Any],
+    source_run_path: str | Path,
+    run_manifest: dict[str, Any] | None = None,
+) -> dict:
+    """Write normalized records into a Nautilus Parquet catalog + integrity manifest.
 
     Returns the machine-readable conversion report.
     """
@@ -795,10 +1020,29 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
         shutil.rmtree(cat_dir)
     cat_dir.mkdir(parents=True, exist_ok=True)
 
+    # --- Phase 2a: derive effective price/size increments that preserve every source value.
+    price_increment, size_increment, price_precision, size_precision = _derive_effective_increments(
+        normalized
+    )
+    effective_replay_config = {
+        "effectivePriceIncrement": str(price_increment),
+        "effectiveSizeIncrement": str(size_increment),
+        "effectivePricePrecision": price_precision,
+        "effectiveSizePrecision": size_precision,
+        "sourceTickSize": normalized.instruments[0].tickSize if normalized.instruments else None,
+    }
+
+    # --- Phase 2b: build instruments with effective increments.
     instruments_by_id: dict[str, Any] = {}
     nautilus_instruments = []
     for instr in normalized.instruments:
-        bo = _build_binary_option(instr)
+        bo = _build_binary_option(
+            instr,
+            price_increment=price_increment,
+            size_increment=size_increment,
+            price_precision=price_precision,
+            size_precision=size_precision,
+        )
         instruments_by_id[instr.instrumentId] = bo
         nautilus_instruments.append(bo)
 
@@ -834,7 +1078,10 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
 
     # Instrument lineage (one row per instrument).
     for instr in normalized.instruments:
-        catalog_lineage_rows.append(_add_lineage_row(instr.lineage.to_dict(), "Instrument"))
+        row = _add_lineage_row(instr.lineage.to_dict(), "Instrument")
+        row["outcome"] = instr.outcome
+        row["tokenId"] = instr.tokenId
+        catalog_lineage_rows.append(row)
 
     # Process all engine-bound records in recorder order (sourceSequence, childIndex)
     # so the ReplayClock produces monotonically increasing timestamps that preserve
@@ -862,12 +1109,12 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
             catalog_lineage_rows.extend([_add_lineage_row(r) for r in rows])
             snapshot_count += 1
             for lv in [*snap.bids, *snap.asks]:
-                _check_precision(
-                    lv.price,
-                    instruments_by_id[snap.instrumentId],
-                    "snapshot",
-                    snap.lineage,
-                    precision_issues,
+                instr = instruments_by_id[snap.instrumentId]
+                _check_round_trip(
+                    lv.price, instr, instr.make_price, "price", "snapshot", snap.lineage, precision_issues
+                )
+                _check_round_trip(
+                    lv.size, instr, instr.make_qty, "size", "snapshot", snap.lineage, precision_issues
                 )
         elif rtype == "delta":
             d = rec
@@ -875,8 +1122,12 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
             all_deltas.append(deltas_obj)
             catalog_lineage_rows.extend([_add_lineage_row(r) for r in rows])
             delta_count += 1
-            _check_precision(
-                d.price, instruments_by_id[d.instrumentId], "delta", d.lineage, precision_issues
+            instr = instruments_by_id[d.instrumentId]
+            _check_round_trip(
+                d.price, instr, instr.make_price, "price", "delta", d.lineage, precision_issues
+            )
+            _check_round_trip(
+                d.size, instr, instr.make_qty, "size", "delta", d.lineage, precision_issues
             )
         elif rtype == "trade":
             t = rec
@@ -884,8 +1135,12 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
             all_trades.append(trade_obj)
             catalog_lineage_rows.extend([_add_lineage_row(r) for r in rows])
             trade_count += 1
-            _check_precision(
-                t.price, instruments_by_id[t.instrumentId], "trade", t.lineage, precision_issues
+            instr = instruments_by_id[t.instrumentId]
+            _check_round_trip(
+                t.price, instr, instr.make_price, "price", "trade", t.lineage, precision_issues
+            )
+            _check_round_trip(
+                t.size, instr, instr.make_qty, "size", "trade", t.lineage, precision_issues
             )
         elif rtype == "ref":
             r = rec
@@ -900,19 +1155,20 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
             catalog_lineage_rows.extend([_add_lineage_row(r) for r in rows])
             lifecycle_count += 1
 
-    # Abort if any precision loss was detected — sub-tick prices must not be silently quantized.
+    # Abort if any price/quantity round-trip fails.
     if precision_issues:
         issue_lines = [
             f"  seq {pi.get('sourceSequence')} child {pi.get('childIndex')}: "
-            f"{pi.get('sourcePrice')} -> {pi.get('instrumentPrice', pi.get('error'))}"
+            f"{pi.get('sourcePrice', pi.get('sourceSize', pi.get('error')))} -> "
+            f"{pi.get('instrumentPrice', pi.get('instrumentSize', pi.get('error')))}"
             for pi in precision_issues[:10]
         ]
         suffix = (
             f"\n  ... and {len(precision_issues) - 10} more" if len(precision_issues) > 10 else ""
         )
         raise ValueError(
-            f"conversion aborted: {len(precision_issues)} precision loss issue(s) detected. "
-            f"Source prices contain sub-tick values that would be quantized by instrument precision."
+            f"conversion aborted: {len(precision_issues)} round-trip precision issue(s) detected. "
+            f"Source prices/quantities contain values that would be quantized by instrument precision."
             f"\n{'\n'.join(issue_lines)}{suffix}"
         )
 
@@ -964,8 +1220,9 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
         *normalized.audit,
     ]
     source_sequences = {e.lineage.sourceSequence for e in all_records}
-    report = {
+    report: dict[str, Any] = {
         "sourceRunId": normalized.runId,
+        "sourceRunPath": str(Path(source_run_path).resolve()),
         "sourceEventCount": len(source_sequences),
         "convertedSnapshotCount": snapshot_count,
         "convertedDeltaCount": delta_count,
@@ -985,9 +1242,79 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
         "unsupportedEventTypes": sorted(
             {a.originalEventType for a in normalized.audit if a.kind == "UNSUPPORTED_SOURCE_EVENT"}
         ),
+        "verifierParameters": verifier_parameters,
+        "sourceCorpusHash": source_events_hash,
+        "sourceEventsHash": source_events_hash,
+        "sourceCorpusLineCount": source_corpus_line_count,
+        "integrityManifest": str(cat_dir / "integrity-manifest.json"),
     }
     report_path = cat_dir / "conversion-report.json"
     report_path.write_text(json.dumps(report, indent=2), encoding="utf-8")
+
+    # Expected final-book health sidecar for self-contained final-book comparison.
+    expected = {
+        tid: {
+            "tokenId": book.get("tokenId"),
+            "state": book.get("state"),
+            "integrity": book.get("integrity"),
+            "bestBid": book.get("bestBid"),
+            "bestAsk": book.get("bestAsk"),
+            "bidDepthCount": book.get("bidDepthCount"),
+            "askDepthCount": book.get("askDepthCount"),
+            "lastSuccessfulUpdateTime": book.get("lastSuccessfulUpdateTime"),
+        }
+        for tid, book in expected_final_books.items()
+    }
+    expected_path = cat_dir / "expected-final-books.json"
+    expected_path.write_text(json.dumps(expected, indent=2), encoding="utf-8")
+
+    # Pre-catalog source-input sidecar (normalized records before Nautilus construction).
+    source_input = _build_source_input(normalized, effective_replay_config)
+    source_input_path = cat_dir / "normalized-source-input.json"
+    source_input_path.write_text(canonical_json(source_input), encoding="utf-8")
+
+    # Catalog-level integrity fields: engine input from the actual Nautilus catalog.
+    cat = ParquetDataCatalog(str(cat_dir))
+    instruments_r, up_instr, down_instr, up_deltas, down_deltas = _catalog_read(cat)
+    input_stream = _build_input_stream(up_deltas, down_deltas, up_instr, down_instr, cat, cat_dir)
+    integrity_fields = _catalog_integrity_fields(input_stream, instruments_r, source_corpus_line_count)
+
+    # Artifact hashes for the integrity manifest.
+    lineage_hash = hash_parquet_rows(cat_dir / "lineage.parquet")
+    audit_hash = hash_parquet_rows(cat_dir / "audit.parquet") if audit_rows else ""
+    expected_final_books_hash = hash_json_file(expected_path)
+    conversion_report_hash = hash_json_file(report_path)
+    normalized_source_input_hash = hash_json_file(source_input_path)
+
+    integrity_manifest = {
+        "version": "1",
+        "runId": normalized.runId,
+        "schemaVersion": 2,
+        "recorderVersion": (run_manifest or {}).get("recorderVersion", ""),
+        "gitCommit": (run_manifest or {}).get("gitCommit", ""),
+        "canonicalizationVersion": "1",
+        "verifierParameters": verifier_parameters,
+        "sourceCorpusHash": source_events_hash,
+        "sourceEventsHash": source_events_hash,
+        "sourceCorpusLineCount": source_corpus_line_count,
+        "lineageSidecarHash": lineage_hash,
+        "auditSidecarHash": audit_hash,
+        "expectedFinalBooksHash": expected_final_books_hash,
+        "conversionReportHash": conversion_report_hash,
+        "normalizedSourceInputHash": normalized_source_input_hash,
+        "normalizedEngineInputHash": integrity_fields["normalizedEngineInputHash"],
+        "strategyVisibleInputHash": integrity_fields["strategyVisibleInputHash"],
+        "instrumentCatalogHash": integrity_fields["instrumentCatalogHash"],
+        "recordCounts": integrity_fields["recordCounts"],
+        "effectivePriceIncrement": str(price_increment),
+        "effectiveSizeIncrement": str(size_increment),
+        "effectivePricePrecision": price_precision,
+        "effectiveSizePrecision": size_precision,
+        "sourceTickSize": effective_replay_config["sourceTickSize"],
+    }
+    manifest_path = cat_dir / "integrity-manifest.json"
+    manifest_path.write_text(json.dumps(integrity_manifest, indent=2), encoding="utf-8")
+
     return report
 
 
@@ -1040,42 +1367,6 @@ def _verify_run_directory(run_directory: str | Path, min_reference_observations:
     raise RuntimeError("TypeScript verifier not available: all candidate runners failed to start")
 
 
-def _sha256_file(path: Path) -> str:
-    return hashlib.sha256(path.read_bytes()).hexdigest()
-
-
-def _source_bundle_hashes(run_directory: str | Path) -> dict[str, Any]:
-    """Compute the source-corpus bundle hash and per-file digests."""
-    run_dir = Path(run_directory)
-    events_path = run_dir / "events.jsonl"
-    if not events_path.exists():
-        raise ValueError(f"events.jsonl not found in {events_path}")
-    raw = events_path.read_bytes()
-    source_events_hash = hashlib.sha256(raw).hexdigest()
-    source_corpus_line_count = len(raw.splitlines())
-
-    bundle_files: dict[str, str] = {
-        "events.jsonl": source_events_hash,
-        "manifest.json": _sha256_file(run_dir / "manifest.json"),
-        "health.json": _sha256_file(run_dir / "health.json"),
-    }
-    market_path = run_dir / "market.json"
-    market_hash = ""
-    if market_path.exists():
-        market_hash = _sha256_file(market_path)
-        bundle_files["market.json"] = market_hash
-    source_corpus_hash = hash_value(bundle_files)
-
-    return {
-        "sourceCorpusHash": source_corpus_hash,
-        "sourceEventsHash": source_events_hash,
-        "sourceCorpusLineCount": source_corpus_line_count,
-        "manifestHash": bundle_files["manifest.json"],
-        "healthHash": bundle_files["health.json"],
-        "marketHash": market_hash,
-    }
-
-
 def convert_run(
     run_directory: str | Path,
     catalog_directory: str | Path,
@@ -1091,59 +1382,17 @@ def convert_run(
 
     run = load_run(run_directory)
     normalized = normalize_run(run)
-    report = write_catalog(normalized, catalog_directory)
-    bundle = _source_bundle_hashes(run_directory)
+    run_dir = Path(run_directory).resolve()
+    events_path = run_dir / "events.jsonl"
+    if not events_path.exists():
+        raise ValueError(f"events.jsonl not found in {run_dir}")
+    raw = events_path.read_bytes()
+    source_events_hash = hashlib.sha256(raw).hexdigest()
+    source_corpus_line_count = len(raw.splitlines())
     verifier_parameters = {
         "minReferenceObservations": min_reference_observations,
         "verify": verify,
     }
-
-    cat_dir = Path(catalog_directory)
-    from nautilus_trader.persistence.catalog import ParquetDataCatalog
-
-    cat = ParquetDataCatalog(str(cat_dir))
-    instruments, up_instr, down_instr, up_deltas, down_deltas = _catalog_read(cat)
-    input_stream = _build_input_stream(up_deltas, down_deltas, up_instr, down_instr, cat, cat_dir)
-    integrity_fields = _catalog_integrity_fields(
-        input_stream, instruments, bundle["sourceCorpusLineCount"]
-    )
-    integrity_manifest = {
-        "version": "1",
-        "runId": run.run_id,
-        "schemaVersion": 2,
-        "recorderVersion": run.manifest.get("recorderVersion", ""),
-        "gitCommit": run.manifest.get("gitCommit", "") or "",
-        "canonicalizationVersion": "1",
-        "verifierParameters": verifier_parameters,
-        "sourceCorpusHash": bundle["sourceCorpusHash"],
-        "sourceEventsHash": bundle["sourceEventsHash"],
-        "manifestHash": bundle["manifestHash"],
-        "healthHash": bundle["healthHash"],
-        "marketHash": bundle["marketHash"],
-        **integrity_fields,
-    }
-    (cat_dir / "integrity-manifest.json").write_text(
-        json.dumps(integrity_manifest, indent=2), encoding="utf-8"
-    )
-    (cat_dir / "source-corpus-hash.json").write_text(
-        json.dumps(
-            {
-                "sourceCorpusHash": bundle["sourceCorpusHash"],
-                "sourceEventsHash": bundle["sourceEventsHash"],
-                "sourceCorpusLineCount": bundle["sourceCorpusLineCount"],
-                "verifierParameters": verifier_parameters,
-            },
-            indent=2,
-        ),
-        encoding="utf-8",
-    )
-
-    report["sourceCorpusHash"] = bundle["sourceCorpusHash"]
-    report["sourceEventsHash"] = bundle["sourceEventsHash"]
-    report["integrityManifest"] = str(cat_dir / "integrity-manifest.json")
-    report["verifierParameters"] = verifier_parameters
-    (cat_dir / "conversion-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
-    # Expected final-book health sidecar for self-contained Phase 9 comparison.
     expected = {
         tid: {
             "tokenId": book.get("tokenId"),
@@ -1157,10 +1406,16 @@ def convert_run(
         }
         for tid, book in run.health.get("finalBookHealth", {}).items()
     }
-    (cat_dir / "expected-final-books.json").write_text(
-        json.dumps(expected, indent=2), encoding="utf-8"
+    return write_catalog(
+        normalized,
+        catalog_directory,
+        source_events_hash=source_events_hash,
+        source_corpus_line_count=source_corpus_line_count,
+        expected_final_books=expected,
+        verifier_parameters=verifier_parameters,
+        source_run_path=run_dir,
+        run_manifest=run.manifest,
     )
-    return report
 
 
 def _main() -> int:

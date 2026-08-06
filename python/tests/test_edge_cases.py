@@ -794,7 +794,7 @@ def test_backtest_node_proof(tmp_path: Path) -> None:
     F.write_sample_run(tmp_path)
     cat_dir = tmp_path / "catalog"
     convert_run(tmp_path, cat_dir, verify=False)
-    result = run_backtest_proof(cat_dir)
+    result = run_backtest_proof(cat_dir, allow_unverified=True)
     assert result.ran, f"BacktestNode did not run: {result.error}"
     assert result.book_events_received > 0, "Strategy received no book events"
     assert result.orders_submitted > 0, "Strategy submitted no orders"
@@ -823,7 +823,7 @@ def test_backtest_node_recorder_order_with_regressing_timestamps(tmp_path: Path)
     F.write_regressing_timestamp_run(tmp_path)
     cat_dir = tmp_path / "catalog"
     convert_run(tmp_path, cat_dir, verify=False)
-    result = run_backtest_proof(cat_dir)
+    result = run_backtest_proof(cat_dir, allow_unverified=True)
     assert result.ran, f"BacktestNode did not run: {result.error}"
     assert result.book_events_received > 0, "Strategy received no book events"
     ledger = result.received_ledger
