@@ -94,9 +94,9 @@ def test_duplicate_event_routed_to_audit(tmp_path: Path) -> None:
     manifest = F.base_manifest(F.base_market(), finalEventCount=5)
     health = F.base_health(totalEventsReceived=5, duplicateEventCount=1)
     # Update event counts to include the duplicate event.
-    # Only UNIQUE_APPLIED events are counted (the duplicate is DUPLICATE_APPLIED).
-    health["eventCountsBySource"]["POLYMARKET_CLOB"] = 2
-    health["eventCountsByType"]["POLYMARKET_CLOB:book"] = 2
+    # The recorder counts all persisted envelopes, including DUPLICATE_APPLIED.
+    health["eventCountsBySource"]["POLYMARKET_CLOB"] = 3
+    health["eventCountsByType"]["POLYMARKET_CLOB:book"] = 3
     F.write_run(
         tmp_path,
         manifest,
@@ -109,6 +109,31 @@ def test_duplicate_event_routed_to_audit(tmp_path: Path) -> None:
     assert any(a.kind == "DEDUPLICATED_COPY" for a in normalized.audit)
     # The duplicate is not fed to the engine (no extra snapshot).
     assert len(normalized.snapshots) == 2
+
+
+# --- 6b. Rejected (RECEIVED_NOT_APPLIED) event ---
+
+
+def test_rejected_event_routed_to_audit(tmp_path: Path) -> None:
+    """A RECEIVED_NOT_APPLIED event must be audit-only, not fed to the engine."""
+    events = F.sample_events()
+    rejected = dict(events[1])
+    rejected["sequence"] = 5
+    rejected["isDuplicate"] = False
+    rejected["dedupeState"] = "RECEIVED_NOT_APPLIED"
+    rejected["duplicateOfSequence"] = None
+    rejected["dedupeReason"] = "STALE_GENERATION"
+    manifest = F.base_manifest(F.base_market(), finalEventCount=5)
+    health = F.base_health(totalEventsReceived=5)
+    health["eventCountsBySource"]["POLYMARKET_CLOB"] = 3
+    health["eventCountsByType"]["POLYMARKET_CLOB:book"] = 3
+    F.write_run(tmp_path, manifest, health, events + [rejected], market=F.base_market())
+    run = load_run(tmp_path)
+    normalized = normalize_run(run)
+    assert any(a.kind == "REJECTED_NOT_APPLIED" for a in normalized.audit)
+    # The rejected event is not fed to the engine (no extra snapshot).
+    assert len(normalized.snapshots) == 2
+    assert len(normalized.deltas) == 0
 
 
 # --- 7. Snapshot followed by deltas ---
@@ -760,11 +785,11 @@ def test_backtest_node_proof(tmp_path: Path) -> None:
     assert result.orders_submitted > 0, "Strategy submitted no orders"
     assert len(result.account_balances) > 0, "No account balances captured"
     # The crossing order at the best ask should produce a fill.
-    assert result.fills_count > 0, "No fills Ã¢â‚¬â€ crossing order did not match"
-    # The strategy should have received deltas in non-decreasing sequence order.
-    seqs = result.received_sequences
-    assert len(seqs) > 0, "No sequence values recorded"
-    assert seqs == sorted(seqs), f"Sequences not in order: {seqs}"
+    assert result.fills_count > 0, "No fills -- crossing order did not match"
+    # The strategy received Up/Down/Chainlink events in the expected canonical order.
+    ledger = result.received_ledger
+    assert len(ledger) > 0, "No events recorded"
+    assert result.ledger_match, f"Received ledger does not match expected: {ledger}"
 
 
 # --- 22b. BacktestNode recorder-order proof with regressing timestamps ---
@@ -786,12 +811,15 @@ def test_backtest_node_recorder_order_with_regressing_timestamps(tmp_path: Path)
     result = run_backtest_proof(cat_dir)
     assert result.ran, f"BacktestNode did not run: {result.error}"
     assert result.book_events_received > 0, "Strategy received no book events"
-    seqs = result.received_sequences
-    assert len(seqs) > 0, "No sequence values recorded"
-    # Sequences should be non-decreasing (recorder order), even though sourceTimestamp regresses.
-    assert seqs == sorted(seqs), f"Sequences not in recorder order: {seqs}"
-    # The first delta should be from seq 2 (processedAt=106), not seq 4 (processedAt=156).
-    first_seq = seqs[0] // 1_000_000
+    ledger = result.received_ledger
+    assert len(ledger) > 0, "No events recorded"
+    # Ledger should be in (sourceSequence, childIndex) order even though sourceTimestamp regresses.
+    sorted_ledger = sorted(
+        ledger, key=lambda x: (x["sourceSequence"], x["childIndex"], x["eventType"])
+    )
+    assert ledger == sorted_ledger, f"Events not in recorder order: {ledger}"
+    # The first delta should be from seq 2 (receivedAt=106), not seq 4 (receivedAt=156).
+    first_seq = ledger[0]["sourceSequence"]
     assert first_seq == 2, f"First event should be from seq 2, got seq {first_seq}"
 
 

@@ -39,27 +39,28 @@ POLYMARKET_VENUE = "POLYMARKET"
 # Nautilus timestamp unit: nanoseconds. Schema-v2 timestamps are Unix milliseconds.
 _MS_TO_NS = 1_000_000
 
-# Replay clock: a monotonic timestamp derived from (sourceSequence, childIndex).
-# The base epoch is 1e15 ns (2001-09-09T01:46:40Z) — well within the Arrow
-# timestamp[ns] range. Each source sequence gets 1ms; each child index gets 1ns
-# within that ms. Supports up to 1_000_000 children per sequence without collision.
-_REPLAY_EPOCH_NS = 1_000_000_000_000_000  # 1e15 ns = 2001-09-09T01:46:40Z
-_REPLAY_SEQ_STEP_NS = 1_000_000  # 1ms per source sequence
-_REPLAY_CHILD_STEP_NS = 1  # 1ns per child index
 
+class ReplayClock:
+    """Stateful monotonic replay clock preserving wall-clock time where possible.
 
-def _replay_ts(source_sequence: int, child_index: int) -> int:
-    """Monotonic replay timestamp from (sourceSequence, childIndex).
+    Uses ``receivedAt`` (in ns) as the candidate timestamp, but enforces strict
+    monotonicity by taking ``max(candidate, previous + 1)``. Child records within
+    one envelope get nanosecond offsets from the envelope's base time.
 
-    Used for ``ts_event`` so the BacktestNode delivers events in recorder order
-    regardless of wall-clock timestamp regressions, ties, or clock skew. Source,
-    receipt, and processing timestamps are retained separately in the lineage.
+    This preserves actual elapsed time between observations, feed-gap durations,
+    staleness intervals, and time remaining until market close — unlike a synthetic
+    compressed clock that destroys all time semantics.
     """
-    return (
-        _REPLAY_EPOCH_NS
-        + source_sequence * _REPLAY_SEQ_STEP_NS
-        + child_index * _REPLAY_CHILD_STEP_NS
-    )
+
+    def __init__(self) -> None:
+        self._last: int = 0
+
+    def next_ts(self, received_at_ms: int, child_index: int = 0) -> int:
+        candidate = received_at_ms * _MS_TO_NS + child_index
+        if candidate <= self._last:
+            candidate = self._last + 1
+        self._last = candidate
+        return candidate
 
 
 def _catalog_record_id(
@@ -183,14 +184,26 @@ def normalize_event(env, instruments_by_token: dict[str, NormalizedInstrument]) 
     market_id = env.marketId or ""
     lin = _lineage(env, market_id)
 
-    # Duplicate handling: only DUPLICATE_APPLIED is definitively a duplicate.
-    # RECEIVED_NOT_APPLIED is an application outcome, not proof of duplication Ã¢â‚¬â€
-    # it could be an empty frame, foreign market, or other audit-only event.
+    # Dedupe-state routing: only UNIQUE_APPLIED events enter the Nautilus engine.
+    # DUPLICATE_APPLIED and RECEIVED_NOT_APPLIED are both audit-only — the recorder
+    # persisted them as historical evidence without mutating accepted state.
     if env.dedupeState == "DUPLICATE_APPLIED":
         return [
             NormalizedAuditEvent(
                 lineage=lin,
                 kind="DEDUPLICATED_COPY",
+                originalEventType=env.eventType,
+                originalPayload=env.payload,
+                rawText=env.rawText,
+                rawMessageText=env.rawMessageText,
+            )
+        ]
+
+    if env.dedupeState == "RECEIVED_NOT_APPLIED":
+        return [
+            NormalizedAuditEvent(
+                lineage=lin,
+                kind="REJECTED_NOT_APPLIED",
                 originalEventType=env.eventType,
                 originalPayload=env.payload,
                 rawText=env.rawText,
@@ -494,7 +507,7 @@ def _ms_to_ns(ms: int | None) -> int:
 
 
 def _snapshot_to_deltas(
-    snap: NormalizedBookSnapshot, instruments_by_id: dict[str, Any]
+    snap: NormalizedBookSnapshot, instruments_by_id: dict[str, Any], clock: ReplayClock
 ) -> tuple[Any, list[dict]]:
     """Convert a snapshot to OrderBookDeltas and return per-row lineage entries.
 
@@ -506,10 +519,10 @@ def _snapshot_to_deltas(
 
     instr = instruments_by_id[snap.instrumentId]
     iid = instr.id
-    # All deltas from one snapshot share the same ts_event (the sequence-level
-    # replay timestamp). The `sequence` field encodes (sourceSequence, childIndex)
-    # for ordering within the batch.
-    ts_event = _replay_ts(snap.lineage.sourceSequence, 0)
+    # All deltas from one snapshot share the same ts_event (the envelope's
+    # receivedAt-based replay time). The `sequence` field encodes
+    # (sourceSequence, childIndex) for ordering within the batch.
+    ts_event = clock.next_ts(snap.lineage.receivedAt, 0)
     ts_init = ts_event
     deltas: list[OrderBookDelta] = []
     lineage_rows: list[dict] = []
@@ -621,14 +634,14 @@ def _snapshot_to_deltas(
 
 
 def _delta_to_nautilus(
-    d: NormalizedBookDelta, instruments_by_id: dict[str, Any]
+    d: NormalizedBookDelta, instruments_by_id: dict[str, Any], clock: ReplayClock
 ) -> tuple[Any, list[dict]]:
     from nautilus_trader.model.data import BookOrder, OrderBookDelta, OrderBookDeltas
     from nautilus_trader.model.enums import BookAction, OrderSide
 
     instr = instruments_by_id[d.instrumentId]
     iid = instr.id
-    ts_event = _replay_ts(d.lineage.sourceSequence, d.lineage.childIndex)
+    ts_event = clock.next_ts(d.lineage.receivedAt, d.lineage.childIndex)
     ts_init = ts_event
     if d.side == "BUY":
         side = OrderSide.BUY
@@ -659,7 +672,7 @@ def _delta_to_nautilus(
 
 
 def _trade_to_nautilus(
-    t: NormalizedTrade, instruments_by_id: dict[str, Any]
+    t: NormalizedTrade, instruments_by_id: dict[str, Any], clock: ReplayClock
 ) -> tuple[Any, list[dict]]:
     from nautilus_trader.model.data import TradeTick
     from nautilus_trader.model.enums import AggressorSide
@@ -667,7 +680,7 @@ def _trade_to_nautilus(
 
     instr = instruments_by_id[t.instrumentId]
     iid = instr.id
-    ts_event = _replay_ts(t.lineage.sourceSequence, t.lineage.childIndex)
+    ts_event = clock.next_ts(t.lineage.receivedAt, t.lineage.childIndex)
     ts_init = ts_event
     agg = AggressorSide.NO_AGGRESSOR
     if t.aggressorSide == "BUY":
@@ -688,10 +701,12 @@ def _trade_to_nautilus(
     return trade, lineage_rows
 
 
-def _reference_to_nautilus(r: NormalizedReferencePrice) -> tuple[Any, list[dict]]:
+def _reference_to_nautilus(
+    r: NormalizedReferencePrice, clock: ReplayClock
+) -> tuple[Any, list[dict]]:
     from nautilus_trader.model.data import CustomData, DataType
 
-    ts_event = _replay_ts(r.lineage.sourceSequence, r.lineage.childIndex)
+    ts_event = clock.next_ts(r.lineage.receivedAt, r.lineage.childIndex)
     ts_init = ts_event
     update = ReferencePriceUpdate(
         ts_event,
@@ -711,10 +726,12 @@ def _reference_to_nautilus(r: NormalizedReferencePrice) -> tuple[Any, list[dict]
     return cd, lineage_rows
 
 
-def _lifecycle_to_nautilus(ev: NormalizedLifecycleEvent) -> tuple[Any, list[dict]]:
+def _lifecycle_to_nautilus(
+    ev: NormalizedLifecycleEvent, clock: ReplayClock
+) -> tuple[Any, list[dict]]:
     from nautilus_trader.model.data import CustomData, DataType
 
-    ts_event = _replay_ts(ev.lineage.sourceSequence, ev.lineage.childIndex)
+    ts_event = clock.next_ts(ev.lineage.receivedAt, ev.lineage.childIndex)
     ts_init = ts_event
     le = LifecycleEvent(
         ts_event,
@@ -801,37 +818,71 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
     for instr in normalized.instruments:
         catalog_lineage_rows.append({**instr.lineage.to_dict(), "recordType": "Instrument"})
 
+    # Process all engine-bound records in recorder order (sourceSequence, childIndex)
+    # so the ReplayClock produces monotonically increasing timestamps that preserve
+    # actual elapsed time where possible.
+    clock = ReplayClock()
+    # Build a unified list of (sort_key, type, record) for all engine-bound records.
+    engine_records: list[tuple[tuple[int, int], str, Any]] = []
     for snap in normalized.snapshots:
-        deltas_obj, rows = _snapshot_to_deltas(snap, instruments_by_id)
-        all_deltas.append(deltas_obj)
-        catalog_lineage_rows.extend(rows)
-        snapshot_count += 1
-        # Check precision: each level price must round-trip through instrument tick precision.
-        for lv in [*snap.bids, *snap.asks]:
-            _check_precision(
-                lv.price,
-                instruments_by_id[snap.instrumentId],
-                "snapshot",
-                snap.lineage,
-                precision_issues,
-            )
+        engine_records.append(((snap.lineage.sourceSequence, 0), "snap", snap))
     for d in normalized.deltas:
-        deltas_obj, rows = _delta_to_nautilus(d, instruments_by_id)
-        all_deltas.append(deltas_obj)
-        catalog_lineage_rows.extend(rows)
-        delta_count += 1
-        _check_precision(
-            d.price, instruments_by_id[d.instrumentId], "delta", d.lineage, precision_issues
-        )
+        engine_records.append(((d.lineage.sourceSequence, d.lineage.childIndex), "delta", d))
     for t in normalized.trades:
-        trade_obj, rows = _trade_to_nautilus(t, instruments_by_id)
-        all_trades.append(trade_obj)
-        catalog_lineage_rows.extend(rows)
-        trade_count += 1
-        _check_precision(
-            t.price, instruments_by_id[t.instrumentId], "trade", t.lineage, precision_issues
-        )
-    # Abort if any precision loss was detected Ã¢â‚¬â€ sub-tick prices must not be silently quantized.
+        engine_records.append(((t.lineage.sourceSequence, t.lineage.childIndex), "trade", t))
+    for r in normalized.references:
+        engine_records.append(((r.lineage.sourceSequence, r.lineage.childIndex), "ref", r))
+    for ev in normalized.lifecycle:
+        engine_records.append(((ev.lineage.sourceSequence, ev.lineage.childIndex), "lifecycle", ev))
+    engine_records.sort(key=lambda x: x[0])
+
+    for _, rtype, rec in engine_records:
+        if rtype == "snap":
+            snap = rec
+            deltas_obj, rows = _snapshot_to_deltas(snap, instruments_by_id, clock)
+            all_deltas.append(deltas_obj)
+            catalog_lineage_rows.extend(rows)
+            snapshot_count += 1
+            for lv in [*snap.bids, *snap.asks]:
+                _check_precision(
+                    lv.price,
+                    instruments_by_id[snap.instrumentId],
+                    "snapshot",
+                    snap.lineage,
+                    precision_issues,
+                )
+        elif rtype == "delta":
+            d = rec
+            deltas_obj, rows = _delta_to_nautilus(d, instruments_by_id, clock)
+            all_deltas.append(deltas_obj)
+            catalog_lineage_rows.extend(rows)
+            delta_count += 1
+            _check_precision(
+                d.price, instruments_by_id[d.instrumentId], "delta", d.lineage, precision_issues
+            )
+        elif rtype == "trade":
+            t = rec
+            trade_obj, rows = _trade_to_nautilus(t, instruments_by_id, clock)
+            all_trades.append(trade_obj)
+            catalog_lineage_rows.extend(rows)
+            trade_count += 1
+            _check_precision(
+                t.price, instruments_by_id[t.instrumentId], "trade", t.lineage, precision_issues
+            )
+        elif rtype == "ref":
+            r = rec
+            ref_obj, rows = _reference_to_nautilus(r, clock)
+            all_refs.append(ref_obj)
+            catalog_lineage_rows.extend(rows)
+            reference_count += 1
+        elif rtype == "lifecycle":
+            ev = rec
+            lc_obj, rows = _lifecycle_to_nautilus(ev, clock)
+            all_lifecycle.append(lc_obj)
+            catalog_lineage_rows.extend(rows)
+            lifecycle_count += 1
+
+    # Abort if any precision loss was detected — sub-tick prices must not be silently quantized.
     if precision_issues:
         issue_lines = [
             f"  seq {pi.get('sourceSequence')} child {pi.get('childIndex')}: "
@@ -846,23 +897,13 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
             f"Source prices contain sub-tick values that would be quantized by instrument precision."
             f"\n{'\n'.join(issue_lines)}{suffix}"
         )
-    for r in normalized.references:
-        ref_obj, rows = _reference_to_nautilus(r)
-        all_refs.append(ref_obj)
-        catalog_lineage_rows.extend(rows)
-        reference_count += 1
-    for ev in normalized.lifecycle:
-        lc_obj, rows = _lifecycle_to_nautilus(ev)
-        all_lifecycle.append(lc_obj)
-        catalog_lineage_rows.extend(rows)
-        lifecycle_count += 1
 
     # Audit events: one lineage row per audit event.
     for a in normalized.audit:
         catalog_lineage_rows.append({**a.lineage.to_dict(), "recordType": "AuditEvent"})
 
     if all_deltas:
-        # Sort by ts_init (processedAt) as required by the catalog.
+        # Sort by ts_init as required by the catalog.
         all_deltas.sort(key=lambda d: d.ts_init if hasattr(d, "ts_init") else 0)
         cat.write_data(all_deltas)
     if all_trades:

@@ -43,8 +43,8 @@ revision but require further validation before a final adoption decision:
    avoid duplicate IDs for batched trades. `ReferencePriceUpdate` and `LifecycleEvent` carry
    `sourceSequence` and `childIndex`.
 6. **Canonical input hash**: The input stream hash includes book deltas, trades, reference
-   observations, lifecycle events (with full typed payload), **and audit events** (duplicates,
-   empty frames, unsupported events) — all ordered by `(sourceSequence, childIndex)`.
+   observations, lifecycle events (with full typed payload), **and audit events** (duplicates, empty
+   frames, unsupported events) — all ordered by `(sourceSequence, childIndex)`.
 7. **Real recorder lifecycle names**: The adapter recognizes `CONNECTION_ATTEMPT`,
    `CONNECTION_OPEN`, `SUBSCRIPTION_SENT`, `CONNECTION_ERROR`, `CONNECTION_CLOSED`,
    `DATA_GAP_STARTED`, `DATA_GAP_ENDED`, `RECONNECT_SCHEDULED`, `STALE_STREAM`, and
@@ -189,8 +189,17 @@ revision but require further validation before a final adoption decision:
 
 ## Recommendation
 
-Proceed with `ADOPT_WITH_CUSTOM_ADAPTER`: keep the TypeScript recorder as the lossless audit layer,
-build the schema-v2 → Nautilus converter and lineage/audit sidecars as the durable boundary, and use
-Nautilus for replay, backtesting, matching/fill simulation, portfolio accounting, and (later) live
-execution. Defer any SDK-based transport replacement to a separate, authenticated live-execution
-workstream outside this read-only spike.
+The evaluation remains **incomplete**. Nautilus demonstrates the required catalog, custom-data,
+backtest, matching, fill, and accounting primitives for the synthetic proof, but several blockers
+must be resolved before a final adoption decision:
+
+- The adapter currently routes `RECEIVED_NOT_APPLIED` envelopes to the Nautilus engine; they must
+  remain audit-only.
+- The Python contract mirror is behind the latest recorder PR (#2); conversion must run the
+  authoritative TypeScript verifier before consuming a run.
+- The adapter has not yet been validated against a real (non-synthetic) verified recording.
+- The remaining P1 findings (input-hash completeness, catalog-record universality) need resolution.
+
+Keep the TypeScript recorder as the authoritative lossless audit layer. Continue the Nautilus
+adapter work only after rebasing onto the current recorder contract and validating one real
+recording end-to-end.

@@ -2,15 +2,17 @@
 
 This module proves that NautilusTrader's BacktestNode can:
 - load data from the converted Parquet catalog
-- feed order-book deltas and custom reference-price data to a strategy
+- feed order-book deltas (both Up and Down tokens) and custom reference-price data
+  to a strategy through the Nautilus event engine
 - deliver events in recorder order (sourceSequence, childIndex) even when
   source timestamps regress or are equal
 - simulate order submission, matching, and fills
 - maintain portfolio/account state
 
-The strategy places a crossing limit buy order (at the best ask price) to
-prove fill simulation and portfolio accounting. It also records the
-``sequence`` field of each received delta to prove recorder-order delivery.
+The strategy records a unified event ledger of (sourceSequence, childIndex,
+eventType, instrumentId) for every received event — book deltas for both tokens
+and Chainlink reference updates — and the proof compares this against the
+expected ledger derived from the catalog.
 """
 
 from __future__ import annotations
@@ -42,7 +44,9 @@ class BacktestProofResult:
     fill_details: list[str] = field(default_factory=list)
     account_balances: list[str] = field(default_factory=list)
     positions: list[str] = field(default_factory=list)
-    received_sequences: list[int] = field(default_factory=list)
+    received_ledger: list[dict] = field(default_factory=list)
+    expected_ledger: list[dict] = field(default_factory=list)
+    ledger_match: bool = False
     error: str | None = None
 
     def to_dict(self) -> dict:
@@ -55,21 +59,25 @@ class BacktestProofResult:
             "fillDetails": self.fill_details,
             "accountBalances": self.account_balances,
             "positions": self.positions,
-            "receivedSequences": self.received_sequences,
+            "receivedLedger": self.received_ledger,
+            "expectedLedger": self.expected_ledger,
+            "ledgerMatch": self.ledger_match,
             "error": self.error,
         }
 
 
 class ProofStrategyConfig(StrategyConfig, frozen=True):
-    instrument_id: str = ""
+    up_instrument_id: str = ""
+    down_instrument_id: str = ""
     cross_price: str = ""
 
 
 class ProofStrategy(Strategy):
-    """Strategy that receives book + reference events and places a crossing limit order.
+    """Strategy that receives Up/Down book + Chainlink events and places a crossing order.
 
-    Records the ``sequence`` field of each received delta to prove recorder-order
-    delivery. Places a limit buy at the best ask price to force a fill.
+    Records a unified event ledger of (sourceSequence, childIndex, eventType,
+    instrumentId) for every received event to prove recorder-order delivery of
+    all three streams in one canonical order.
 
     Uses class-level state to track events received (the BacktestNode instantiates
     strategies via importable paths, so the strategy class must be at module level).
@@ -82,28 +90,25 @@ class ProofStrategy(Strategy):
     _final_account_balances: list[str] = []
     _final_positions: list[str] = []
     _final_fills_count: int = 0
-    _received_sequences: list[int] = []
     _fill_details: list[str] = []
+    _received_ledger: list[dict] = []
 
     def on_start(self) -> None:
         from nautilus_trader.model.data import DataType
         from nautilus_trader.model.identifiers import ClientId
 
-        iid_str = self.config.instrument_id
-        iid = InstrumentId.from_str(iid_str) if iid_str else None
-        if iid is not None:
-            self.instrument = self.cache.instrument(iid)
-        else:
-            self.instrument = None
-        if self.instrument is None:
+        up_iid = InstrumentId.from_str(self.config.up_instrument_id)
+        down_iid = InstrumentId.from_str(self.config.down_instrument_id)
+        self.up_instrument = self.cache.instrument(up_iid)
+        self.down_instrument = self.cache.instrument(down_iid)
+        if self.up_instrument is None or self.down_instrument is None:
             self.log.error("Instrument not found")
             self.stop()
             return
-        self.subscribe_order_book_deltas(instrument_id=self.instrument.id)
+        # Subscribe to both Up and Down order-book deltas.
+        self.subscribe_order_book_deltas(instrument_id=self.up_instrument.id)
+        self.subscribe_order_book_deltas(instrument_id=self.down_instrument.id)
         # Subscribe to Chainlink reference data through the Nautilus event engine.
-        # The BacktestNode loads it via BacktestDataConfig with client_id="CHAINLINK",
-        # the DataEngine delivers it, and on_data() receives it — proving the full
-        # CLOB + Chainlink joint delivery path.
         self.subscribe_data(
             DataType(ReferencePriceUpdate),
             client_id=ClientId("CHAINLINK"),
@@ -111,23 +116,34 @@ class ProofStrategy(Strategy):
 
     def on_order_book_deltas(self, deltas) -> None:
         type(self).book_events += 1
-        # Record the sequence field (sourceSequence * 1_000_000 + childIndex) to
-        # prove the engine delivers events in recorder order.
         try:
             delta_list = list(deltas.deltas) if hasattr(deltas, "deltas") else [deltas]
         except Exception:
             delta_list = []
+        is_up = False
         for d in delta_list:
-            type(self)._received_sequences.append(d.sequence)
-        if not type(self)._order_submitted and self.instrument is not None:
-            # After the snapshot deltas are applied, submit a crossing limit order
-            # at the best ask price to force a fill.
+            # Decode (sourceSequence, childIndex) from the sequence field.
+            seq = d.sequence
+            source_seq = seq // 1_000_000
+            child_idx = seq % 1_000_000
+            type(self)._received_ledger.append(
+                {
+                    "sourceSequence": source_seq,
+                    "childIndex": child_idx,
+                    "eventType": "OrderBookDelta",
+                    "instrumentId": str(d.instrument_id),
+                }
+            )
+            if d.instrument_id == self.up_instrument.id:
+                is_up = True
+        # Place a crossing limit order at the best ask after the first Up snapshot.
+        if is_up and not type(self)._order_submitted and self.up_instrument is not None:
             cross_price_str = self.config.cross_price or "0.52"
             try:
                 order = self.order_factory.limit(
-                    instrument_id=self.instrument.id,
+                    instrument_id=self.up_instrument.id,
                     order_side=OrderSide.BUY,
-                    quantity=self.instrument.make_qty(Decimal("10")),
+                    quantity=self.up_instrument.make_qty(Decimal("10")),
                     price=Price.from_str(cross_price_str),
                     time_in_force=TimeInForce.GTC,
                 )
@@ -140,17 +156,24 @@ class ProofStrategy(Strategy):
     def on_data(self, data) -> None:
         if isinstance(data, ReferencePriceUpdate):
             type(self).reference_events += 1
+            type(self)._received_ledger.append(
+                {
+                    "sourceSequence": data.sourceSequence,
+                    "childIndex": data.childIndex,
+                    "eventType": "ReferencePriceUpdate",
+                    "instrumentId": "",
+                }
+            )
 
     def on_order_filled(self, event) -> None:
         type(self)._final_fills_count += 1
         type(self)._fill_details.append(
             f"filled: side={event.order_side} qty={event.last_qty} px={event.last_px}"
         )
-        # Capture account balance immediately after the fill.
         try:
             from nautilus_trader.model.identifiers import Venue
 
-            venue = Venue(str(self.instrument.id.venue))
+            venue = Venue(str(self.up_instrument.id.venue))
             account = self.cache.account_for_venue(venue)
             if account is not None:
                 type(self)._final_account_balances = [repr(account)]
@@ -168,7 +191,7 @@ class ProofStrategy(Strategy):
         try:
             from nautilus_trader.model.identifiers import Venue
 
-            venue = Venue(str(self.instrument.id.venue))
+            venue = Venue(str(self.up_instrument.id.venue))
             account = self.cache.account_for_venue(venue)
             if account is not None and not type(self)._final_account_balances:
                 type(self)._final_account_balances.append(repr(account))
@@ -183,12 +206,45 @@ class ProofStrategy(Strategy):
             pass
 
 
+def _build_expected_ledger(cat_dir: Path, up_id, down_id) -> list[dict]:
+    """Build the expected event ledger from the catalog."""
+    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+
+    cat = ParquetDataCatalog(str(cat_dir))
+    ledger: list[dict] = []
+    for d in cat.order_book_deltas():
+        if d.instrument_id in (up_id, down_id):
+            seq = d.sequence
+            source_seq = seq // 1_000_000
+            child_idx = seq % 1_000_000
+            ledger.append(
+                {
+                    "sourceSequence": source_seq,
+                    "childIndex": child_idx,
+                    "eventType": "OrderBookDelta",
+                    "instrumentId": str(d.instrument_id),
+                }
+            )
+    for cd in cat.custom_data(cls=ReferencePriceUpdate):
+        r = cd.data
+        ledger.append(
+            {
+                "sourceSequence": r.sourceSequence,
+                "childIndex": r.childIndex,
+                "eventType": "ReferencePriceUpdate",
+                "instrumentId": "",
+            }
+        )
+    ledger.sort(key=lambda x: (x["sourceSequence"], x["childIndex"], x["eventType"]))
+    return ledger
+
+
 def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
     """Run a Nautilus BacktestNode against the converted catalog.
 
     Returns a BacktestProofResult with evidence that the engine ran, received
-    book and reference events, delivered events in recorder order, simulated
-    a fill, and maintained portfolio state.
+    Up/Down book and Chainlink reference events, delivered events in recorder
+    order, simulated a fill, and maintained portfolio state.
     """
     cat_dir = Path(catalog_directory)
 
@@ -212,23 +268,25 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
         return BacktestProofResult(ran=False, error="no instruments in catalog")
 
     up_instr = next((i for i in instruments if i.outcome == "UP"), instruments[0])
+    down_instr = next((i for i in instruments if i.outcome == "DOWN"), instruments[-1])
 
-    # Determine time range from the catalog data.
-    all_deltas = [d for d in cat.order_book_deltas() if d.instrument_id == up_instr.id]
+    # Determine time range from all catalog data (both tokens + references).
+    all_deltas = list(cat.order_book_deltas())
     if not all_deltas:
         return BacktestProofResult(ran=False, error="no order book deltas in catalog")
     start_ns = min(d.ts_event for d in all_deltas)
     end_ns = max(d.ts_event for d in all_deltas)
     end_ns += 60 * 1_000_000_000  # +60s buffer
 
-    # Determine the best ask from the first snapshot to place a crossing order.
-    # The first snapshot for the UP token has asks at some price; we buy at that
-    # price to guarantee a fill.
+    # Determine the best ask from the first Up snapshot to place a crossing order.
     cross_price = "0.52"
     for d in all_deltas:
-        if d.order is not None and str(d.order.side) == "SELL":
+        if d.instrument_id == up_instr.id and d.order is not None and str(d.order.side) == "SELL":
             cross_price = str(d.order.price)
             break
+
+    # Build the expected ledger from the catalog.
+    expected_ledger = _build_expected_ledger(cat_dir, up_instr.id, down_instr.id)
 
     # Reset class-level state.
     ProofStrategy.book_events = 0
@@ -238,10 +296,9 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
     ProofStrategy._final_account_balances = []
     ProofStrategy._final_positions = []
     ProofStrategy._final_fills_count = 0
-    ProofStrategy._received_sequences = []
     ProofStrategy._fill_details = []
+    ProofStrategy._received_ledger = []
 
-    # Build the backtest configuration.
     venue_config = BacktestVenueConfig(
         name=str(up_instr.id.venue),
         oms_type=OmsType.NETTING,
@@ -260,6 +317,13 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
         ),
         BacktestDataConfig(
             catalog_path=str(cat_dir),
+            data_cls="nautilus_trader.model.data:OrderBookDelta",
+            instrument_id=down_instr.id,
+            start_time=start_ns,
+            end_time=end_ns,
+        ),
+        BacktestDataConfig(
+            catalog_path=str(cat_dir),
             data_cls="prediction_markets_nautilus.models:ReferencePriceUpdate",
             client_id="CHAINLINK",
             start_time=start_ns,
@@ -271,7 +335,8 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
         strategy_path="prediction_markets_nautilus.backtest:ProofStrategy",
         config_path="prediction_markets_nautilus.backtest:ProofStrategyConfig",
         config={
-            "instrument_id": str(up_instr.id),
+            "up_instrument_id": str(up_instr.id),
+            "down_instrument_id": str(down_instr.id),
             "cross_price": cross_price,
         },
     )
@@ -293,7 +358,7 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
         return BacktestProofResult(ran=False, error=f"BacktestNode creation failed: {e}")
 
     try:
-        results = node.run()
+        node.run()
     except Exception as e:
         return BacktestProofResult(
             ran=False,
@@ -302,18 +367,15 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
             error=f"BacktestNode.run() failed: {e}",
         )
 
-    # Extract portfolio/account state.
-    fills_count = 0
-    account_balances: list[str] = []
-    positions: list[str] = []
-    received_sequences: list[int] = []
+    fills_count = ProofStrategy._final_fills_count
+    account_balances = list(ProofStrategy._final_account_balances)
+    positions = list(ProofStrategy._final_positions)
+    received_ledger = list(ProofStrategy._received_ledger)
+    fill_details = list(ProofStrategy._fill_details)
 
-    if results:
-        fills_count = ProofStrategy._final_fills_count
-        account_balances = list(ProofStrategy._final_account_balances)
-        positions = list(ProofStrategy._final_positions)
-        received_sequences = list(ProofStrategy._received_sequences)
-        fill_details = list(ProofStrategy._fill_details)
+    # Sort the received ledger the same way as expected for comparison.
+    received_ledger.sort(key=lambda x: (x["sourceSequence"], x["childIndex"], x["eventType"]))
+    ledger_match = received_ledger == expected_ledger
 
     return BacktestProofResult(
         ran=True,
@@ -324,5 +386,7 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
         fill_details=fill_details,
         account_balances=account_balances,
         positions=positions,
-        received_sequences=received_sequences,
+        received_ledger=received_ledger,
+        expected_ledger=expected_ledger,
+        ledger_match=ledger_match,
     )

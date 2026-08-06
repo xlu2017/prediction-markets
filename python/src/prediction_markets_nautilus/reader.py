@@ -221,7 +221,8 @@ def load_run(run_directory: str | Path) -> RunDirectory:
     ref_stale_after = health.get("referenceStaleAfterMs") or 10000
     ref_clock_skew = health.get("referenceClockSkewMs") or 5000
     for env in events:
-        if env.eventType == "REFERENCE_PRICE" and not env.isDuplicate:
+        # Only accepted reference observations affect reference health.
+        if env.eventType == "REFERENCE_PRICE" and env.dedupeState == "UNIQUE_APPLIED":
             if env.sourceTimestamp is not None:
                 ref_obs.add(env.sourceTimestamp)
                 source_age = env.receivedAt - env.sourceTimestamp
@@ -254,34 +255,25 @@ def load_run(run_directory: str | Path) -> RunDirectory:
         )
 
     # --- Verify eventCountsBySource and eventCountsByType ---
-    # Only count UNIQUE_APPLIED events — the recorder only applied those.
-    applied_events = [env for env in events if env.dedupeState == "UNIQUE_APPLIED"]
+    # The recorder increments counters for every persisted envelope, including
+    # audit-only events (DUPLICATE_APPLIED, RECEIVED_NOT_APPLIED). Use canonical
+    # dictionary equality for exact comparison.
     recomp_by_source: dict[str, int] = {}
     recomp_by_type: dict[str, int] = {}
-    for env in applied_events:
+    for env in events:
         recomp_by_source[env.source] = recomp_by_source.get(env.source, 0) + 1
         type_key = f"{env.source}:{env.eventType}"
         recomp_by_type[type_key] = recomp_by_type.get(type_key, 0) + 1
-    health_by_source = health.get("eventCountsBySource", {})
-    if isinstance(health_by_source, dict):
-        # Exact equality: every key in health must match recomputed, and vice versa.
-        for source, count in recomp_by_source.items():
-            h_count = health_by_source.get(source)
-            if h_count is not None and h_count != count:
-                errors.append(f"eventCountsBySource[{source}] = {h_count} != recomputed {count}")
-        for source, h_count in health_by_source.items():
-            if source not in recomp_by_source:
-                errors.append(f"eventCountsBySource[{source}] = {h_count} but not recomputed")
-    health_by_type = health.get("eventCountsByType", {})
-    if isinstance(health_by_type, dict):
-        for type_key, count in recomp_by_type.items():
-            h_count = health_by_type.get(type_key)
-            if h_count is not None and h_count != count:
-                errors.append(f"eventCountsByType[{type_key}] = {h_count} != recomputed {count}")
-        for type_key, h_count in health_by_type.items():
-            if type_key not in recomp_by_type:
-                errors.append(f"eventCountsByType[{type_key}] = {h_count} but not recomputed")
-                errors.append(f"eventCountsByType[{type_key}] = {h_count} != recomputed {count}")
+    health_by_source = health.get("eventCountsBySource", {}) or {}
+    if isinstance(health_by_source, dict) and recomp_by_source != health_by_source:
+        errors.append(
+            f"eventCountsBySource mismatch: health={health_by_source} != recomputed={recomp_by_source}"
+        )
+    health_by_type = health.get("eventCountsByType", {}) or {}
+    if isinstance(health_by_type, dict) and recomp_by_type != health_by_type:
+        errors.append(
+            f"eventCountsByType mismatch: health={health_by_type} != recomputed={recomp_by_type}"
+        )
 
     # --- Reconstruct final books from events and compare with finalBookHealth ---
     up_token = manifest["market"].upTokenId
