@@ -61,7 +61,7 @@ jobs:
           PY
       - name: BacktestNode proof with fills and ordering
         run: |
-          uv run python -m prediction_markets_nautilus.backtest \
+          uv run python -m prediction_markets_nautilus.__main_backtest \
             --catalog-directory .artifacts/nautilus-catalog --output .artifacts/backtest-proof.json
           uv run python - <<'PY'
           import json

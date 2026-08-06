@@ -15,7 +15,6 @@ prove fill simulation and portfolio accounting. It also records the
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass, field
 from decimal import Decimal
 from pathlib import Path
@@ -40,6 +39,7 @@ class BacktestProofResult:
     reference_events_received: int = 0
     orders_submitted: int = 0
     fills_count: int = 0
+    fill_details: list[str] = field(default_factory=list)
     account_balances: list[str] = field(default_factory=list)
     positions: list[str] = field(default_factory=list)
     received_sequences: list[int] = field(default_factory=list)
@@ -52,6 +52,7 @@ class BacktestProofResult:
             "referenceEventsReceived": self.reference_events_received,
             "ordersSubmitted": self.orders_submitted,
             "fillsCount": self.fills_count,
+            "fillDetails": self.fill_details,
             "accountBalances": self.account_balances,
             "positions": self.positions,
             "receivedSequences": self.received_sequences,
@@ -62,7 +63,6 @@ class BacktestProofResult:
 class ProofStrategyConfig(StrategyConfig, frozen=True):
     instrument_id: str = ""
     cross_price: str = ""
-    catalog_path: str = ""
 
 
 class ProofStrategy(Strategy):
@@ -86,7 +86,8 @@ class ProofStrategy(Strategy):
     _fill_details: list[str] = []
 
     def on_start(self) -> None:
-        from nautilus_trader.persistence.catalog import ParquetDataCatalog
+        from nautilus_trader.model.data import DataType
+        from nautilus_trader.model.identifiers import ClientId
 
         iid_str = self.config.instrument_id
         iid = InstrumentId.from_str(iid_str) if iid_str else None
@@ -99,16 +100,14 @@ class ProofStrategy(Strategy):
             self.stop()
             return
         self.subscribe_order_book_deltas(instrument_id=self.instrument.id)
-        # Load reference data directly from the catalog since BacktestNode cannot
-        # load custom data types without instrument_id binding.
-        try:
-            cat_path = self.config.catalog_path if hasattr(self.config, "catalog_path") else None
-            if cat_path:
-                cat = ParquetDataCatalog(cat_path)
-                refs = cat.custom_data(cls=ReferencePriceUpdate)
-                type(self).reference_events = len(refs)
-        except Exception:
-            pass
+        # Subscribe to Chainlink reference data through the Nautilus event engine.
+        # The BacktestNode loads it via BacktestDataConfig with client_id="CHAINLINK",
+        # the DataEngine delivers it, and on_data() receives it — proving the full
+        # CLOB + Chainlink joint delivery path.
+        self.subscribe_data(
+            DataType(ReferencePriceUpdate),
+            client_id=ClientId("CHAINLINK"),
+        )
 
     def on_order_book_deltas(self, deltas) -> None:
         type(self).book_events += 1
@@ -166,24 +165,20 @@ class ProofStrategy(Strategy):
 
     def on_stop(self) -> None:
         """Capture final portfolio state before the engine disposes."""
-        type(self)._final_account_balances = []
-        type(self)._final_positions = []
         try:
             from nautilus_trader.model.identifiers import Venue
 
             venue = Venue(str(self.instrument.id.venue))
             account = self.cache.account_for_venue(venue)
-            if account is not None:
+            if account is not None and not type(self)._final_account_balances:
                 type(self)._final_account_balances.append(repr(account))
                 for currency in account.balances():
                     bal = account.balance(currency)
                     if bal is not None:
                         type(self)._final_account_balances.append(repr(bal))
-            for order in self.cache.orders():
-                if order.is_filled and type(self)._final_fills_count == 0:
-                    type(self)._final_fills_count += 1
-            for pos in self.cache.positions():
-                type(self)._final_positions.append(str(pos))
+            if not type(self)._final_positions:
+                for pos in self.cache.positions():
+                    type(self)._final_positions.append(str(pos))
         except Exception:
             pass
 
@@ -252,7 +247,7 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
         oms_type=OmsType.NETTING,
         account_type=AccountType.CASH,
         book_type="L2_MBP",
-        starting_balances=["1_000_000 USDC"],
+        starting_balances=["1_000_000 pUSD"],
     )
 
     data_configs = [
@@ -260,6 +255,13 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
             catalog_path=str(cat_dir),
             data_cls="nautilus_trader.model.data:OrderBookDelta",
             instrument_id=up_instr.id,
+            start_time=start_ns,
+            end_time=end_ns,
+        ),
+        BacktestDataConfig(
+            catalog_path=str(cat_dir),
+            data_cls="prediction_markets_nautilus.models:ReferencePriceUpdate",
+            client_id="CHAINLINK",
             start_time=start_ns,
             end_time=end_ns,
         ),
@@ -271,7 +273,6 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
         config={
             "instrument_id": str(up_instr.id),
             "cross_price": cross_price,
-            "catalog_path": str(cat_dir),
         },
     )
 
@@ -312,6 +313,7 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
         account_balances = list(ProofStrategy._final_account_balances)
         positions = list(ProofStrategy._final_positions)
         received_sequences = list(ProofStrategy._received_sequences)
+        fill_details = list(ProofStrategy._fill_details)
 
     return BacktestProofResult(
         ran=True,
@@ -319,26 +321,8 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
         reference_events_received=ProofStrategy.reference_events,
         orders_submitted=ProofStrategy.orders_submitted,
         fills_count=fills_count,
+        fill_details=fill_details,
         account_balances=account_balances,
         positions=positions,
         received_sequences=received_sequences,
     )
-
-
-def _main() -> int:
-    import argparse
-
-    parser = argparse.ArgumentParser(prog="prediction_markets_nautilus.backtest")
-    parser.add_argument("--catalog-directory", required=True)
-    parser.add_argument("--output", default=None)
-    args = parser.parse_args()
-    result = run_backtest_proof(args.catalog_directory)
-    report = {"backtestProof": result.to_dict()}
-    if args.output:
-        Path(args.output).write_text(json.dumps(report, indent=2), encoding="utf-8")
-    print(json.dumps(report, indent=2))
-    return 0
-
-
-if __name__ == "__main__":  # pragma: no cover
-    raise SystemExit(_main())

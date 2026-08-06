@@ -15,28 +15,36 @@ revision but require further validation before a final adoption decision:
 
 ### P0 findings (addressed)
 
-1. **Replay sequence preservation**: Replay now orders by `(sourceSequence, childIndex)` embedded in
-   each delta's `sequence` field (`sourceSequence * 1_000_000 + childIndex`). The converter uses
-   `processedAt` (monotonically increasing) for `ts_event` so the BacktestNode also delivers events
-   in recorder order even when `sourceTimestamp` regresses. A dedicated test with regressing source
-   timestamps proves this.
+1. **Replay sequence preservation**: Replay orders by `(sourceSequence, childIndex)` embedded in
+   each delta's `sequence` field (`sourceSequence * 1_000_000 + childIndex`). The `ts_event` field
+   uses a **monotonic replay clock** derived from `(sourceSequence, childIndex)` — not wall-clock
+   time — so the BacktestNode delivers events in recorder order even when `sourceTimestamp`
+   regresses or ties. Source, receipt, and processing timestamps are preserved separately in the
+   `Lineage` sidecar. A dedicated test with regressing source timestamps proves this.
 2. **Multi-token price_change**: The converter resolves the instrument per-change using
    `price_changes[i].asset_id` when the envelope `tokenId` is null. The lineage sidecar records
    `resolvedTokenId` for each row.
 3. **BacktestNode proof**: A real `BacktestNode` runs against the converted catalog with a strategy
-   that receives book events, submits a crossing limit order at the best ask, and registers a fill
+   that receives book events, submits a crossing market order at the best ask, and registers a fill
    (`OrderFilled` event). The strategy records the `sequence` field of each delta to prove recorder
-   ordering. Reference prices are loaded from the catalog and counted.
+   ordering. **Chainlink reference prices are delivered through the Nautilus event engine** via
+   `BacktestDataConfig` with `client_id="CHAINLINK"` and `subscribe_data()` — not an out-of-band
+   catalog query. The proof asserts: 3 book events, 1 reference event, 1 order submitted, 1 fill,
+   cash debited to `999_994.800000 pUSD` (10 × 0.52), and a `LONG 10.000000` position.
 4. **Reader invariant cross-checks**: The reader independently recomputes `eventCountsBySource`,
-   `eventCountsByType`, reference anomalies, and reconstructs final book state from the event stream
-   to compare with `finalBookHealth`.
+   `eventCountsByType` (only `UNIQUE_APPLIED` events), reference anomalies, and reconstructs final
+   book state from the event stream to compare with `finalBookHealth`. Unknown book sides are
+   rejected, `Decimal` ordering is used for price comparison, and event-count maps require exact
+   equality (all keys checked, not just recomputed ones).
 5. **Lineage one-to-one with catalog rows**: Each expanded catalog row has its own lineage row with
-   a distinct `childIndex` and a stable `catalogRecordId`. The `sequence` field uses a 1,000,000
-   multiplier to avoid collisions. `TradeId` includes `childIndex` to avoid duplicate IDs for
-   batched trades. `ReferencePriceUpdate` and `LifecycleEvent` carry `sourceSequence` and
-   `childIndex`.
-6. **Canonical input hash**: The input stream hash now includes book deltas, trades, reference
-   observations, and lifecycle events, all ordered by `(sourceSequence, childIndex)`.
+   a distinct `childIndex` and a **genuinely unique** `catalogRecordId`
+   (`runId:sourceSequence:childIndex:tokenId`). UP and DOWN instruments from the same
+   market-discovery event get distinct IDs via the token ID. `TradeId` includes `childIndex` to
+   avoid duplicate IDs for batched trades. `ReferencePriceUpdate` and `LifecycleEvent` carry
+   `sourceSequence` and `childIndex`.
+6. **Canonical input hash**: The input stream hash includes book deltas, trades, reference
+   observations, lifecycle events (with full typed payload), **and audit events** (duplicates,
+   empty frames, unsupported events) — all ordered by `(sourceSequence, childIndex)`.
 7. **Real recorder lifecycle names**: The adapter recognizes `CONNECTION_ATTEMPT`,
    `CONNECTION_OPEN`, `SUBSCRIPTION_SENT`, `CONNECTION_ERROR`, `CONNECTION_CLOSED`,
    `DATA_GAP_STARTED`, `DATA_GAP_ENDED`, `RECONNECT_SCHEDULED`, `STALE_STREAM`, and
@@ -44,26 +52,29 @@ revision but require further validation before a final adoption decision:
 
 ### P1 findings (addressed)
 
-1. **Python CI**: `uv sync --frozen --extra dev` installs dev dependencies.
+1. **Python CI**: `uv sync --frozen --extra dev` installs dev dependencies. The CLI entry point is
+   in a separate `__main_backtest.py` module to avoid the `__main__` / importable module
+   dual-instance problem with `ProofStrategy` class variables.
 2. **Decimal guarantees**: Comparisons use `Decimal`, JSON float fallback uses
    `parse_float=Decimal`, and precision loss aborts conversion (sub-tick prices are not silently
    quantized).
 3. **Audit classification**: `RECEIVED_NOT_APPLIED` is no longer classified as a duplicate — only
    `DUPLICATE_APPLIED` is.
-4. **Missing reference value**: The converter fails with an audit record instead of substituting
-   `"0"` when a reference value is missing.
+4. **Missing reference value**: The converter **aborts with a `ValueError`** instead of routing to
+   audit or substituting `"0"` when a reference value is missing.
 5. **Unknown book sides**: Invalid sides are rejected with a `ValueError` instead of defaulting to
    `SELL`.
 6. **sourceEventCount**: Counts unique source envelopes, not expanded normalized records.
 7. **Realistic fixture**: A 10-event fixture with snapshots, deltas, trades, multi-token
    price_changes, lifecycle events, and same-time conflicts. A separate regressing-timestamp fixture
    proves recorder-order delivery.
+8. **Typed lifecycle payload**: `LifecycleEvent` preserves the full typed payload (feed name, close
+   code, gap duration, etc.) as `payloadJson`, not just `dedupeReason`.
 
 ### Remaining work before final decision
 
 - Validate the adapter against real (non-synthetic) schema-v2 recordings.
 - Performance test with larger event streams.
-- Test portfolio accounting with matching settlement currency.
 
 ## Answers to the required questions
 
@@ -128,7 +139,7 @@ revision but require further validation before a final adoption decision:
 10. **Estimated maintenance burden of the adapter?** Low-to-moderate. The adapter is a thin,
     well-bounded converter plus two custom data types and a deterministic replay harness. The
     schema-v2 contract is stable (versioned). The main ongoing cost is re-validating against new
-    Nautilus releases and re-running the 21 edge-case tests. No trading/execution code is maintained
+    Nautilus releases and re-running the 32 edge-case tests. No trading/execution code is maintained
     by the project — that is Nautilus's responsibility.
 
 11. **Is the current Nautilus Polymarket adapter reusable directly?** Not for replay. It is reusable
@@ -168,8 +179,13 @@ revision but require further validation before a final adoption decision:
 - Sample fixture `fixtures/sample-run` converts: 2 snapshots, 1 reference, 1 lifecycle, 0 audit.
 - Two independent process replays produce identical hashes (see CI).
 - Final-book comparison `allMatch: true` against `health.finalBookHealth`.
-- 21 edge-case tests pass (20 required cases + reference-price queryability).
-- No authenticated endpoint called; no order placed.
+- 32 edge-case tests pass (20 required cases + reference-price queryability + realistic fixture
+  suite + BacktestNode proof + regressing-timestamp proof + missing-reference-value abort + reader
+  invariant rejection tests).
+- BacktestNode proof: 3 book events, 1 Chainlink reference event (via event engine), 1 market order,
+  1 fill, cash debited to `999_994.800000 pUSD`, `LONG 10.000000` position, sequences in recorder
+  order.
+- No authenticated endpoint called; no order placed to a live exchange.
 
 ## Recommendation
 

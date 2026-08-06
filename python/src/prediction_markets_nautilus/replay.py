@@ -275,7 +275,8 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
             }
         )
 
-    # Lifecycle events (audit/catalog sidecar) — include sourceSequence and childIndex.
+    # Lifecycle events (audit/catalog sidecar) — include sourceSequence, childIndex,
+    # and the full typed payload (feed name, close code, gap duration, etc.).
     lifecycle = cat.custom_data(cls=LifecycleEvent)
     for cd in lifecycle:
         le = cd.data
@@ -285,8 +286,29 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
                 "childIndex": le.childIndex,
                 "side": "LIFECYCLE",
                 "kind": le.kind,
+                "generation": le.generation,
+                "payloadJson": le.payloadJson,
             }
         )
+
+    # Audit events (duplicates, empty frames, unsupported events) — included in the
+    # canonical input hash so the hash covers the complete source stream, not just
+    # the events fed to the trading engine.
+    audit_path = cat_dir / "audit.parquet"
+    if audit_path.exists():
+        import pyarrow.parquet as pq
+
+        audit_table = pq.read_table(audit_path)
+        for row in audit_table.to_pylist():
+            input_stream.append(
+                {
+                    "sourceSequence": row.get("sourceSequence", 0),
+                    "childIndex": row.get("childIndex", 0),
+                    "side": "AUDIT",
+                    "kind": row.get("kind", ""),
+                    "originalEventType": row.get("originalEventType", ""),
+                }
+            )
 
     # Canonical sort by (sourceSequence, childIndex, side) — includes ALL event types.
     input_stream.sort(

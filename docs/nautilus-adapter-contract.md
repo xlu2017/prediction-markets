@@ -153,7 +153,7 @@ rawMessageText     str|null
 | normalized field           | Nautilus target                         | rule                                                                                                                                                                                                 |
 | -------------------------- | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `NormalizedInstrument`     | `BinaryOption`                          | `InstrumentId(Symbol(tokenId), Venue("POLYMARKET"))`; `Price.from_str(tickSize)`; collateral `pUSD`; `ts_init` from `opensAt`. `min_quantity` left unset when source has no minimum (do not invent). |
-| `NormalizedBookSnapshot`   | `OrderBookSnapshot`                     | `InstrumentId` per token; `BookLevel` list from bids/asks; `Price.from_str`/`Quantity.from_str`; `ts_event` = `sourceTimestamp` (or `receivedAt` fallback), `ts_init` = `processedAt`.               |
+| `NormalizedBookSnapshot`   | `OrderBookSnapshot`                     | `InstrumentId` per token; `BookLevel` list from bids/asks; `Price.from_str`/`Quantity.from_str`; `ts_event` = replay clock (see below), `ts_init` = `processedAt`.                                    |
 | `NormalizedBookDelta`      | `OrderBookDelta`                        | `OrderSide.BUY`/`SELL`; `BookOrder(Price.from_str, Quantity.from_str)`; size `"0"` → `OrderBookDeltaOperation.CLEAR`; `ts_event`/`ts_init` as above.                                                 |
 | `NormalizedTrade`          | `TradeTick`                             | `Price.from_str`/`Quantity.from_str`; `AggregationSide` from `aggressorSide`; `ts_event`/`ts_init`.                                                                                                  |
 | `NormalizedReferencePrice` | custom `ReferencePriceUpdate` data type | custom Nautilus `Data` object (Phase 6); not a `TradeTick`/`QuoteTick`.                                                                                                                              |
@@ -162,10 +162,16 @@ rawMessageText     str|null
 
 ## Timestamp semantics
 
-- `ts_event` (the event's view of when it occurred) = schema-v2 `sourceTimestamp` when present, else
-  `receivedAt`. For Chainlink, `sourceTimestamp` is the canonical payload timestamp.
-- `ts_init` (when the system initialized processing) = schema-v2 `processedAt`.
-- Both are Unix milliseconds UTC, the unit Nautilus expects.
+- `ts_event` (the event's view of when it occurred) = **monotonic replay clock** derived from
+  `(sourceSequence, childIndex)`, not wall-clock time. This ensures the BacktestNode delivers events
+  in recorder order regardless of source timestamp regressions, ties, or clock skew. The formula is:
+  `replay_ts = REPLAY_EPOCH + sourceSequence * STEP + childIndex * SUB_STEP` (in nanoseconds).
+  Source, receipt, and processing timestamps are retained separately in the `Lineage` sidecar.
+- `ts_init` (when the system initialized processing) = same replay clock as `ts_event`, ensuring
+  the Parquet catalog partitions and filters consistently. The original `processedAt` is preserved
+  in the `Lineage` block.
+- Source timestamps (`sourceTimestamp`, `topLevelSourceTimestamp`, `payloadSourceTimestamp`),
+  `receivedAt`, and `processedAt` are all preserved in the `Lineage` block for audit and analysis.
 - Negative source-to-receive latencies are preserved by storing both `sourceTimestamp` and
   `receivedAt` in lineage; they are not clamped.
 

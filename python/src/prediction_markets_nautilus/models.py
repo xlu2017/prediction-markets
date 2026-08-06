@@ -139,6 +139,7 @@ class NormalizedLifecycleEvent:
     kind: str  # "CONNECTION_GENERATION" | "RESYNC_BOUNDARY" | "MARKET_DISCOVERED"
     generation: int | None
     detail: str | None
+    payloadJson: str = ""  # full typed payload as JSON (feed name, close code, gap duration, etc.)
 
 
 @dataclass(frozen=True)
@@ -192,11 +193,13 @@ class LifecycleEvent(Data):
     """Connection-generation / resync-boundary lifecycle marker (audit/catalog sidecar).
 
     ``sourceSequence`` and ``childIndex`` carry recorder order so the input hash can include
-    lifecycle events in canonical order.
+    lifecycle events in canonical order. ``payloadJson`` preserves the full typed payload
+    (feed name, close code, gap duration, etc.) as a JSON string.
     """
 
     kind: str = ""
     generation: int = 0
     detail: str = ""
+    payloadJson: str = ""
     sourceSequence: int = 0
     childIndex: int = 0

@@ -94,8 +94,9 @@ def test_duplicate_event_routed_to_audit(tmp_path: Path) -> None:
     manifest = F.base_manifest(F.base_market(), finalEventCount=5)
     health = F.base_health(totalEventsReceived=5, duplicateEventCount=1)
     # Update event counts to include the duplicate event.
-    health["eventCountsBySource"]["POLYMARKET_CLOB"] = 3
-    health["eventCountsByType"]["POLYMARKET_CLOB:book"] = 3
+    # Only UNIQUE_APPLIED events are counted (the duplicate is DUPLICATE_APPLIED).
+    health["eventCountsBySource"]["POLYMARKET_CLOB"] = 2
+    health["eventCountsByType"]["POLYMARKET_CLOB:book"] = 2
     F.write_run(
         tmp_path,
         manifest,
@@ -620,6 +621,40 @@ def test_reference_prices_independently_queryable(tmp_path: Path) -> None:
     assert cat.trade_ticks() == []
 
 
+# --- Missing reference value aborts conversion ---
+
+
+def test_missing_reference_value_aborts_conversion(tmp_path: Path) -> None:
+    """A reference price event with no value must abort conversion, not route to audit."""
+    events = [
+        F.market_discovered(1),
+        F.book_event(
+            2,
+            "111111",
+            [{"price": ".48", "size": "30"}],
+            [{"price": ".52", "size": "25"}],
+            1785909720100,
+        ),
+        F.book_event(
+            3,
+            "222222",
+            [{"price": ".47", "size": "20"}],
+            [{"price": ".53", "size": "22"}],
+            1785909720110,
+        ),
+        {
+            **F.reference_event(4),
+            "payload": {"topic": "crypto_prices_chainlink", "payload": {"symbol": "btc/usd"}},
+            "rawMessageText": '{"topic": "crypto_prices_chainlink", "payload": {"symbol": "btc/usd"}}',
+        },
+    ]
+    manifest = F.base_manifest(F.base_market(), finalEventCount=4)
+    F.write_run(tmp_path, manifest, F.base_health(), events, market=F.base_market())
+    run = load_run(tmp_path)
+    with pytest.raises(ValueError, match="reference price missing value"):
+        normalize_run(run)
+
+
 # --- 21. Realistic fixture: deltas, trades, lifecycle, multi-token, same-time ---
 
 
@@ -690,6 +725,10 @@ def test_realistic_fixture_lineage_one_row_per_catalog_row(tmp_path: Path) -> No
     # Each snapshot should have childIndex 0 (CLEAR), 1 (bid), 2 (ask).
     snap_seqs = {r["sourceSequence"] for r in snap_rows if "CLEAR" in r["recordType"]}
     assert snap_seqs == {2, 3, 9, 10}
+    # Every catalogRecordId must be unique â€” one per catalog row.
+    record_ids = [r["catalogRecordId"] for r in rows]
+    assert len(record_ids) == len(set(record_ids)), "catalogRecordId values are not unique"
+    assert all(rid for rid in record_ids), "some catalogRecordId values are empty"
 
 
 def test_realistic_fixture_replay_determinism(tmp_path: Path) -> None:
@@ -721,7 +760,7 @@ def test_backtest_node_proof(tmp_path: Path) -> None:
     assert result.orders_submitted > 0, "Strategy submitted no orders"
     assert len(result.account_balances) > 0, "No account balances captured"
     # The crossing order at the best ask should produce a fill.
-    assert result.fills_count > 0, "No fills — crossing order did not match"
+    assert result.fills_count > 0, "No fills Ã¢â‚¬â€ crossing order did not match"
     # The strategy should have received deltas in non-decreasing sequence order.
     seqs = result.received_sequences
     assert len(seqs) > 0, "No sequence values recorded"

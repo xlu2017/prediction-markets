@@ -254,23 +254,33 @@ def load_run(run_directory: str | Path) -> RunDirectory:
         )
 
     # --- Verify eventCountsBySource and eventCountsByType ---
+    # Only count UNIQUE_APPLIED events — the recorder only applied those.
+    applied_events = [env for env in events if env.dedupeState == "UNIQUE_APPLIED"]
     recomp_by_source: dict[str, int] = {}
     recomp_by_type: dict[str, int] = {}
-    for env in events:
+    for env in applied_events:
         recomp_by_source[env.source] = recomp_by_source.get(env.source, 0) + 1
         type_key = f"{env.source}:{env.eventType}"
         recomp_by_type[type_key] = recomp_by_type.get(type_key, 0) + 1
     health_by_source = health.get("eventCountsBySource", {})
     if isinstance(health_by_source, dict):
+        # Exact equality: every key in health must match recomputed, and vice versa.
         for source, count in recomp_by_source.items():
             h_count = health_by_source.get(source)
             if h_count is not None and h_count != count:
                 errors.append(f"eventCountsBySource[{source}] = {h_count} != recomputed {count}")
+        for source, h_count in health_by_source.items():
+            if source not in recomp_by_source:
+                errors.append(f"eventCountsBySource[{source}] = {h_count} but not recomputed")
     health_by_type = health.get("eventCountsByType", {})
     if isinstance(health_by_type, dict):
         for type_key, count in recomp_by_type.items():
             h_count = health_by_type.get(type_key)
             if h_count is not None and h_count != count:
+                errors.append(f"eventCountsByType[{type_key}] = {h_count} != recomputed {count}")
+        for type_key, h_count in health_by_type.items():
+            if type_key not in recomp_by_type:
+                errors.append(f"eventCountsByType[{type_key}] = {h_count} but not recomputed")
                 errors.append(f"eventCountsByType[{type_key}] = {h_count} != recomputed {count}")
 
     # --- Reconstruct final books from events and compare with finalBookHealth ---
@@ -289,15 +299,15 @@ def load_run(run_directory: str | Path) -> RunDirectory:
         recon_bids: dict[str, str] = {}
         recon_asks: dict[str, str] = {}
         for env in events:
+            # Only replay events the recorder actually applied.
+            if env.dedupeState != "UNIQUE_APPLIED":
+                continue
             # Skip events that don't affect this token.
-            # For book events, check tokenId directly.
-            # For price_change events, check per-change asset_id.
             if env.eventType == "book":
                 if env.tokenId != token_id:
                     continue
             elif env.eventType == "price_change":
-                # price_change may affect this token via per-change asset_id.
-                pass
+                pass  # check per-change asset_id below
             else:
                 continue
             payload = env.payload if isinstance(env.payload, dict) else {}
@@ -337,14 +347,20 @@ def load_run(run_directory: str | Path) -> RunDirectory:
                     side = ch.get("side")
                     if not isinstance(price, str) or not isinstance(size, str):
                         continue
+                    # Reject unknown sides — do not default to SELL.
+                    if side not in ("BUY", "SELL"):
+                        errors.append(f"price_change for {token_id} has unknown side {side!r}")
+                        continue
                     book = recon_bids if side == "BUY" else recon_asks
                     if size != "0":
                         book[price] = size
                     else:
                         book.pop(price, None)
-        # Compare reconstructed best bid/ask with health.
-        recon_best_bid = max(recon_bids, key=lambda p: float(p)) if recon_bids else None
-        recon_best_ask = min(recon_asks, key=lambda p: float(p)) if recon_asks else None
+        # Compare reconstructed best bid/ask with health using Decimal ordering.
+        from decimal import Decimal as _Decimal
+
+        recon_best_bid = max(recon_bids, key=lambda p: _Decimal(p)) if recon_bids else None
+        recon_best_ask = min(recon_asks, key=lambda p: _Decimal(p)) if recon_asks else None
         exp_best_bid = expected_book.get("bestBid")
         exp_best_ask = expected_book.get("bestAsk")
         if exp_best_bid is not None and recon_best_bid is not None:

@@ -8,6 +8,7 @@ source envelope.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import shutil
 from decimal import Decimal
@@ -38,6 +39,40 @@ POLYMARKET_VENUE = "POLYMARKET"
 # Nautilus timestamp unit: nanoseconds. Schema-v2 timestamps are Unix milliseconds.
 _MS_TO_NS = 1_000_000
 
+# Replay clock: a monotonic timestamp derived from (sourceSequence, childIndex).
+# The base epoch is 1e15 ns (2001-09-09T01:46:40Z) — well within the Arrow
+# timestamp[ns] range. Each source sequence gets 1ms; each child index gets 1ns
+# within that ms. Supports up to 1_000_000 children per sequence without collision.
+_REPLAY_EPOCH_NS = 1_000_000_000_000_000  # 1e15 ns = 2001-09-09T01:46:40Z
+_REPLAY_SEQ_STEP_NS = 1_000_000  # 1ms per source sequence
+_REPLAY_CHILD_STEP_NS = 1  # 1ns per child index
+
+
+def _replay_ts(source_sequence: int, child_index: int) -> int:
+    """Monotonic replay timestamp from (sourceSequence, childIndex).
+
+    Used for ``ts_event`` so the BacktestNode delivers events in recorder order
+    regardless of wall-clock timestamp regressions, ties, or clock skew. Source,
+    receipt, and processing timestamps are retained separately in the lineage.
+    """
+    return (
+        _REPLAY_EPOCH_NS
+        + source_sequence * _REPLAY_SEQ_STEP_NS
+        + child_index * _REPLAY_CHILD_STEP_NS
+    )
+
+
+def _catalog_record_id(
+    run_id: str, source_sequence: int, child_index: int, token_id: str | None
+) -> str:
+    """Stable unique ID for each catalog row.
+
+    Every expanded row (CLEAR, ADD bid, ADD ask, etc.) gets a distinct ID by
+    including the child index. Instruments include their token ID to distinguish
+    UP vs DOWN from the same market-discovery event.
+    """
+    return f"{run_id}:{source_sequence}:{child_index}:{token_id or 'none'}"
+
 
 def _instrument_id(condition_id: str, token_id: str) -> str:
     return f"{condition_id}-{token_id}.{POLYMARKET_VENUE}"
@@ -53,9 +88,9 @@ def _lineage(
     # resolvedTokenId is the actual token for this row (may differ from envelope tokenId for
     # multi-token price_change events where envelope tokenId is null).
     rtid = resolved_token_id if resolved_token_id is not None else env.tokenId
-    # catalogRecordId: stable unique ID per catalog row. Uses a wide multiplier to avoid
-    # collisions even for events expanded into many children.
-    catalog_record_id = f"{env.runId}:{env.sequence}:{child_index}:{rtid or 'none'}"
+    # catalogRecordId: stable unique ID per catalog row. Includes child_index
+    # so every expanded row (CLEAR, ADD bid, ADD ask) gets a distinct ID.
+    catalog_record_id = _catalog_record_id(env.runId, env.sequence, child_index, rtid)
     return Lineage(
         runId=env.runId,
         sequence=env.sequence,
@@ -100,9 +135,17 @@ def normalize_instruments(run: RunDirectory) -> list[NormalizedInstrument]:
             processedAt=0,
         )
     for outcome, token_id in (("UP", m.upTokenId), ("DOWN", m.downTokenId)):
+        # Each instrument gets its own lineage with a unique catalogRecordId
+        # that includes the token ID, so UP and DOWN instruments are distinct.
+        instr_lin = dataclasses.replace(
+            lin,
+            tokenId=token_id,
+            resolvedTokenId=token_id,
+            catalogRecordId=_catalog_record_id(lin.runId, lin.sourceSequence, 0, token_id),
+        )
         out.append(
             NormalizedInstrument(
-                lineage=lin,
+                lineage=instr_lin,
                 instrumentId=_instrument_id(m.conditionId, token_id),
                 conditionId=m.conditionId,
                 tokenId=token_id,
@@ -162,6 +205,9 @@ def normalize_event(env, instruments_by_token: dict[str, NormalizedInstrument]) 
                 kind="MARKET_DISCOVERED",
                 generation=env.connectionGeneration,
                 detail=env.eventType,
+                payloadJson=json.dumps(env.payload, sort_keys=True, default=str)
+                if env.payload is not None
+                else "",
             )
         ]
 
@@ -178,8 +224,13 @@ def normalize_event(env, instruments_by_token: dict[str, NormalizedInstrument]) 
             elif isinstance(value, (int, Decimal)):
                 value = str(value)
             elif value is None:
-                # Fail rather than invent a price.
-                return [_audit_unsupported(env, lin, "reference price missing value")]
+                # Abort conversion — a missing reference price is a data integrity
+                # failure, not an audit-only event. Inventing a price would corrupt
+                # downstream settlement logic.
+                raise ValueError(
+                    f"reference price missing value at sourceSequence={env.sequence} "
+                    f"(runId={env.runId})"
+                )
             else:
                 value = str(value)
         symbol = inner.get("symbol") or payload.get("symbol") or ""
@@ -219,6 +270,9 @@ def normalize_event(env, instruments_by_token: dict[str, NormalizedInstrument]) 
                     kind=et,
                     generation=env.connectionGeneration,
                     detail=str(env.dedupeReason or ""),
+                    payloadJson=json.dumps(env.payload, sort_keys=True, default=str)
+                    if env.payload is not None
+                    else "",
                 )
             ]
         if et in ("EMPTY_FRAME", "IGNORED_FOREIGN_MARKET", "PING", "PONG"):
@@ -452,8 +506,11 @@ def _snapshot_to_deltas(
 
     instr = instruments_by_id[snap.instrumentId]
     iid = instr.id
-    ts_event = _ms_to_ns(snap.lineage.processedAt)
-    ts_init = _ms_to_ns(snap.lineage.processedAt)
+    # All deltas from one snapshot share the same ts_event (the sequence-level
+    # replay timestamp). The `sequence` field encodes (sourceSequence, childIndex)
+    # for ordering within the batch.
+    ts_event = _replay_ts(snap.lineage.sourceSequence, 0)
+    ts_init = ts_event
     deltas: list[OrderBookDelta] = []
     lineage_rows: list[dict] = []
     child = 0
@@ -472,7 +529,17 @@ def _snapshot_to_deltas(
         )
     )
     lineage_rows.append(
-        {**snap.lineage.to_dict(), "childIndex": child, "recordType": "OrderBookDelta_CLEAR"}
+        {
+            **snap.lineage.to_dict(),
+            "childIndex": child,
+            "catalogRecordId": _catalog_record_id(
+                snap.lineage.runId,
+                snap.lineage.sourceSequence,
+                child,
+                snap.lineage.resolvedTokenId or snap.lineage.tokenId,
+            ),
+            "recordType": "OrderBookDelta_CLEAR",
+        }
     )
     child += 1
 
@@ -501,7 +568,17 @@ def _snapshot_to_deltas(
             )
         )
         lineage_rows.append(
-            {**snap.lineage.to_dict(), "childIndex": child, "recordType": "OrderBookDelta_ADD_BID"}
+            {
+                **snap.lineage.to_dict(),
+                "childIndex": child,
+                "catalogRecordId": _catalog_record_id(
+                    snap.lineage.runId,
+                    snap.lineage.sourceSequence,
+                    child,
+                    snap.lineage.resolvedTokenId or snap.lineage.tokenId,
+                ),
+                "recordType": "OrderBookDelta_ADD_BID",
+            }
         )
         child += 1
     for idx, lv in enumerate(snap.asks):
@@ -527,7 +604,17 @@ def _snapshot_to_deltas(
             )
         )
         lineage_rows.append(
-            {**snap.lineage.to_dict(), "childIndex": child, "recordType": "OrderBookDelta_ADD_ASK"}
+            {
+                **snap.lineage.to_dict(),
+                "childIndex": child,
+                "catalogRecordId": _catalog_record_id(
+                    snap.lineage.runId,
+                    snap.lineage.sourceSequence,
+                    child,
+                    snap.lineage.resolvedTokenId or snap.lineage.tokenId,
+                ),
+                "recordType": "OrderBookDelta_ADD_ASK",
+            }
         )
         child += 1
     return OrderBookDeltas(iid, deltas), lineage_rows
@@ -541,8 +628,8 @@ def _delta_to_nautilus(
 
     instr = instruments_by_id[d.instrumentId]
     iid = instr.id
-    ts_event = _ms_to_ns(d.lineage.processedAt)
-    ts_init = _ms_to_ns(d.lineage.processedAt)
+    ts_event = _replay_ts(d.lineage.sourceSequence, d.lineage.childIndex)
+    ts_init = ts_event
     if d.side == "BUY":
         side = OrderSide.BUY
     elif d.side == "SELL":
@@ -580,8 +667,8 @@ def _trade_to_nautilus(
 
     instr = instruments_by_id[t.instrumentId]
     iid = instr.id
-    ts_event = _ms_to_ns(t.lineage.processedAt)
-    ts_init = _ms_to_ns(t.lineage.processedAt)
+    ts_event = _replay_ts(t.lineage.sourceSequence, t.lineage.childIndex)
+    ts_init = ts_event
     agg = AggressorSide.NO_AGGRESSOR
     if t.aggressorSide == "BUY":
         agg = AggressorSide.BUYER
@@ -604,8 +691,8 @@ def _trade_to_nautilus(
 def _reference_to_nautilus(r: NormalizedReferencePrice) -> tuple[Any, list[dict]]:
     from nautilus_trader.model.data import CustomData, DataType
 
-    ts_event = _ms_to_ns(r.lineage.processedAt)
-    ts_init = _ms_to_ns(r.lineage.processedAt)
+    ts_event = _replay_ts(r.lineage.sourceSequence, r.lineage.childIndex)
+    ts_init = ts_event
     update = ReferencePriceUpdate(
         ts_event,
         ts_init,
@@ -627,14 +714,15 @@ def _reference_to_nautilus(r: NormalizedReferencePrice) -> tuple[Any, list[dict]
 def _lifecycle_to_nautilus(ev: NormalizedLifecycleEvent) -> tuple[Any, list[dict]]:
     from nautilus_trader.model.data import CustomData, DataType
 
-    ts_event = _ms_to_ns(ev.lineage.processedAt)
-    ts_init = _ms_to_ns(ev.lineage.processedAt)
+    ts_event = _replay_ts(ev.lineage.sourceSequence, ev.lineage.childIndex)
+    ts_init = ts_event
     le = LifecycleEvent(
         ts_event,
         ts_init,
         kind=ev.kind,
         generation=ev.generation or 0,
         detail=ev.detail or "",
+        payloadJson=ev.payloadJson,
         sourceSequence=ev.lineage.sourceSequence,
         childIndex=ev.lineage.childIndex,
     )
