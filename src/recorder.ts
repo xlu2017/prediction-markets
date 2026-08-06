@@ -154,6 +154,8 @@ export async function runRecorder(
   const startedAt = new Date(startedAtMs).toISOString();
   const runId = dependencies.runId ?? createRunId(startedAtMs);
   const gitCommit = await currentGitCommit(cwd);
+  const clobStaleAfterMs = dependencies.clobStaleAfterMs ?? 15_000;
+  const referenceStaleAfterMs = dependencies.referenceStaleAfterMs ?? 10_000;
   const commandArguments: Record<string, JsonValue> = {
     durationSeconds: options.durationSeconds,
     outputDir: options.outputDir,
@@ -162,11 +164,63 @@ export async function runRecorder(
   };
   const store = await RunStore.initialize(
     options.outputDir,
-    createManifest({ runId, startedAt, market, gitCommit, commandArguments }),
+    createManifest({
+      runId,
+      startedAt,
+      market,
+      gitCommit,
+      commandArguments,
+      clobStaleAfterMs,
+      referenceStaleAfterMs,
+    }),
   );
   const books = new OrderBookTracker([market.upTokenId, market.downTokenId]);
-  const health = new HealthTracker(runId, startedAt, [market.upTokenId, market.downTokenId], books);
-  const processor = new RecorderEventProcessor(runId, market, store, books, health, logger, now);
+  const health = new HealthTracker(
+    runId,
+    startedAt,
+    [market.upTokenId, market.downTokenId],
+    books,
+    referenceStaleAfterMs,
+  );
+  const fatalController = new AbortController();
+  const feedsBySource = new Map<string, ManagedWebSocket>();
+  let currentClobGeneration: number | null = null;
+  const checkGeneration = (frame: FeedFrame): boolean => {
+    const feed = feedsBySource.get(frame.source);
+    if (feed === undefined) return false;
+    if (!feed.isCurrentGeneration(frame.connectionGeneration)) return false;
+    if (feed.isPreGapObservation(frame.receivedAt)) return false;
+    return true;
+  };
+  const commitValidData = (frame: FeedFrame): boolean => {
+    const feed = feedsBySource.get(frame.source);
+    if (feed === undefined) return false;
+    const committed = feed.commitValidDataMessage(frame.receivedAt, frame.connectionGeneration);
+    if (committed && frame.source === "POLYMARKET_CLOB") {
+      currentClobGeneration = frame.connectionGeneration;
+    }
+    return committed;
+  };
+  const onClobGap = (): void => {
+    currentClobGeneration = null;
+  };
+  const onFatalError = (): void => {
+    logger.error("Fatal processing error detected, stopping feeds");
+    fatalController.abort("fatal processing error");
+  };
+  const processor = new RecorderEventProcessor(
+    runId,
+    market,
+    store,
+    books,
+    health,
+    logger,
+    now,
+    checkGeneration,
+    onFatalError,
+    onClobGap,
+    commitValidData,
+  );
   const feeds = createFeeds({
     market,
     dependencies,
@@ -174,10 +228,7 @@ export async function runRecorder(
     onFrame: (frame) => processor.enqueueFrame(frame),
     onLifecycle: (event) => processor.enqueueLifecycle(event),
   });
-  const staleAfterMs = Math.max(
-    dependencies.clobStaleAfterMs ?? 15_000,
-    dependencies.referenceStaleAfterMs ?? 10_000,
-  );
+  for (const feed of feeds) feedsBySource.set(feed.source, feed);
 
   processor.enqueueMarketMetadata(startedAtMs);
   try {
@@ -188,18 +239,40 @@ export async function runRecorder(
       durationSeconds: options.durationSeconds,
       outputDirectory: store.directory,
     });
-    await waitForDuration(options.durationSeconds * 1_000, options.signal, monotonicNow);
+    const combinedSignal = options.signal;
+    if (combinedSignal !== undefined) {
+      combinedSignal.addEventListener("abort", () => fatalController.abort(combinedSignal.reason), {
+        once: true,
+      });
+    }
+    await waitForDuration(options.durationSeconds * 1_000, fatalController.signal, monotonicNow);
     await Promise.all(feeds.map(async (feed) => feed.stop()));
     const eventCount = await processor.drain();
     const endedAtMs = now();
     const endedAt = new Date(endedAtMs).toISOString();
+    const healthSummary = health.summary(
+      endedAt,
+      endedAtMs,
+      clobStaleAfterMs,
+      referenceStaleAfterMs,
+      currentClobGeneration,
+    );
     await store.finalize({
       status: "COMPLETED",
       endedAt,
       finalEventCount: eventCount,
-      health: health.summary(endedAt, endedAtMs, staleAfterMs),
+      health: healthSummary,
+      captureStatus: healthSummary.captureStatus,
+      usableForReplay: healthSummary.usableForReplay,
+      qualityFailures: healthSummary.qualityFailures,
     });
-    logger.info("Recorder completed", { runId, eventCount, outputDirectory: store.directory });
+    logger.info("Recorder completed", {
+      runId,
+      eventCount,
+      outputDirectory: store.directory,
+      captureStatus: healthSummary.captureStatus,
+      usableForReplay: healthSummary.usableForReplay,
+    });
     return { runId, runDirectory: store.directory, eventCount, market };
   } catch (error) {
     await Promise.allSettled(feeds.map(async (feed) => feed.stop()));
@@ -207,12 +280,23 @@ export async function runRecorder(
     const endedAtMs = now();
     const endedAt = new Date(endedAtMs).toISOString();
     const reason = errorMessage(error);
+    const healthSummary = health.summary(
+      endedAt,
+      endedAtMs,
+      clobStaleAfterMs,
+      referenceStaleAfterMs,
+      currentClobGeneration,
+      true,
+    );
     await store
       .finalize({
         status: "FAILED",
         endedAt,
         finalEventCount: processor.count,
-        health: health.summary(endedAt, endedAtMs, staleAfterMs),
+        health: healthSummary,
+        captureStatus: healthSummary.captureStatus,
+        usableForReplay: healthSummary.usableForReplay,
+        qualityFailures: healthSummary.qualityFailures,
         failureReason: reason,
       })
       .catch((finalizationError: unknown) => {

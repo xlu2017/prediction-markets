@@ -44,6 +44,7 @@ function rawDataToString(data: RawData): string {
 
 export class ManagedWebSocket {
   private socket: WebSocket | null = null;
+  private closePromise: Promise<void> = Promise.resolve();
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
   private staleTimer: NodeJS.Timeout | null = null;
@@ -51,6 +52,7 @@ export class ManagedWebSocket {
   private reconnectAttempt = 0;
   private generation = 0;
   private gapStartedAt: number | null = null;
+  private gapEnded = true;
   private readonly staleDetector: StaleDetector;
   private readonly now: () => number;
   private readonly random: () => number;
@@ -61,6 +63,14 @@ export class ManagedWebSocket {
     this.now = options.now ?? Date.now;
     this.random = options.random ?? Math.random;
     this.createSocket = options.createSocket ?? ((url) => new WebSocket(url));
+  }
+
+  public get source(): EventSource {
+    return this.options.source;
+  }
+
+  public get name(): string {
+    return this.options.name;
   }
 
   public start(): void {
@@ -76,7 +86,14 @@ export class ManagedWebSocket {
     this.clearTimers();
     const socket = this.socket;
     this.socket = null;
-    if (socket === null || socket.readyState === WebSocket.CLOSED) return;
+    if (socket === null) {
+      await this.closePromise;
+      return;
+    }
+    if (socket.readyState === WebSocket.CLOSED) {
+      await this.closePromise;
+      return;
+    }
 
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
@@ -91,6 +108,32 @@ export class ManagedWebSocket {
       if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
       else socket.close(1000, "controlled shutdown");
     });
+    await this.closePromise;
+  }
+
+  public isCurrentGeneration(connectionGeneration: number): boolean {
+    return connectionGeneration === this.generation;
+  }
+
+  public isPreGapObservation(receivedAt: number): boolean {
+    return this.gapStartedAt !== null && !this.gapEnded && receivedAt < this.gapStartedAt;
+  }
+
+  public commitValidDataMessage(receivedAt: number, connectionGeneration: number): boolean {
+    if (connectionGeneration !== this.generation) return false;
+    if (this.gapStartedAt !== null && !this.gapEnded && receivedAt < this.gapStartedAt) {
+      return false;
+    }
+    this.staleDetector.observe(receivedAt);
+    if (this.gapStartedAt !== null && !this.gapEnded) {
+      this.emitLifecycle("DATA_GAP_ENDED", connectionGeneration, {
+        gapStartedAt: this.gapStartedAt,
+        gapDurationMs: Math.max(0, receivedAt - this.gapStartedAt),
+      });
+      this.gapStartedAt = null;
+      this.gapEnded = true;
+    }
+    return true;
   }
 
   private connect(): void {
@@ -99,6 +142,11 @@ export class ManagedWebSocket {
     const currentGeneration = this.generation;
     const socket = this.createSocket(this.options.url);
     this.socket = socket;
+    this.closePromise = new Promise<void>((resolveClose) => {
+      socket.once("close", () => {
+        resolveClose();
+      });
+    });
 
     this.emitLifecycle("CONNECTION_ATTEMPT", currentGeneration, { url: this.options.url });
 
@@ -112,13 +160,6 @@ export class ManagedWebSocket {
       this.emitLifecycle("SUBSCRIPTION_SENT", currentGeneration, {
         subscription: this.options.subscription,
       });
-      if (this.gapStartedAt !== null) {
-        this.emitLifecycle("DATA_GAP_ENDED", currentGeneration, {
-          gapStartedAt: this.gapStartedAt,
-          gapDurationMs: Math.max(0, openedAt - this.gapStartedAt),
-        });
-        this.gapStartedAt = null;
-      }
       this.startTimers(socket, currentGeneration);
     });
 
@@ -126,7 +167,6 @@ export class ManagedWebSocket {
       if (this.stopping || socket !== this.socket) return;
       const receivedAt = this.now();
       const rawText = rawDataToString(data);
-      if (rawText !== "PONG" && rawText !== "PING") this.staleDetector.observe(receivedAt);
       this.options.onFrame({
         source: this.options.source,
         rawText,
@@ -149,6 +189,7 @@ export class ManagedWebSocket {
       if (this.stopping) return;
       if (this.gapStartedAt === null) {
         this.gapStartedAt = closedAt;
+        this.gapEnded = false;
         this.emitLifecycle("DATA_GAP_STARTED", currentGeneration, { gapStartedAt: closedAt });
       }
       const delayMs = reconnectDelayMs(
@@ -183,6 +224,7 @@ export class ManagedWebSocket {
           this.emitLifecycle("STALE_STREAM", generation, {
             staleAfterMs: this.options.staleAfterMs,
           });
+          if (socket.readyState === WebSocket.OPEN) socket.close(1011, "stale stream");
         }
       },
       Math.max(250, Math.floor(this.options.staleAfterMs / 4)),

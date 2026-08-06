@@ -175,6 +175,8 @@ describe("read-only recorder integration", () => {
 
     expect(manifest.completionStatus).toBe("COMPLETED");
     expect(manifest.finalEventCount).toBe(events.length);
+    expect(manifest.schemaVersion).toBe(2);
+    expect(health.schemaVersion).toBe(2);
     expect(health.bothTokenStreamsObserved).toBe(true);
     expect(health.referencePriceStreamObserved).toBe(true);
     expect(health.reconnectCount).toBeGreaterThanOrEqual(2);
@@ -187,6 +189,32 @@ describe("read-only recorder integration", () => {
     );
     expect(events.some((event) => event.eventType === "DATA_GAP_STARTED")).toBe(true);
     expect(events.some((event) => event.eventType === "DATA_GAP_ENDED")).toBe(true);
+
+    for (const event of events) {
+      expect(event.schemaVersion).toBe(2);
+      expect(event.marketId).toBe("market-200");
+      expect(event.conditionId).toBe("0xcondition");
+    }
+    const clobDataEvents = events.filter(
+      (event) => event.source === "POLYMARKET_CLOB" && event.sourceMarketId !== null,
+    );
+    expect(clobDataEvents.length).toBeGreaterThan(0);
+    for (const event of clobDataEvents) {
+      expect(event.sourceMarketId).toBe("0xcondition");
+    }
+    const duplicateEvents = events.filter((event) => event.isDuplicate);
+    expect(duplicateEvents.length).toBeGreaterThanOrEqual(1);
+    for (const event of duplicateEvents) {
+      expect(event.duplicateOfSequence).not.toBeNull();
+      expect(event.dedupeReason).not.toBeNull();
+    }
+    const frameEvents = events.filter((event) => event.frameId !== null);
+    expect(frameEvents.length).toBeGreaterThan(0);
+    for (const event of frameEvents) {
+      expect(event.messageIndex).not.toBeNull();
+      expect(event.messageCount).not.toBeNull();
+    }
+
     const reference = events.find((event) => event.eventType === "REFERENCE_PRICE");
     const referencePayload =
       reference?.payload !== null &&

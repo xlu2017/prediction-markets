@@ -8,6 +8,7 @@ interfaces used at runtime.
 - Base: `https://gamma-api.polymarket.com`
 - Direct event lookup: `GET /events/slug/{slug}`
 - Fallback discovery: `GET /events/keyset` with public, read-only filters
+- Retry: bounded exponential backoff on HTTP 429 and 5xx responses (up to 3 retries)
 
 Official references:
 

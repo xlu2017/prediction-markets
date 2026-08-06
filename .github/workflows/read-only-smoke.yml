@@ -23,6 +23,18 @@ jobs:
       - run: pnpm install --frozen-lockfile
       - run: pnpm read-only:check
       - run: pnpm market:record --duration-seconds 30
+      - name: Find run directory
+        id: find-run
+        run: |
+          set -euo pipefail
+          RUN_DIR=$(find data/polymarket-runs -mindepth 1 -maxdepth 1 -type d | sort | tail -1)
+          if [ -z "$RUN_DIR" ]; then
+            echo "No run directory found" >&2
+            exit 1
+          fi
+          echo "run_directory=$RUN_DIR" >> "$GITHUB_OUTPUT"
+      - name: Verify run is usable for replay
+        run: pnpm market:verify-run "${{ steps.find-run.outputs.run_directory }}"
       - uses: actions/upload-artifact@v4
         if: always()
         with:

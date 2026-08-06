@@ -1,0 +1,30 @@
+{
+  "id": "797090",
+  "slug": "btc-updown-5m-1785950400",
+  "title": "Bitcoin Up or Down - August 5, 1:20PM-1:25PM ET",
+  "description": "This market will resolve to \"Up\" if the Bitcoin price at the end of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the BTC/USD data stream available at https://data.chain.link/streams/btc-usd.\nPlease note that this market is about the price according to Chainlink data stream BTC/USD, not according to other sources or spot markets.",
+  "resolutionSource": "https://data.chain.link/streams/btc-usd",
+  "startDate": "2026-08-04T17:27:59.496907Z",
+  "endDate": "2026-08-05T17:25:00Z",
+  "active": true,
+  "closed": false,
+  "startTime": "2026-08-05T17:20:00Z",
+  "markets": [
+    {
+      "id": "3342900",
+      "conditionId": "0xea9e33e80061e1528c92dedd0e55166bcc2177e9c22527a844fd11cc848e2c92",
+      "slug": "btc-updown-5m-1785950400",
+      "question": "Bitcoin Up or Down - August 5, 1:20PM-1:25PM ET",
+      "description": "This market will resolve to \"Up\" if the Bitcoin price at the end of the time range specified in the title is greater than or equal to the price at the beginning of that range. Otherwise, it will resolve to \"Down\".\nThe resolution source for this market is information from Chainlink, specifically the BTC/USD data stream available at https://data.chain.link/streams/btc-usd.\nPlease note that this market is about the price according to Chainlink data stream BTC/USD, not according to other sources or spot markets.",
+      "resolutionSource": "https://data.chain.link/streams/btc-usd",
+      "startDate": "2026-08-04T17:27:59.496907Z",
+      "endDate": "2026-08-05T17:25:00Z",
+      "active": true,
+      "closed": false,
+      "outcomes": "[\"Up\", \"Down\"]",
+      "clobTokenIds": "[\"61226495212788195071825345455083842089091872160352873237516209780957917201310\", \"19708664482862201586158060288384845482705734993661746815545489803110170332166\"]",
+      "orderPriceMinTickSize": 0.01,
+      "eventStartTime": "2026-08-05T17:20:00Z"
+    }
+  ]
+}

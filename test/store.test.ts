@@ -31,6 +31,8 @@ describe("run storage", () => {
         market,
         gitCommit: null,
         commandArguments: { durationSeconds: 1 },
+        clobStaleAfterMs: 15_000,
+        referenceStaleAfterMs: 10_000,
       }),
     );
     const sequencer = new EventSequencer(runId);
@@ -38,13 +40,15 @@ describe("run storage", () => {
       sequencer.next({
         source: "POLYMARKET_CLOB",
         eventType: "book",
+        marketId: market.marketId,
+        conditionId: market.conditionId,
         receivedAt: 1,
         processedAt: 2,
         payload: { bids: [{ price: ".48", size: "30" }] },
       }),
     );
     const health: HealthSummary = {
-      schemaVersion: 1,
+      schemaVersion: 2,
       runId,
       startedAt: "2026-08-05T06:02:00.000Z",
       endedAt: "2026-08-05T06:02:01.000Z",
@@ -60,12 +64,60 @@ describe("run storage", () => {
       bothTokenStreamsObserved: false,
       referencePriceStreamObserved: false,
       finalBookHealth: {},
+      openGapsByFeed: {},
+      dataGapCount: 0,
+      closedGapCount: 0,
+      totalGapDurationMs: 0,
+      maximumGapDurationMs: 0,
+      captureStatus: "PARTIAL",
+      usableForReplay: false,
+      qualityFailures: [
+        {
+          code: "MISSING_UP_SNAPSHOT",
+          message: "Missing token snapshot: 111111",
+          tokenId: "111111",
+        },
+        {
+          code: "MISSING_DOWN_SNAPSHOT",
+          message: "Missing token snapshot: 222222",
+          tokenId: "222222",
+        },
+        { code: "REFERENCE_STREAM_MISSING", message: "Chainlink reference stream not observed" },
+      ],
+      clobStaleAfterMs: 15_000,
+      referenceStaleAfterMs: 10_000,
+      lastReferenceReceivedAt: null,
+      lastReferenceConnectionGeneration: null,
+      lastReferenceSourceTimestamp: null,
+      finalReferenceAgeMs: null,
+      finalReferenceSourceAgeMs: null,
+      referenceFresh: false,
+      referenceClockSkewMs: 5_000,
+      referenceTimestampAnomalyCount: 0,
+      referenceTimestampMissingCount: 0,
+      referenceStaleAtReceiptCount: 0,
+      referenceFutureSourceSkewCount: 0,
     };
     await store.finalize({
       status: "COMPLETED",
       endedAt: "2026-08-05T06:02:01.000Z",
       finalEventCount: 1,
       health,
+      captureStatus: "PARTIAL",
+      usableForReplay: false,
+      qualityFailures: [
+        {
+          code: "MISSING_UP_SNAPSHOT",
+          message: "Missing token snapshot: 111111",
+          tokenId: "111111",
+        },
+        {
+          code: "MISSING_DOWN_SNAPSHOT",
+          message: "Missing token snapshot: 222222",
+          tokenId: "222222",
+        },
+        { code: "REFERENCE_STREAM_MISSING", message: "Chainlink reference stream not observed" },
+      ],
     });
 
     const eventLines = (await readFile(path.join(store.directory, "events.jsonl"), "utf8"))

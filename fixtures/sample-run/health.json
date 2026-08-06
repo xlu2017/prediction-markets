@@ -1,8 +1,8 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "runId": "fixture-run-001",
   "startedAt": "2026-08-05T06:02:00.000Z",
-  "endedAt": "2026-08-05T06:02:01.000Z",
+  "endedAt": "2026-08-05T06:02:00.126Z",
   "totalEventsReceived": 4,
   "eventCountsBySource": {
     "POLYMARKET_MARKET": 1,
@@ -25,6 +25,11 @@
   "finalBookHealth": {
     "111111": {
       "tokenId": "111111",
+      "state": "SYNCHRONIZED",
+      "integrity": "NORMAL",
+      "crossedIncidentCount": 0,
+      "synchronizationEpoch": 0,
+      "snapshotConnectionGeneration": 1,
       "bestBid": ".48",
       "bestAsk": ".52",
       "bidDepthCount": 1,
@@ -34,6 +39,11 @@
     },
     "222222": {
       "tokenId": "222222",
+      "state": "SYNCHRONIZED",
+      "integrity": "NORMAL",
+      "crossedIncidentCount": 0,
+      "synchronizationEpoch": 0,
+      "snapshotConnectionGeneration": 1,
       "bestBid": ".47",
       "bestAsk": ".53",
       "bidDepthCount": 1,
@@ -41,5 +51,26 @@
       "lastSuccessfulUpdateTime": 1785909720116,
       "healthy": true
     }
-  }
+  },
+  "openGapsByFeed": {},
+  "dataGapCount": 0,
+  "closedGapCount": 0,
+  "totalGapDurationMs": 0,
+  "maximumGapDurationMs": 0,
+  "captureStatus": "COMPLETE",
+  "usableForReplay": true,
+  "qualityFailures": [],
+  "clobStaleAfterMs": 15000,
+  "referenceStaleAfterMs": 10000,
+  "lastReferenceReceivedAt": 1785909720125,
+  "lastReferenceConnectionGeneration": 1,
+  "lastReferenceSourceTimestamp": 1785909720120,
+  "finalReferenceAgeMs": 1,
+  "finalReferenceSourceAgeMs": 6,
+  "referenceFresh": true,
+  "referenceClockSkewMs": 5000,
+  "referenceTimestampAnomalyCount": 0,
+  "referenceTimestampMissingCount": 0,
+  "referenceStaleAtReceiptCount": 0,
+  "referenceFutureSourceSkewCount": 0
 }

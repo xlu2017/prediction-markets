@@ -1,7 +1,7 @@
 {
-  "schemaVersion": 1,
+  "schemaVersion": 2,
   "market": {
-    "schemaVersion": 1,
+    "schemaVersion": 2,
     "eventId": "event-100",
     "marketId": "market-200",
     "conditionId": "0xcondition",
@@ -22,6 +22,7 @@
       "slug": "btc-updown-5m-1785909600",
       "active": true,
       "closed": false
-    }
+    },
+    "rawGammaText": "{\"id\":\"event-100\",\"slug\":\"btc-updown-5m-1785909600\",\"active\":true,\"closed\":false}"
   }
 }

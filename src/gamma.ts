@@ -11,19 +11,64 @@ export type MarketDiscoveryOptions = {
   logger: Logger;
 };
 
-async function fetchJson(
+const MAX_RETRY_ATTEMPTS = 3;
+const RETRY_BASE_DELAY_MS = 500;
+
+function isRetryableStatus(status: number): boolean {
+  return status === 429 || (status >= 500 && status <= 599);
+}
+
+async function fetchJsonWithRetry(
   url: URL,
   fetchImplementation: typeof fetch,
-  allowNotFound = false,
-): Promise<unknown> {
-  const response = await fetchImplementation(url, {
-    headers: { Accept: "application/json" },
-    signal: AbortSignal.timeout(10_000),
-  });
-  if (allowNotFound && response.status === 404) return null;
-  if (!response.ok)
-    throw new Error(`Gamma request failed (${response.status}) for ${url.pathname}`);
-  return JSON.parse(await response.text()) as unknown;
+  allowNotFound: boolean,
+  random: () => number,
+): Promise<{ json: unknown; rawText: string }> {
+  let lastError: Error | null = null;
+  for (let attempt = 0; attempt < MAX_RETRY_ATTEMPTS; attempt += 1) {
+    try {
+      const response = await fetchImplementation(url, {
+        headers: { Accept: "application/json" },
+        signal: AbortSignal.timeout(10_000),
+      });
+      const rawText = await response.text();
+      if (allowNotFound && response.status === 404) {
+        return { json: null, rawText };
+      }
+      if (!response.ok) {
+        if (isRetryableStatus(response.status) && attempt < MAX_RETRY_ATTEMPTS - 1) {
+          const jitter = 0.8 + Math.min(1, Math.max(0, random())) * 0.4;
+          const delay = Math.round(RETRY_BASE_DELAY_MS * 2 ** attempt * jitter);
+          await new Promise<void>((resolve) => {
+            const timer = setTimeout(resolve, delay);
+            timer.unref();
+          });
+          lastError = new Error(
+            `Gamma request returned retryable status ${response.status} for ${url.pathname}`,
+          );
+          continue;
+        }
+        throw new Error(`Gamma request failed (${response.status}) for ${url.pathname}`);
+      }
+      return { json: JSON.parse(rawText) as unknown, rawText };
+    } catch (error) {
+      lastError = error instanceof Error ? error : new Error(String(error));
+      if (
+        attempt < MAX_RETRY_ATTEMPTS - 1 &&
+        !(error instanceof Error && error.message.includes("Gamma request failed"))
+      ) {
+        const jitter = 0.8 + Math.min(1, Math.max(0, random())) * 0.4;
+        const delay = Math.round(RETRY_BASE_DELAY_MS * 2 ** attempt * jitter);
+        await new Promise<void>((resolve) => {
+          const timer = setTimeout(resolve, delay);
+          timer.unref();
+        });
+        continue;
+      }
+      if (error instanceof Error && error.message.includes("Gamma request failed")) throw error;
+    }
+  }
+  throw lastError ?? new Error(`Gamma request exhausted retries for ${url.pathname}`);
 }
 
 function candidateSlugs(nowMs: number): string[] {
@@ -48,20 +93,21 @@ export async function discoverBtcFiveMinuteMarket(
   const nowMs = options.nowMs ?? Date.now();
   const fetchImplementation = options.fetchImplementation ?? fetch;
   const baseUrl = options.gammaBaseUrl ?? PUBLIC_ENDPOINTS.gamma;
+  const random = Math.random;
 
   if (options.marketSlug !== undefined) {
     const url = new URL(`/events/slug/${encodeURIComponent(options.marketSlug)}`, baseUrl);
-    const event = await fetchJson(url, fetchImplementation);
-    return validateBtcFiveMinuteEvent(event, nowMs);
+    const { json, rawText } = await fetchJsonWithRetry(url, fetchImplementation, false, random);
+    return validateBtcFiveMinuteEvent(json, nowMs, rawText);
   }
 
   const validationErrors: string[] = [];
   for (const slug of candidateSlugs(nowMs)) {
     try {
       const url = new URL(`/events/slug/${encodeURIComponent(slug)}`, baseUrl);
-      const event = await fetchJson(url, fetchImplementation, true);
-      if (event === null) continue;
-      const market = validateBtcFiveMinuteEvent(event, nowMs);
+      const { json, rawText } = await fetchJsonWithRetry(url, fetchImplementation, true, random);
+      if (json === null) continue;
+      const market = validateBtcFiveMinuteEvent(json, nowMs, rawText);
       options.logger.info("Discovered market from interval slug", { slug });
       return market;
     } catch (error) {
@@ -77,11 +123,16 @@ export async function discoverBtcFiveMinuteMarket(
   url.searchParams.set("title_search", "Bitcoin Up or Down");
   url.searchParams.set("end_date_min", new Date(nowMs).toISOString());
   url.searchParams.set("end_date_max", new Date(nowMs + 600_000).toISOString());
-  const payload = await fetchJson(url, fetchImplementation);
+  const { json: payload, rawText } = await fetchJsonWithRetry(
+    url,
+    fetchImplementation,
+    false,
+    random,
+  );
   const matches: MarketSpecification[] = [];
   for (const event of extractEventList(payload)) {
     try {
-      matches.push(validateBtcFiveMinuteEvent(event, nowMs));
+      matches.push(validateBtcFiveMinuteEvent(event, nowMs, rawText));
     } catch (error) {
       validationErrors.push(errorMessage(error));
     }

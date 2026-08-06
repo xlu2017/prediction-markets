@@ -4,6 +4,7 @@ export default defineConfig({
   test: {
     coverage: { enabled: false },
     include: ["test/**/*.test.ts"],
-    testTimeout: 10_000,
+    testTimeout: 30_000,
+    fileParallelism: false,
   },
 });

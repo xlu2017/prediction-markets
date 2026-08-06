@@ -4,7 +4,7 @@ export type JsonValue = JsonPrimitive | JsonValue[] | { [key: string]: JsonValue
 export type EventSource = "POLYMARKET_CLOB" | "POLYMARKET_MARKET" | "POLYMARKET_REFERENCE_PRICE";
 
 export type MarketSpecification = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   eventId: string;
   marketId: string;
   conditionId: string;
@@ -21,28 +21,73 @@ export type MarketSpecification = {
   active: boolean;
   closed: boolean;
   rawMetadata: JsonValue;
+  rawGammaText: string;
 };
 
+export type DedupeState = "UNIQUE_APPLIED" | "DUPLICATE_APPLIED" | "RECEIVED_NOT_APPLIED";
+
 export type RawEventEnvelope = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   runId: string;
   sequence: number;
   source: EventSource;
   eventType: string;
   marketId: string | null;
+  conditionId: string | null;
+  sourceMarketId: string | null;
   tokenId: string | null;
+  observedTokenIds: string[] | null;
   sourceTimestamp: number | null;
+  topLevelSourceTimestamp: number | null;
+  payloadSourceTimestamp: number | null;
   receivedAt: number;
   processedAt: number;
   connectionGeneration: number | null;
+  frameId: string | null;
+  messageIndex: number | null;
+  messageCount: number | null;
+  isDuplicate: boolean;
+  dedupeState: DedupeState;
+  duplicateOfSequence: number | null;
+  dedupeReason: string | null;
   payload: JsonValue;
   rawText: string | null;
+  rawMessageText: string | null;
 };
 
 export type CompletionStatus = "COMPLETED" | "FAILED" | "RUNNING";
+export type CaptureStatus = "COMPLETE" | "PARTIAL" | "UNUSABLE";
+export type BookState = "UNINITIALIZED" | "SYNCHRONIZED" | "STALE" | "INVALID" | "RESYNC_REQUIRED";
+export type BookIntegrity = "NORMAL" | "LOCKED" | "CROSSED";
+
+export type QualityFailureCode =
+  | "MISSING_UP_SNAPSHOT"
+  | "MISSING_DOWN_SNAPSHOT"
+  | "REFERENCE_STREAM_MISSING"
+  | "REFERENCE_STREAM_STALE"
+  | "REFERENCE_CLOCK_SKEW"
+  | "REFERENCE_TIMESTAMP_MISSING"
+  | "REFERENCE_LOCAL_CLOCK_SKEW"
+  | "OPEN_DATA_GAP"
+  | "CLOSED_DATA_GAP"
+  | "MALFORMED_EVENTS_PRESENT"
+  | "BOOK_STALE"
+  | "BOOK_INVALID"
+  | "BOOK_RESYNC_REQUIRED"
+  | "BOOK_SNAPSHOT_STALE_GENERATION"
+  | "BOOK_CROSSED"
+  | "FATAL_PROCESSOR_ERROR"
+  | "PROCESS_FAILURE";
+
+export type QualityFailure = {
+  code: QualityFailureCode;
+  message: string;
+  feed?: string;
+  tokenId?: string;
+};
 
 export type RunManifest = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   runId: string;
   startedAt: string;
   endedAt: string | null;
@@ -54,10 +99,20 @@ export type RunManifest = {
   completionStatus: CompletionStatus;
   finalEventCount: number | null;
   failureReason: string | null;
+  captureStatus: CaptureStatus;
+  usableForReplay: boolean;
+  qualityFailures: QualityFailure[];
+  clobStaleAfterMs: number;
+  referenceStaleAfterMs: number;
 };
 
 export type BookHealth = {
   tokenId: string;
+  state: BookState;
+  integrity: BookIntegrity;
+  crossedIncidentCount: number;
+  synchronizationEpoch: number;
+  snapshotConnectionGeneration: number | null;
   bestBid: string | null;
   bestAsk: string | null;
   bidDepthCount: number;
@@ -66,8 +121,13 @@ export type BookHealth = {
   healthy: boolean;
 };
 
+export type OpenGap = {
+  feed: string;
+  startedAt: number;
+};
+
 export type HealthSummary = {
-  schemaVersion: 1;
+  schemaVersion: 2;
   runId: string;
   startedAt: string;
   endedAt: string | null;
@@ -83,6 +143,27 @@ export type HealthSummary = {
   bothTokenStreamsObserved: boolean;
   referencePriceStreamObserved: boolean;
   finalBookHealth: Record<string, BookHealth>;
+  openGapsByFeed: Record<string, OpenGap>;
+  dataGapCount: number;
+  closedGapCount: number;
+  totalGapDurationMs: number;
+  maximumGapDurationMs: number;
+  captureStatus: CaptureStatus;
+  usableForReplay: boolean;
+  qualityFailures: QualityFailure[];
+  clobStaleAfterMs: number;
+  referenceStaleAfterMs: number;
+  lastReferenceReceivedAt: number | null;
+  lastReferenceConnectionGeneration: number | null;
+  lastReferenceSourceTimestamp: number | null;
+  finalReferenceAgeMs: number | null;
+  finalReferenceSourceAgeMs: number | null;
+  referenceFresh: boolean;
+  referenceClockSkewMs: number;
+  referenceTimestampAnomalyCount: number;
+  referenceTimestampMissingCount: number;
+  referenceStaleAtReceiptCount: number;
+  referenceFutureSourceSkewCount: number;
 };
 
 export type LogLevel = "debug" | "error" | "info" | "warn";

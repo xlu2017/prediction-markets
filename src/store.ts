@@ -5,16 +5,18 @@ import path from "node:path";
 import { promisify } from "node:util";
 
 import type {
+  CaptureStatus,
   CompletionStatus,
   HealthSummary,
   JsonValue,
   MarketSpecification,
+  QualityFailure,
   RawEventEnvelope,
   RunManifest,
 } from "./types.js";
 
 const execFileAsync = promisify(execFile);
-export const RECORDER_VERSION = "0.1.0";
+export const RECORDER_VERSION = "0.2.0";
 export const OUTPUT_FILES = ["manifest.json", "market.json", "events.jsonl", "health.json"];
 
 export function createRunId(nowMs = Date.now(), uuid = randomUUID()): string {
@@ -46,9 +48,11 @@ export function createManifest(input: {
   market: MarketSpecification;
   gitCommit: string | null;
   commandArguments: Record<string, JsonValue>;
+  clobStaleAfterMs: number;
+  referenceStaleAfterMs: number;
 }): RunManifest {
   return {
-    schemaVersion: 1,
+    schemaVersion: 2,
     runId: input.runId,
     startedAt: input.startedAt,
     endedAt: null,
@@ -60,6 +64,11 @@ export function createManifest(input: {
     completionStatus: "RUNNING",
     finalEventCount: null,
     failureReason: null,
+    captureStatus: "UNUSABLE",
+    usableForReplay: false,
+    qualityFailures: [],
+    clobStaleAfterMs: input.clobStaleAfterMs,
+    referenceStaleAfterMs: input.referenceStaleAfterMs,
   };
 }
 
@@ -72,11 +81,11 @@ export class RunStore {
 
   public static async initialize(outputBase: string, manifest: RunManifest): Promise<RunStore> {
     const directory = path.resolve(outputBase, manifest.runId);
-    await mkdir(directory, { recursive: false });
+    await mkdir(directory, { recursive: true });
     const eventsFile = await open(path.join(directory, "events.jsonl"), "wx");
     const store = new RunStore(directory, manifest, eventsFile);
     await atomicJson(path.join(directory, "market.json"), {
-      schemaVersion: 1,
+      schemaVersion: 2,
       market: manifest.market,
     });
     await store.writeManifest();
@@ -96,6 +105,9 @@ export class RunStore {
     endedAt: string;
     finalEventCount: number;
     health: HealthSummary;
+    captureStatus: CaptureStatus;
+    usableForReplay: boolean;
+    qualityFailures: QualityFailure[];
     failureReason?: string | null;
   }): Promise<void> {
     await this.flush();
@@ -105,6 +117,9 @@ export class RunStore {
       completionStatus: input.status,
       finalEventCount: input.finalEventCount,
       failureReason: input.failureReason ?? null,
+      captureStatus: input.captureStatus,
+      usableForReplay: input.usableForReplay,
+      qualityFailures: input.qualityFailures,
     };
     await atomicJson(path.join(this.directory, "health.json"), input.health);
     await this.writeManifest();

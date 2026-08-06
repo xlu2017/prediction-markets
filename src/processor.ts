@@ -1,10 +1,12 @@
-import { BoundedDeduplicator, EventSequencer } from "./envelope.js";
+import { createHash } from "node:crypto";
+
+import { MessageDeduplicator, EventSequencer, type MessageDedupeKey } from "./envelope.js";
 import { assertExactWireDecimals, extractJsonDecimalLexeme } from "./decimal.js";
 import { errorMessage } from "./logger.js";
 import type { FeedFrame, FeedLifecycle } from "./feeds/managed-websocket.js";
 import { HealthTracker } from "./health.js";
 import { OrderBookTracker } from "./book.js";
-import type { Logger, MarketSpecification } from "./types.js";
+import type { DedupeState, JsonValue, Logger, MarketSpecification } from "./types.js";
 import { RunStore } from "./store.js";
 
 function asRecord(value: unknown): Record<string, unknown> | null {
@@ -34,37 +36,137 @@ function clobTokenIds(event: Record<string, unknown>): string[] {
   return [...result];
 }
 
-function clobDedupeKey(event: Record<string, unknown>, eventType: string): string | null {
-  const hashes = new Set<string>();
-  if (typeof event.hash === "string") hashes.add(event.hash);
-  if (Array.isArray(event.price_changes)) {
-    for (const item of event.price_changes) {
-      const record = asRecord(item);
-      if (record !== null && typeof record.hash === "string") hashes.add(record.hash);
-    }
-  }
-  if (hashes.size === 0) return null;
-  return `${eventType}:${[...hashes].sort().join(",")}`;
+function rawFrameHash(rawText: string): string {
+  return createHash("sha256").update(rawText).digest("hex");
 }
 
-function referenceDedupeKey(event: Record<string, unknown>): string | null {
-  const payload = asRecord(event.payload);
-  if (payload?.symbol !== "btc/usd") return null;
-  const timestamp = timestampFrom(payload.timestamp);
-  if (
-    timestamp === null ||
-    (typeof payload.value !== "number" && typeof payload.value !== "string")
-  ) {
+function messageHash(messageText: string): string {
+  return createHash("sha256").update(messageText).digest("hex");
+}
+
+function sliceArrayMessages(rawText: string): string[] | null {
+  const trimmed = rawText.trim();
+  if (!trimmed.startsWith("[")) return null;
+  try {
+    const parsed = JSON.parse(rawText) as unknown;
+    if (!Array.isArray(parsed)) return null;
+  } catch {
     return null;
   }
-  return `btc/usd:${timestamp}:${String(payload.value)}`;
+  const messages: string[] = [];
+  let depth = 0;
+  let inString = false;
+  let escape = false;
+  let start = -1;
+  for (let i = 0; i < rawText.length; i += 1) {
+    const ch = rawText[i];
+    if (inString) {
+      if (escape) escape = false;
+      else if (ch === "\\") escape = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+      if (depth === 1 && start < 0) start = i;
+    } else if (ch === "[" || ch === "{") {
+      if (depth === 1 && start < 0) start = i;
+      depth += 1;
+    } else if (ch === "}" || ch === "]") {
+      depth -= 1;
+      if (depth === 1 && start >= 0) {
+        messages.push(rawText.slice(start, i + 1));
+        start = -1;
+      } else if (depth === 0) {
+        if (start >= 0) messages.push(rawText.slice(start, i).trim());
+        break;
+      }
+    } else if (depth === 1 && ch === ",") {
+      if (start >= 0) {
+        messages.push(rawText.slice(start, i).trim());
+        start = -1;
+      }
+    } else if (
+      depth === 1 &&
+      start < 0 &&
+      !(ch === " " || ch === "\t" || ch === "\n" || ch === "\r")
+    ) {
+      start = i;
+    }
+  }
+  return messages.length > 0 ? messages : null;
+}
+
+type ParsedMessage = {
+  message: unknown;
+  rawMessageText: string;
+  messageIndex: number;
+};
+
+function parseFrameMessages(rawText: string): ParsedMessage[] {
+  const slices = sliceArrayMessages(rawText);
+  if (slices !== null) {
+    const result: ParsedMessage[] = [];
+    for (let i = 0; i < slices.length; i += 1) {
+      try {
+        const message = JSON.parse(slices[i] ?? "") as unknown;
+        result.push({ message, rawMessageText: slices[i] ?? "", messageIndex: i });
+      } catch {
+        result.push({ message: null, rawMessageText: slices[i] ?? "", messageIndex: i });
+      }
+    }
+    return result;
+  }
+  return [{ message: JSON.parse(rawText) as unknown, rawMessageText: rawText, messageIndex: 0 }];
+}
+
+type MalformedIdentity = {
+  sourceMarketId: string | null;
+  tokenIds: string[];
+  sourceTimestamp: number | null;
+  eventType: string | null;
+  topic: string | null;
+  symbol: string | null;
+};
+
+function extractMalformedIdentity(message: unknown): MalformedIdentity {
+  const record = asRecord(message);
+  if (record === null) {
+    return {
+      sourceMarketId: null,
+      tokenIds: [],
+      sourceTimestamp: null,
+      eventType: null,
+      topic: null,
+      symbol: null,
+    };
+  }
+  const sourceMarketId = typeof record.market === "string" ? record.market : null;
+  const eventType = typeof record.event_type === "string" ? record.event_type : null;
+  const sourceTimestamp = timestampFrom(record.timestamp);
+  const tokenIds = clobTokenIds(record);
+  const payload = asRecord(record.payload);
+  const topic = typeof record.topic === "string" ? record.topic : null;
+  const symbol = typeof payload?.symbol === "string" ? payload.symbol : null;
+  const payloadTimestamp = payload !== null ? timestampFrom(payload.timestamp) : null;
+  return {
+    sourceMarketId,
+    tokenIds,
+    sourceTimestamp: sourceTimestamp ?? payloadTimestamp,
+    eventType,
+    topic,
+    symbol,
+  };
 }
 
 export class RecorderEventProcessor {
   private readonly sequencer: EventSequencer;
-  private readonly deduplicator = new BoundedDeduplicator();
+  private readonly deduplicator = new MessageDeduplicator();
+  private frameCounter = 0;
   private queue: Promise<void> = Promise.resolve();
   private fatalError: Error | null = null;
+  private clobResyncPending = false;
+  private clobResyncPendingGeneration: number | null = null;
 
   public constructor(
     runId: string,
@@ -74,6 +176,10 @@ export class RecorderEventProcessor {
     private readonly health: HealthTracker,
     private readonly logger: Logger,
     private readonly now: () => number = Date.now,
+    private readonly checkGeneration?: (frame: FeedFrame) => boolean,
+    private readonly onFatalError?: () => void,
+    private readonly onClobGap?: () => void,
+    private readonly commitValidData?: (frame: FeedFrame) => boolean,
   ) {
     this.sequencer = new EventSequencer(runId);
   }
@@ -86,10 +192,23 @@ export class RecorderEventProcessor {
     this.enqueue(async () => {
       if (event.eventType === "RECONNECT_SCHEDULED") this.health.reconnect();
       if (event.eventType === "STALE_STREAM") this.health.staleIncident();
+      if (
+        event.eventType === "DATA_GAP_STARTED" &&
+        (event.payload as Record<string, unknown>).feed === "clob-market"
+      ) {
+        this.requireClobResync(event.connectionGeneration);
+      }
+      if (
+        event.eventType === "STALE_STREAM" &&
+        (event.payload as Record<string, unknown>).feed === "clob-market"
+      ) {
+        this.requireClobResync(event.connectionGeneration);
+      }
       const envelope = this.sequencer.next({
         source: event.source,
         eventType: event.eventType,
         marketId: this.market.marketId,
+        conditionId: this.market.conditionId,
         receivedAt: event.receivedAt,
         processedAt: this.now(),
         connectionGeneration: event.connectionGeneration,
@@ -100,16 +219,25 @@ export class RecorderEventProcessor {
     });
   }
 
+  private requireClobResync(generation: number): void {
+    if (this.clobResyncPending) return;
+    this.clobResyncPending = true;
+    this.clobResyncPendingGeneration = generation;
+    this.books.requireResync();
+    this.onClobGap?.();
+  }
+
   public enqueueMarketMetadata(receivedAt: number): void {
     this.enqueue(async () => {
       const envelope = this.sequencer.next({
         source: "POLYMARKET_MARKET",
         eventType: "MARKET_DISCOVERED",
         marketId: this.market.marketId,
+        conditionId: this.market.conditionId,
         receivedAt,
         processedAt: this.now(),
         payload: this.market.rawMetadata,
-        rawText: JSON.stringify(this.market.rawMetadata),
+        rawText: this.market.rawGammaText,
       });
       await this.store.append(envelope);
       this.health.observe(envelope);
@@ -130,81 +258,241 @@ export class RecorderEventProcessor {
     this.queue = this.queue.then(task).catch((error: unknown) => {
       const normalized = error instanceof Error ? error : new Error(String(error));
       this.fatalError ??= normalized;
+      this.health.markFatalError();
       this.logger.error("Event processing failed", { message: normalized.message });
+      this.onFatalError?.();
     });
   }
 
+  private nextFrameId(): string {
+    this.frameCounter += 1;
+    return `frame-${this.frameCounter}`;
+  }
+
   private async processFrame(frame: FeedFrame): Promise<void> {
-    if (frame.rawText === "PONG" || frame.rawText === "PING") {
+    const frameId = this.nextFrameId();
+    const frameHash = rawFrameHash(frame.rawText);
+    if (
+      frame.source === "POLYMARKET_CLOB" &&
+      frame.rawText !== "PONG" &&
+      frame.rawText !== "PING"
+    ) {
+      this.logger.debug("CLOB frame received", { frameId, rawText: frame.rawText.slice(0, 100) });
+    }
+
+    if (frame.rawText.trim() === "") {
       const envelope = this.sequencer.next({
         source: frame.source,
-        eventType: frame.rawText,
+        eventType: "EMPTY_FRAME",
         marketId: this.market.marketId,
+        conditionId: this.market.conditionId,
         receivedAt: frame.receivedAt,
         processedAt: this.now(),
         connectionGeneration: frame.connectionGeneration,
+        frameId,
+        messageIndex: 0,
+        messageCount: 1,
+        dedupeState: "RECEIVED_NOT_APPLIED",
         payload: { value: frame.rawText },
         rawText: frame.rawText,
+        rawMessageText: frame.rawText,
       });
       await this.store.append(envelope);
       this.health.observe(envelope);
       return;
     }
 
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(frame.rawText) as unknown;
-    } catch (error) {
-      await this.writeMalformed(frame, error);
+    if (frame.rawText === "PONG" || frame.rawText === "PING") {
+      const envelope = this.sequencer.next({
+        source: frame.source,
+        eventType: frame.rawText,
+        marketId: this.market.marketId,
+        conditionId: this.market.conditionId,
+        receivedAt: frame.receivedAt,
+        processedAt: this.now(),
+        connectionGeneration: frame.connectionGeneration,
+        frameId,
+        messageIndex: 0,
+        messageCount: 1,
+        payload: { value: frame.rawText },
+        rawText: frame.rawText,
+        rawMessageText: frame.rawText,
+      });
+      await this.store.append(envelope);
+      this.health.observe(envelope);
       return;
     }
 
-    const messages = Array.isArray(parsed) ? parsed : [parsed];
-    for (const message of messages) {
+    let parsedMessages: ParsedMessage[];
+    try {
+      parsedMessages = parseFrameMessages(frame.rawText);
+    } catch (error) {
+      await this.writeMalformed(frame, frameId, frameHash, 0, 1, null, error, frame.rawText);
+      return;
+    }
+
+    const messageCount = parsedMessages.length;
+    for (const parsed of parsedMessages) {
       try {
-        if (frame.source === "POLYMARKET_CLOB") await this.processClob(frame, message);
-        else if (frame.source === "POLYMARKET_REFERENCE_PRICE") {
-          await this.processReference(frame, message);
+        if (parsed.message === null) {
+          throw new Error("Message could not be parsed");
+        }
+        if (frame.source === "POLYMARKET_CLOB") {
+          await this.processClob(frame, frameId, frameHash, parsed, messageCount);
+        } else if (frame.source === "POLYMARKET_REFERENCE_PRICE") {
+          await this.processReference(frame, frameId, frameHash, parsed, messageCount);
         }
       } catch (error) {
-        await this.writeMalformed(frame, error);
+        const identity = extractMalformedIdentity(parsed.message);
+        await this.writeMalformed(
+          frame,
+          frameId,
+          frameHash,
+          parsed.messageIndex,
+          messageCount,
+          identity,
+          error,
+          parsed.rawMessageText,
+        );
       }
     }
   }
 
-  private async processClob(frame: FeedFrame, message: unknown): Promise<void> {
-    const event = asRecord(message);
+  private buildDedupeKey(
+    frame: FeedFrame,
+    frameHash: string,
+    parsed: ParsedMessage,
+    sourceTimestamp: number | null,
+  ): MessageDedupeKey {
+    return {
+      connectionGeneration: frame.connectionGeneration,
+      frameHash,
+      messageIndex: parsed.messageIndex,
+      messageHash: messageHash(parsed.rawMessageText),
+      sourceTimestamp,
+    };
+  }
+
+  private async processClob(
+    frame: FeedFrame,
+    frameId: string,
+    frameHash: string,
+    parsed: ParsedMessage,
+    messageCount: number,
+  ): Promise<void> {
+    const event = asRecord(parsed.message);
     if (event === null || typeof event.event_type !== "string") {
       throw new Error("CLOB frame is missing event_type");
     }
     assertExactWireDecimals(event);
     const eventType = event.event_type;
-    if (this.deduplicator.seen(clobDedupeKey(event, eventType))) {
-      this.health.duplicateEvent();
+    const sourceMarketId = event.market;
+    if (typeof sourceMarketId !== "string") {
+      throw new Error("CLOB event is missing required market field");
+    }
+    if (sourceMarketId !== this.market.conditionId) {
+      const envelope = this.sequencer.next({
+        source: frame.source,
+        eventType: "IGNORED_FOREIGN_MARKET",
+        marketId: this.market.marketId,
+        conditionId: this.market.conditionId,
+        sourceMarketId,
+        tokenId: null,
+        observedTokenIds: clobTokenIds(event).length > 0 ? clobTokenIds(event) : null,
+        sourceTimestamp: timestampFrom(event.timestamp),
+        receivedAt: frame.receivedAt,
+        processedAt: this.now(),
+        connectionGeneration: frame.connectionGeneration,
+        frameId,
+        messageIndex: parsed.messageIndex,
+        messageCount,
+        dedupeState: "RECEIVED_NOT_APPLIED",
+        payload: event,
+        rawText: frame.rawText,
+        rawMessageText: parsed.rawMessageText,
+      });
+      await this.store.append(envelope);
+      this.health.observe(envelope);
       return;
     }
+    const sourceTimestamp = timestampFrom(event.timestamp);
+    const dedupeKey = this.buildDedupeKey(frame, frameHash, parsed, sourceTimestamp);
+    const dedupeResult = this.deduplicator.classify(dedupeKey);
+    const isDuplicate = dedupeResult.isDuplicate;
     const processedAt = this.now();
-    const observedTokens = this.books.apply(event, processedAt);
+    let observedTokens: string[] = [];
+    let dedupeState: DedupeState;
+    let generationAccepted = true;
+
+    if (isDuplicate) {
+      dedupeState = "DUPLICATE_APPLIED";
+    } else {
+      generationAccepted = this.checkGeneration?.(frame) ?? true;
+      if (!generationAccepted) {
+        dedupeState = "RECEIVED_NOT_APPLIED";
+      } else {
+        observedTokens = this.books.apply(event, processedAt, frame.connectionGeneration);
+        this.deduplicator.registerApplied(dedupeKey, this.sequencer.count + 1);
+        dedupeState = "UNIQUE_APPLIED";
+      }
+    }
+
     const frameTokens = clobTokenIds(event);
     const tokens = [...new Set([...observedTokens, ...frameTokens])];
     const envelope = this.sequencer.next({
       source: frame.source,
       eventType,
-      marketId: typeof event.market === "string" ? event.market : this.market.marketId,
+      marketId: this.market.marketId,
+      conditionId: this.market.conditionId,
+      sourceMarketId,
       tokenId: tokens.length === 1 ? (tokens[0] ?? null) : null,
-      sourceTimestamp: timestampFrom(event.timestamp),
+      observedTokenIds: tokens.length > 1 ? tokens : null,
+      sourceTimestamp,
       receivedAt: frame.receivedAt,
       processedAt,
       connectionGeneration: frame.connectionGeneration,
+      frameId,
+      messageIndex: parsed.messageIndex,
+      messageCount,
+      isDuplicate,
+      dedupeState,
+      duplicateOfSequence: dedupeResult.duplicateOfSequence,
+      dedupeReason: isDuplicate
+        ? "matching connection generation, frame hash, message index, message hash, and source timestamp"
+        : generationAccepted
+          ? null
+          : "frame from inactive connection generation",
       payload: event,
       rawText: frame.rawText,
+      rawMessageText: parsed.rawMessageText,
     });
     await this.store.append(envelope);
     this.health.observe(envelope, tokens);
+    if (isDuplicate) {
+      this.health.duplicateEvent();
+    } else if (dedupeState === "UNIQUE_APPLIED") {
+      const committed = this.commitValidData?.(frame) ?? true;
+      if (
+        committed &&
+        eventType === "book" &&
+        this.clobResyncPending &&
+        this.clobResyncPendingGeneration !== null &&
+        frame.connectionGeneration > this.clobResyncPendingGeneration
+      ) {
+        this.clobResyncPending = false;
+        this.clobResyncPendingGeneration = null;
+      }
+    }
   }
 
-  private async processReference(frame: FeedFrame, message: unknown): Promise<void> {
-    const parsedEvent = asRecord(message);
+  private async processReference(
+    frame: FeedFrame,
+    frameId: string,
+    frameHash: string,
+    parsed: ParsedMessage,
+    messageCount: number,
+  ): Promise<void> {
+    const parsedEvent = asRecord(parsed.message);
     if (
       parsedEvent === null ||
       typeof parsedEvent.topic !== "string" ||
@@ -214,47 +502,137 @@ export class RecorderEventProcessor {
     }
     const referenceEventType = parsedEvent.type;
     const parsedPayload = asRecord(parsedEvent.payload);
-    const exactValue = extractJsonDecimalLexeme(frame.rawText, "value");
+    const exactValue = extractJsonDecimalLexeme(parsed.rawMessageText, "value");
     const event =
       parsedPayload === null || exactValue === null
         ? parsedEvent
         : { ...parsedEvent, payload: { ...parsedPayload, value: exactValue } };
-    if (this.deduplicator.seen(referenceDedupeKey(event))) {
-      this.health.duplicateEvent();
-      return;
-    }
+    const topLevelTimestamp = timestampFrom(parsedEvent.timestamp);
+    const payloadTimestamp = parsedPayload !== null ? timestampFrom(parsedPayload.timestamp) : null;
+    const sourceTimestamp = payloadTimestamp ?? topLevelTimestamp;
     const payload = asRecord(event.payload);
     const isBtcPrice =
       event.topic === "crypto_prices_chainlink" &&
       payload?.symbol === "btc/usd" &&
       (typeof payload.value === "number" || typeof payload.value === "string");
-    const sourceTimestamp = timestampFrom(payload?.timestamp) ?? timestampFrom(event.timestamp);
+    const dedupeKey = this.buildDedupeKey(frame, frameHash, parsed, sourceTimestamp);
+    const dedupeResult = this.deduplicator.classify(dedupeKey);
+    const isDuplicate = dedupeResult.isDuplicate;
+    let dedupeState: DedupeState;
+    let inactiveReason: string | null = null;
+
+    if (isDuplicate) {
+      dedupeState = "DUPLICATE_APPLIED";
+    } else {
+      const generationAccepted = this.checkGeneration?.(frame) ?? true;
+      if (!generationAccepted) {
+        dedupeState = "RECEIVED_NOT_APPLIED";
+        inactiveReason = this.describeInactiveReason(frame);
+      } else {
+        this.deduplicator.registerApplied(dedupeKey, this.sequencer.count + 1);
+        dedupeState = "UNIQUE_APPLIED";
+      }
+    }
+
     const envelope = this.sequencer.next({
       source: frame.source,
-      eventType: isBtcPrice ? "REFERENCE_PRICE" : `REFERENCE_${referenceEventType.toUpperCase()}`,
+      eventType: isBtcPrice ? "REFERENCE_PRICE" : referenceEventType.toUpperCase(),
       marketId: this.market.marketId,
+      conditionId: this.market.conditionId,
+      tokenId: null,
       sourceTimestamp,
+      topLevelSourceTimestamp: topLevelTimestamp,
+      payloadSourceTimestamp: payloadTimestamp,
       receivedAt: frame.receivedAt,
       processedAt: this.now(),
       connectionGeneration: frame.connectionGeneration,
+      frameId,
+      messageIndex: parsed.messageIndex,
+      messageCount,
+      isDuplicate,
+      dedupeState,
+      duplicateOfSequence: dedupeResult.duplicateOfSequence,
+      dedupeReason: isDuplicate
+        ? "matching connection generation, frame hash, message index, message hash, and source timestamp"
+        : inactiveReason,
       payload: event,
       rawText: frame.rawText,
+      rawMessageText: parsed.rawMessageText,
     });
     await this.store.append(envelope);
     this.health.observe(envelope);
+    if (isDuplicate) {
+      this.health.duplicateEvent();
+    } else if (dedupeState === "UNIQUE_APPLIED" && isBtcPrice) {
+      const committed = this.commitValidData?.(frame) ?? true;
+      if (!committed) {
+        this.logger.warn(
+          "Reference frame failed commit-time revalidation, not refreshing stale detector",
+          {
+            generation: frame.connectionGeneration,
+          },
+        );
+      }
+    } else if (dedupeState === "RECEIVED_NOT_APPLIED" && isBtcPrice) {
+      this.logger.warn("Reference frame from inactive generation, not refreshing stale detector", {
+        generation: frame.connectionGeneration,
+      });
+    }
   }
 
-  private async writeMalformed(frame: FeedFrame, error: unknown): Promise<void> {
+  private describeInactiveReason(frame: FeedFrame): string {
+    if (this.checkGeneration?.(frame) === false) {
+      return "frame from inactive connection generation or pre-gap observation";
+    }
+    return "frame from inactive connection generation";
+  }
+
+  private async writeMalformed(
+    frame: FeedFrame,
+    frameId: string,
+    _frameHash: string,
+    messageIndex: number,
+    messageCount: number,
+    identity: MalformedIdentity | null,
+    error: unknown,
+    rawMessageText: string,
+  ): Promise<void> {
     this.health.malformedEvent();
+    const parsedIdentity: JsonValue | null =
+      identity === null
+        ? null
+        : {
+            sourceMarketId: identity.sourceMarketId,
+            tokenIds: identity.tokenIds,
+            sourceTimestamp: identity.sourceTimestamp,
+            eventType: identity.eventType,
+            topic: identity.topic,
+            symbol: identity.symbol,
+          };
     const envelope = this.sequencer.next({
       source: frame.source,
       eventType: "MALFORMED_EVENT",
       marketId: this.market.marketId,
+      conditionId: this.market.conditionId,
+      sourceMarketId: identity?.sourceMarketId ?? null,
+      tokenId: identity?.tokenIds.length === 1 ? (identity.tokenIds[0] ?? null) : null,
+      observedTokenIds:
+        identity !== null && identity.tokenIds.length > 1 ? identity.tokenIds : null,
+      sourceTimestamp: identity?.sourceTimestamp ?? null,
       receivedAt: frame.receivedAt,
       processedAt: this.now(),
       connectionGeneration: frame.connectionGeneration,
-      payload: { error: errorMessage(error) },
+      frameId,
+      messageIndex,
+      messageCount,
+      dedupeState: "RECEIVED_NOT_APPLIED",
+      payload: {
+        errorCode: "MALFORMED_EVENT",
+        errorMessage: errorMessage(error),
+        parsedIdentity,
+      },
       rawText: frame.rawText,
+      rawMessageText,
     });
     await this.store.append(envelope);
     this.health.observe(envelope);
