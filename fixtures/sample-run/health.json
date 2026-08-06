@@ -2,7 +2,7 @@
   "schemaVersion": 2,
   "runId": "fixture-run-001",
   "startedAt": "2026-08-05T06:02:00.000Z",
-  "endedAt": "2026-08-05T06:02:01.000Z",
+  "endedAt": "2026-08-05T06:02:00.126Z",
   "totalEventsReceived": 4,
   "eventCountsBySource": {
     "POLYMARKET_MARKET": 1,

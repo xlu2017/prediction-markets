@@ -291,9 +291,23 @@ describe("verify-run corrupted artifact detection", () => {
     const upBook = bookHealth["111111"];
     if (upBook === undefined) throw new Error("fixture missing book 111111");
     upBook.state = "UNINITIALIZED";
+    upBook.snapshotConnectionGeneration = null;
+    upBook.lastSuccessfulUpdateTime = null;
+    upBook.bestBid = null;
+    upBook.bestAsk = null;
+    upBook.bidDepthCount = 0;
+    upBook.askDepthCount = 0;
+    upBook.healthy = false;
     const downBook = bookHealth["222222"];
     if (downBook === undefined) throw new Error("fixture missing book 222222");
     downBook.state = "UNINITIALIZED";
+    downBook.snapshotConnectionGeneration = null;
+    downBook.lastSuccessfulUpdateTime = null;
+    downBook.bestBid = null;
+    downBook.bestAsk = null;
+    downBook.bidDepthCount = 0;
+    downBook.askDepthCount = 0;
+    downBook.healthy = false;
     await writeJson(path.join(dir, "health.json"), health);
     await expect(verifyRun(dir, 1)).rejects.toThrow(/book for token.*SYNCHRONIZED/);
   });
@@ -420,14 +434,25 @@ describe("verify-run corrupted artifact detection", () => {
     const dir = await createTempRunDir();
     await copyFixture(dir);
     const lines = await readLines(path.join(dir, "events.jsonl"));
+    // Null out book sourceTimestamps so only the reference event contributes to max latency
+    for (let i = 0; i < 3; i += 1) {
+      const parsed = JSON.parse(requireLine(lines, i)) as Record<string, unknown>;
+      parsed.sourceTimestamp = null;
+      lines[i] = JSON.stringify(parsed);
+    }
     const ref = JSON.parse(requireLine(lines, 3)) as Record<string, unknown>;
     // receivedAt - sourceTimestamp = -1000ms (source timestamp is 1s ahead)
-    ref.sourceTimestamp = (ref.receivedAt as number) + 1000;
+    const newSourceTs = (ref.receivedAt as number) + 1000;
+    ref.sourceTimestamp = newSourceTs;
+    ref.topLevelSourceTimestamp = newSourceTs;
+    ref.payloadSourceTimestamp = newSourceTs;
     lines[3] = JSON.stringify(ref);
     await writeLines(path.join(dir, "events.jsonl"), lines);
     const health = await readJson(path.join(dir, "health.json"));
-    // Set the latency to -1000 (signed, finite, within referenceClockSkewMs=5000)
+    // Recomputed: maxSourceLatency = -1000, lastRefSourceTimestamp = newSourceTs
     health.maximumSourceToReceiveLatencyMs = -1000;
+    health.lastReferenceSourceTimestamp = newSourceTs;
+    health.finalReferenceSourceAgeMs = 1785909720126 - newSourceTs;
     health.referenceClockSkewMs = 5000;
     await writeJson(path.join(dir, "health.json"), health);
     const manifest = await readJson(path.join(dir, "manifest.json"));
@@ -544,5 +569,139 @@ describe("verify-run corrupted artifact detection", () => {
     lines[1] = JSON.stringify(book);
     await writeLines(path.join(dir, "events.jsonl"), lines);
     await expect(verifyRun(dir, 1)).rejects.toThrow(/processedAt.*before receivedAt/);
+  });
+
+  it("fails when up and down snapshots have different generations but health matches both", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book2 = JSON.parse(requireLine(lines, 2)) as Record<string, unknown>;
+    book2.connectionGeneration = 2;
+    lines[2] = JSON.stringify(book2);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    const health = await readJson(path.join(dir, "health.json"));
+    const bookHealth = health.finalBookHealth as Record<string, Record<string, unknown>>;
+    const downHealth = bookHealth["222222"];
+    if (downHealth === undefined) throw new Error("fixture missing book 222222");
+    downHealth.snapshotConnectionGeneration = 2;
+    await writeJson(path.join(dir, "health.json"), health);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /does not equal latest accepted CLOB generation/,
+    );
+  });
+
+  it("fails when a synchronized book has null snapshotConnectionGeneration", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const health = await readJson(path.join(dir, "health.json"));
+    const bookHealth = health.finalBookHealth as Record<string, Record<string, unknown>>;
+    const upHealth = bookHealth["111111"];
+    if (upHealth === undefined) throw new Error("fixture missing book 111111");
+    upHealth.snapshotConnectionGeneration = null;
+    await writeJson(path.join(dir, "health.json"), health);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /snapshotConnectionGeneration must be > 0 for SYNCHRONIZED/,
+    );
+  });
+
+  it("fails when book envelope has tokenId=null with observedTokenIds=[expected]", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    book1.tokenId = null;
+    book1.observedTokenIds = ["111111"];
+    lines[1] = JSON.stringify(book1);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/tokenId null is not an expected token/);
+  });
+
+  it("fails when book envelope has observedTokenIds non-null", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    book1.observedTokenIds = ["111111"];
+    lines[1] = JSON.stringify(book1);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /observedTokenIds must be null for a full snapshot/,
+    );
+  });
+
+  it("fails when book payload.asset_id does not match tokenId", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const payload = book1.payload as Record<string, unknown>;
+    payload.asset_id = "222222";
+    lines[1] = JSON.stringify(book1);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/payload\.asset_id.*does not match tokenId/);
+  });
+
+  it("fails when book payload.market does not match conditionId", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const payload = book1.payload as Record<string, unknown>;
+    payload.market = "0xwrong";
+    lines[1] = JSON.stringify(book1);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/payload\.market.*does not match conditionId/);
+  });
+
+  it("fails when final bestBid is changed in health", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const health = await readJson(path.join(dir, "health.json"));
+    const bookHealth = health.finalBookHealth as Record<string, Record<string, unknown>>;
+    const upHealth = bookHealth["111111"];
+    if (upHealth === undefined) throw new Error("fixture missing book 111111");
+    upHealth.bestBid = ".99";
+    await writeJson(path.join(dir, "health.json"), health);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/replayed bestBid.*does not match health/);
+  });
+
+  it("fails when depth count is changed in health", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const health = await readJson(path.join(dir, "health.json"));
+    const bookHealth = health.finalBookHealth as Record<string, Record<string, unknown>>;
+    const upHealth = bookHealth["111111"];
+    if (upHealth === undefined) throw new Error("fixture missing book 111111");
+    upHealth.bidDepthCount = 99;
+    await writeJson(path.join(dir, "health.json"), health);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /replayed bidDepthCount.*does not match health/,
+    );
+  });
+
+  it("fails when integrity is changed in health", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const health = await readJson(path.join(dir, "health.json"));
+    const bookHealth = health.finalBookHealth as Record<string, Record<string, unknown>>;
+    const upHealth = bookHealth["111111"];
+    if (upHealth === undefined) throw new Error("fixture missing book 111111");
+    upHealth.integrity = "CROSSED";
+    await writeJson(path.join(dir, "health.json"), health);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/replayed integrity.*does not match health/);
+  });
+
+  it("fails when crossedIncidentCount is changed in health", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const health = await readJson(path.join(dir, "health.json"));
+    const bookHealth = health.finalBookHealth as Record<string, Record<string, unknown>>;
+    const upHealth = bookHealth["111111"];
+    if (upHealth === undefined) throw new Error("fixture missing book 111111");
+    upHealth.crossedIncidentCount = 99;
+    await writeJson(path.join(dir, "health.json"), health);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /replayed crossedIncidentCount.*does not match health/,
+    );
   });
 });

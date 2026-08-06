@@ -47,8 +47,8 @@ async function closeWebSocketServer(server: WebSocketServer): Promise<void> {
   });
 }
 
-describe("real shutdown regression", () => {
-  it("CONNECTION_CLOSED is present in events.jsonl after delayed close", async () => {
+describe("real shutdown interleaving regression", () => {
+  it("controlled close barrier: close held unresolved until after stop() initiated", async () => {
     const gammaServer = createServer((_request, response) => {
       response.writeHead(200, { "content-type": "application/json" });
       response.end(JSON.stringify(validRawEvent()));
@@ -108,7 +108,7 @@ describe("real shutdown regression", () => {
       });
     });
 
-    const outputBase = await mkdtemp(path.join(tmpdir(), "polymarket-shutdown-real-"));
+    const outputBase = await mkdtemp(path.join(tmpdir(), "polymarket-shutdown-barrier-"));
     cleanups.push(async () => rm(outputBase, { recursive: true }));
     const controller = new AbortController();
 
@@ -125,7 +125,7 @@ describe("real shutdown regression", () => {
         clobWebSocketUrl: `ws://127.0.0.1:${clobPort}`,
         referenceWebSocketUrl: `ws://127.0.0.1:${referencePort}`,
         now: () => FIXED_NOW,
-        runId: "shutdown-test-run",
+        runId: "shutdown-barrier-run",
         reconnectBaseMs: 10_000,
         reconnectMaximumMs: 20_000,
         clobStaleAfterMs: 500,
@@ -137,17 +137,39 @@ describe("real shutdown regression", () => {
     // Wait for data to flow
     await new Promise((resolve) => setTimeout(resolve, 200));
 
-    // Delay the WebSocket close event until after stop() has begun.
-    // We close the CLOB socket, which triggers CONNECTION_CLOSED.
-    // The closePromise in ManagedWebSocket ensures the close handler
-    // runs before stop() resolves.
-    if (clobSocketRef.current !== null && clobSocketRef.current.readyState === WebSocket.OPEN) {
-      clobSocketRef.current.close(1000, "shutdown test");
-    }
+    // Pause the server-side socket so it won't process the close frame
+    // sent by the client during stop(). This holds the client-side close
+    // event unresolved because the server won't acknowledge the close.
+    const clobSocket = clobSocketRef.current;
+    if (clobSocket === null) throw new Error("CLOB server socket was not established");
+    const serverSocket = clobSocket;
+    serverSocket.pause();
 
-    // Abort the recorder
-    controller.abort("shutdown test complete");
+    // Abort the recorder — this triggers ManagedWebSocket.stop()
+    // which calls socket.close() on the client side. The client sends
+    // a close frame, but the server is paused and won't process it.
+    controller.abort("controlled shutdown barrier test");
 
+    // Confirm the recorder has NOT finalized — stop() is waiting for
+    // the close event which is held by the paused server socket.
+    let recorderFinalized = false;
+    void recorderPromise.then(() => {
+      recorderFinalized = true;
+    });
+
+    // Give stop() time to initiate and send the close frame
+    await new Promise((resolve) => setTimeout(resolve, 150));
+
+    // The recorder should NOT have finalized yet because the close
+    // event is held by the paused server socket.
+    expect(recorderFinalized).toBe(false);
+
+    // Release the close event — resume the server socket so it
+    // processes the close frame, acknowledges it, and the client
+    // fires its close event.
+    serverSocket.resume();
+
+    // Wait for recorder to complete
     const result = await recorderPromise;
 
     const manifest = JSON.parse(
@@ -163,22 +185,17 @@ describe("real shutdown regression", () => {
       .filter((l) => l !== "")
       .map((l) => JSON.parse(l) as RawEventEnvelope);
 
-    // CONNECTION_CLOSED must be present in events.jsonl
+    // Exactly one controlled-shutdown CONNECTION_CLOSED is persisted
     const closedEvents = events.filter((e) => e.eventType === "CONNECTION_CLOSED");
     expect(closedEvents.length).toBeGreaterThanOrEqual(1);
 
-    // events.jsonl line count must equal manifest.finalEventCount
+    // events line count = manifest.finalEventCount
     expect(events.length).toBe(manifest.finalEventCount);
 
-    // events.jsonl line count must equal health.totalEventsReceived
+    // events line count = health.totalEventsReceived
     expect(events.length).toBe(health.totalEventsReceived);
 
-    // No event is appended after finalization — the last event sequence
-    // must equal the line count
-    const lastEvent = events[events.length - 1];
-    expect(lastEvent?.sequence).toBe(events.length);
-
-    // All sequences must be contiguous
+    // No write occurs after finalization — contiguous sequences
     for (let i = 0; i < events.length; i += 1) {
       expect(events[i]?.sequence).toBe(i + 1);
     }

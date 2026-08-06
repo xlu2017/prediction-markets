@@ -239,6 +239,45 @@ export function runtimeValidateBookHealth(raw: unknown, tokenId: string): BookHe
     `book.${tokenId}.lastSuccessfulUpdateTime`,
   );
   assertBoolean(record.healthy, `book.${tokenId}.healthy`);
+  const state = record.state as BookHealth["state"];
+  const snapshotGen = record.snapshotConnectionGeneration as number | null;
+  const lastUpdate = record.lastSuccessfulUpdateTime as number | null;
+  const bestBid = record.bestBid as string | null;
+  const bestAsk = record.bestAsk as string | null;
+  const bidDepth = record.bidDepthCount as number;
+  const askDepth = record.askDepthCount as number;
+  if (state === "SYNCHRONIZED") {
+    if (snapshotGen === null || snapshotGen <= 0) {
+      throw new Error(
+        `book.${tokenId}.snapshotConnectionGeneration must be > 0 for SYNCHRONIZED, got ${String(snapshotGen)}`,
+      );
+    }
+    if (lastUpdate === null) {
+      throw new Error(`book.${tokenId}.lastSuccessfulUpdateTime must be non-null for SYNCHRONIZED`);
+    }
+  }
+  if (state === "UNINITIALIZED") {
+    if (snapshotGen !== null) {
+      throw new Error(
+        `book.${tokenId}.snapshotConnectionGeneration must be null for UNINITIALIZED, got ${snapshotGen}`,
+      );
+    }
+    if (lastUpdate !== null) {
+      throw new Error(
+        `book.${tokenId}.lastSuccessfulUpdateTime must be null for UNINITIALIZED, got ${lastUpdate}`,
+      );
+    }
+    if (bestBid !== null || bestAsk !== null) {
+      throw new Error(
+        `book.${tokenId}.bestBid/bestAsk must be null for UNINITIALIZED, got bid=${String(bestBid)} ask=${String(bestAsk)}`,
+      );
+    }
+    if (bidDepth !== 0 || askDepth !== 0) {
+      throw new Error(
+        `book.${tokenId}.bidDepthCount/askDepthCount must be 0 for UNINITIALIZED, got bid=${bidDepth} ask=${askDepth}`,
+      );
+    }
+  }
   return raw as BookHealth;
 }
 
@@ -989,33 +1028,108 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
         errors.push(`recomputed reference timestamp anomaly count ${recomputedAnomalyCount} > 0`);
       }
       const tokenIds = [manifest.market.upTokenId, manifest.market.downTokenId];
+      const expectedTokenSet = new Set(tokenIds);
       const replayBooks = new OrderBookTracker(tokenIds);
       const appliedBookGenerations = new Map<string, number>();
       let latestAcceptedClobGeneration: number | null = null;
+      let recomputedMaxSourceLatency: number | null = null;
+      let recomputedMaxProcessingLatency: number | null = null;
+      let recomputedLastRefReceivedAt: number | null = null;
+      let recomputedLastRefSourceTimestamp: number | null = null;
+      let recomputedLastRefConnectionGeneration: number | null = null;
       for (const event of events) {
+        if (event.sourceTimestamp !== null) {
+          const latency = event.receivedAt - event.sourceTimestamp;
+          if (recomputedMaxSourceLatency === null || latency > recomputedMaxSourceLatency) {
+            recomputedMaxSourceLatency = latency;
+          }
+        }
+        const processingLatency = event.processedAt - event.receivedAt;
+        if (
+          recomputedMaxProcessingLatency === null ||
+          processingLatency > recomputedMaxProcessingLatency
+        ) {
+          recomputedMaxProcessingLatency = processingLatency;
+        }
         if (
           event.source === "POLYMARKET_CLOB" &&
-          event.eventType === "book" &&
           !event.isDuplicate &&
           event.dedupeState === "UNIQUE_APPLIED"
         ) {
-          const tokenId = event.tokenId;
-          if (tokenId !== null) {
+          if (event.connectionGeneration !== null) {
+            if (
+              latestAcceptedClobGeneration === null ||
+              event.connectionGeneration > latestAcceptedClobGeneration
+            ) {
+              latestAcceptedClobGeneration = event.connectionGeneration;
+            }
+          }
+          if (event.eventType === "book") {
+            if (event.tokenId === null || !expectedTokenSet.has(event.tokenId)) {
+              errors.push(
+                `book event sequence ${event.sequence}: tokenId ${String(event.tokenId)} is not an expected token`,
+              );
+              continue;
+            }
+            if (event.observedTokenIds !== null) {
+              errors.push(
+                `book event sequence ${event.sequence}: observedTokenIds must be null for a full snapshot, got ${JSON.stringify(event.observedTokenIds)}`,
+              );
+              continue;
+            }
+            const payload = event.payload as Record<string, unknown>;
+            const assetId = payload.asset_id;
+            const market = payload.market;
+            if (assetId !== event.tokenId) {
+              errors.push(
+                `book event sequence ${event.sequence}: payload.asset_id ${String(assetId)} does not match tokenId ${event.tokenId}`,
+              );
+              continue;
+            }
+            if (market !== manifest.market.conditionId) {
+              errors.push(
+                `book event sequence ${event.sequence}: payload.market ${String(market)} does not match conditionId ${manifest.market.conditionId}`,
+              );
+              continue;
+            }
             try {
               replayBooks.apply(event.payload, event.processedAt, event.connectionGeneration ?? 0);
-              appliedBookGenerations.set(tokenId, event.connectionGeneration ?? 0);
+              appliedBookGenerations.set(event.tokenId, event.connectionGeneration ?? 0);
             } catch (replayError) {
               errors.push(
                 `replay failed for book event sequence ${event.sequence}: ${replayError instanceof Error ? replayError.message : String(replayError)}`,
               );
             }
           }
-          if (
-            event.connectionGeneration !== null &&
-            (latestAcceptedClobGeneration === null ||
-              event.connectionGeneration > latestAcceptedClobGeneration)
-          ) {
-            latestAcceptedClobGeneration = event.connectionGeneration;
+          if (event.eventType === "price_change") {
+            try {
+              replayBooks.apply(event.payload, event.processedAt, event.connectionGeneration ?? 0);
+            } catch (replayError) {
+              errors.push(
+                `replay failed for price_change event sequence ${event.sequence}: ${replayError instanceof Error ? replayError.message : String(replayError)}`,
+              );
+            }
+          }
+        }
+        if (
+          event.source === "POLYMARKET_CLOB" &&
+          (event.eventType === "DATA_GAP_STARTED" || event.eventType === "STALE_STREAM") &&
+          (event.payload as Record<string, unknown>).feed === "clob-market"
+        ) {
+          replayBooks.requireResync();
+        }
+        if (
+          event.source === "POLYMARKET_REFERENCE_PRICE" &&
+          event.eventType === "REFERENCE_PRICE" &&
+          !event.isDuplicate &&
+          event.dedupeState === "UNIQUE_APPLIED"
+        ) {
+          recomputedLastRefReceivedAt = event.receivedAt;
+          if (event.sourceTimestamp !== null) {
+            recomputedLastRefSourceTimestamp = event.sourceTimestamp;
+          }
+          if (event.connectionGeneration !== null) {
+            recomputedLastRefConnectionGeneration = event.connectionGeneration;
           }
         }
       }
@@ -1026,14 +1140,11 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
             event.source === "POLYMARKET_CLOB" &&
             event.eventType === "book" &&
             !event.isDuplicate &&
-            event.dedupeState === "UNIQUE_APPLIED"
+            event.dedupeState === "UNIQUE_APPLIED" &&
+            event.tokenId === expected
           ) {
-            const tokens =
-              event.observedTokenIds ?? (event.tokenId !== null ? [event.tokenId] : []);
-            if (tokens.includes(expected)) {
-              found = true;
-              break;
-            }
+            found = true;
+            break;
           }
         }
         if (!found) {
@@ -1042,25 +1153,123 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
           );
         }
       }
-      for (const expected of tokenIds) {
-        const healthBook = health.finalBookHealth[expected];
-        if (healthBook === undefined) continue;
-        const replayGen = appliedBookGenerations.get(expected);
-        if (replayGen !== undefined && healthBook.snapshotConnectionGeneration !== null) {
-          if (replayGen !== healthBook.snapshotConnectionGeneration) {
+      if (manifest.captureStatus === "COMPLETE") {
+        for (const expected of tokenIds) {
+          const healthBook = health.finalBookHealth[expected];
+          if (healthBook === undefined) continue;
+          const replayGen = appliedBookGenerations.get(expected);
+          if (replayGen !== undefined && healthBook.snapshotConnectionGeneration !== null) {
+            if (replayGen !== healthBook.snapshotConnectionGeneration) {
+              errors.push(
+                `token ${expected}: latest applied snapshot generation ${replayGen} does not match health.snapshotConnectionGeneration ${healthBook.snapshotConnectionGeneration}`,
+              );
+            }
+          }
+          if (
+            replayGen !== undefined &&
+            latestAcceptedClobGeneration !== null &&
+            replayGen !== latestAcceptedClobGeneration
+          ) {
             errors.push(
-              `token ${expected}: latest applied snapshot generation ${replayGen} does not match health.snapshotConnectionGeneration ${healthBook.snapshotConnectionGeneration}`,
+              `token ${expected}: latest applied snapshot generation ${replayGen} does not equal latest accepted CLOB generation ${latestAcceptedClobGeneration}`,
             );
           }
         }
-        if (
-          replayGen !== undefined &&
-          latestAcceptedClobGeneration !== null &&
-          replayGen > latestAcceptedClobGeneration
-        ) {
-          errors.push(
-            `token ${expected}: latest applied snapshot generation ${replayGen} exceeds latest accepted CLOB generation ${latestAcceptedClobGeneration}`,
-          );
+      }
+      const replaySnapshot = replayBooks.snapshot(
+        health.endedAt !== null ? Date.parse(health.endedAt) : 0,
+        health.clobStaleAfterMs,
+      );
+      for (const expected of tokenIds) {
+        const healthBook = health.finalBookHealth[expected];
+        if (healthBook === undefined) continue;
+        const replayBook = replaySnapshot[expected];
+        if (replayBook === undefined) {
+          errors.push(`token ${expected}: no replayed book state to compare with health`);
+          continue;
+        }
+        const fields: [string, unknown, unknown][] = [
+          ["tokenId", replayBook.tokenId, healthBook.tokenId],
+          ["state", replayBook.state, healthBook.state],
+          ["integrity", replayBook.integrity, healthBook.integrity],
+          [
+            "crossedIncidentCount",
+            replayBook.crossedIncidentCount,
+            healthBook.crossedIncidentCount,
+          ],
+          [
+            "synchronizationEpoch",
+            replayBook.synchronizationEpoch,
+            healthBook.synchronizationEpoch,
+          ],
+          [
+            "snapshotConnectionGeneration",
+            replayBook.snapshotConnectionGeneration,
+            healthBook.snapshotConnectionGeneration,
+          ],
+          ["bestBid", replayBook.bestBid, healthBook.bestBid],
+          ["bestAsk", replayBook.bestAsk, healthBook.bestAsk],
+          ["bidDepthCount", replayBook.bidDepthCount, healthBook.bidDepthCount],
+          ["askDepthCount", replayBook.askDepthCount, healthBook.askDepthCount],
+          [
+            "lastSuccessfulUpdateTime",
+            replayBook.lastSuccessfulUpdateTime,
+            healthBook.lastSuccessfulUpdateTime,
+          ],
+          ["healthy", replayBook.healthy, healthBook.healthy],
+        ];
+        for (const [field, replayVal, healthVal] of fields) {
+          if (replayVal !== healthVal) {
+            errors.push(
+              `token ${expected}: replayed ${field} ${JSON.stringify(replayVal)} does not match health ${JSON.stringify(healthVal)}`,
+            );
+          }
+        }
+      }
+      if (recomputedMaxSourceLatency !== health.maximumSourceToReceiveLatencyMs) {
+        errors.push(
+          `recomputed maximumSourceToReceiveLatencyMs ${recomputedMaxSourceLatency} does not match health ${health.maximumSourceToReceiveLatencyMs}`,
+        );
+      }
+      if (recomputedMaxProcessingLatency !== health.maximumReceiveToProcessLatencyMs) {
+        errors.push(
+          `recomputed maximumReceiveToProcessLatencyMs ${recomputedMaxProcessingLatency} does not match health ${health.maximumReceiveToProcessLatencyMs}`,
+        );
+      }
+      if (recomputedLastRefReceivedAt !== health.lastReferenceReceivedAt) {
+        errors.push(
+          `recomputed lastReferenceReceivedAt ${recomputedLastRefReceivedAt} does not match health ${health.lastReferenceReceivedAt}`,
+        );
+      }
+      if (recomputedLastRefSourceTimestamp !== health.lastReferenceSourceTimestamp) {
+        errors.push(
+          `recomputed lastReferenceSourceTimestamp ${recomputedLastRefSourceTimestamp} does not match health ${health.lastReferenceSourceTimestamp}`,
+        );
+      }
+      if (recomputedLastRefConnectionGeneration !== health.lastReferenceConnectionGeneration) {
+        errors.push(
+          `recomputed lastReferenceConnectionGeneration ${recomputedLastRefConnectionGeneration} does not match health ${health.lastReferenceConnectionGeneration}`,
+        );
+      }
+      if (health.endedAt !== null) {
+        const endedAtMs = Date.parse(health.endedAt);
+        if (!Number.isNaN(endedAtMs)) {
+          const recomputedRefAge =
+            recomputedLastRefReceivedAt !== null ? endedAtMs - recomputedLastRefReceivedAt : null;
+          if (recomputedRefAge !== health.finalReferenceAgeMs) {
+            errors.push(
+              `recomputed finalReferenceAgeMs ${recomputedRefAge} does not match health ${health.finalReferenceAgeMs}`,
+            );
+          }
+          const recomputedRefSourceAge =
+            recomputedLastRefSourceTimestamp !== null
+              ? endedAtMs - recomputedLastRefSourceTimestamp
+              : null;
+          if (recomputedRefSourceAge !== health.finalReferenceSourceAgeMs) {
+            errors.push(
+              `recomputed finalReferenceSourceAgeMs ${recomputedRefSourceAge} does not match health ${health.finalReferenceSourceAgeMs}`,
+            );
+          }
         }
       }
     }
