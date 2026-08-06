@@ -176,7 +176,7 @@ export class RecorderEventProcessor {
     private readonly health: HealthTracker,
     private readonly logger: Logger,
     private readonly now: () => number = Date.now,
-    private readonly onValidData?: (frame: FeedFrame) => void,
+    private readonly onValidData?: (frame: FeedFrame) => boolean,
     private readonly onFatalError?: () => void,
     private readonly onClobGap?: () => void,
   ) {
@@ -421,13 +421,19 @@ export class RecorderEventProcessor {
     const processedAt = this.now();
     let observedTokens: string[] = [];
     let dedupeState: DedupeState;
+    let accepted = true;
 
     if (isDuplicate) {
       dedupeState = "DUPLICATE_APPLIED";
     } else {
-      observedTokens = this.books.apply(event, processedAt, frame.connectionGeneration);
-      this.deduplicator.registerApplied(dedupeKey, this.sequencer.count + 1);
-      dedupeState = "UNIQUE_APPLIED";
+      accepted = this.onValidData?.(frame) ?? true;
+      if (!accepted) {
+        dedupeState = "RECEIVED_NOT_APPLIED";
+      } else {
+        observedTokens = this.books.apply(event, processedAt, frame.connectionGeneration);
+        this.deduplicator.registerApplied(dedupeKey, this.sequencer.count + 1);
+        dedupeState = "UNIQUE_APPLIED";
+      }
     }
 
     const frameTokens = clobTokenIds(event);
@@ -452,7 +458,9 @@ export class RecorderEventProcessor {
       duplicateOfSequence: dedupeResult.duplicateOfSequence,
       dedupeReason: isDuplicate
         ? "matching connection generation, frame hash, message index, message hash, and source timestamp"
-        : null,
+        : accepted
+          ? null
+          : "frame from inactive connection generation",
       payload: event,
       rawText: frame.rawText,
       rawMessageText: parsed.rawMessageText,
@@ -460,9 +468,9 @@ export class RecorderEventProcessor {
     await this.store.append(envelope);
     this.health.observe(envelope, tokens);
     if (isDuplicate) this.health.duplicateEvent();
-    else {
+    else if (dedupeState === "UNIQUE_APPLIED") {
       if (
-        (eventType === "book" || eventType === "price_change") &&
+        eventType === "book" &&
         this.clobResyncPending &&
         this.clobResyncPendingGeneration !== null &&
         frame.connectionGeneration > this.clobResyncPendingGeneration
@@ -470,7 +478,6 @@ export class RecorderEventProcessor {
         this.clobResyncPending = false;
         this.clobResyncPendingGeneration = null;
       }
-      this.onValidData?.(frame);
     }
   }
 
@@ -544,7 +551,17 @@ export class RecorderEventProcessor {
     await this.store.append(envelope);
     this.health.observe(envelope);
     if (isDuplicate) this.health.duplicateEvent();
-    else if (isBtcPrice) this.onValidData?.(frame);
+    else if (isBtcPrice) {
+      const refAccepted = this.onValidData?.(frame) ?? true;
+      if (!refAccepted) {
+        this.logger.warn(
+          "Reference frame from inactive generation, not refreshing stale detector",
+          {
+            generation: frame.connectionGeneration,
+          },
+        );
+      }
+    }
   }
 
   private async writeMalformed(

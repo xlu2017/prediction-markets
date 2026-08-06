@@ -104,6 +104,9 @@ export class ManagedWebSocket {
 
   public notifyValidDataMessage(receivedAt: number, connectionGeneration: number): boolean {
     if (connectionGeneration !== this.generation) return false;
+    if (this.gapStartedAt !== null && !this.gapEnded && receivedAt < this.gapStartedAt) {
+      return false;
+    }
     this.staleDetector.observe(receivedAt);
     if (this.gapStartedAt !== null && !this.gapEnded) {
       this.emitLifecycle("DATA_GAP_ENDED", connectionGeneration, {

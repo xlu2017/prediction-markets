@@ -84,6 +84,7 @@ export class HealthTracker {
       envelope.source === "POLYMARKET_CLOB" &&
       envelope.eventType === "book" &&
       !envelope.isDuplicate &&
+      envelope.dedupeState === "UNIQUE_APPLIED" &&
       envelope.tokenId !== null
     ) {
       this.tokenSnapshotsObserved.add(envelope.tokenId);
@@ -216,10 +217,22 @@ export class HealthTracker {
         });
       }
     }
-    if (this.referenceTimestampAnomalyCount > 0) {
+    if (this.referenceTimestampMissingCount > 0) {
       failures.push({
         code: "REFERENCE_TIMESTAMP_MISSING",
-        message: `${this.referenceTimestampAnomalyCount} reference timestamp anomaly(ies) occurred during the run`,
+        message: `${this.referenceTimestampMissingCount} reference observation(s) had missing source timestamp`,
+      });
+    }
+    if (this.referenceStaleAtReceiptCount > 0) {
+      failures.push({
+        code: "REFERENCE_STREAM_STALE",
+        message: `${this.referenceStaleAtReceiptCount} reference observation(s) were stale at receipt time (source age exceeded ${this.referenceStaleAfterMs}ms)`,
+      });
+    }
+    if (this.referenceFutureSourceSkewCount > 0) {
+      failures.push({
+        code: "REFERENCE_CLOCK_SKEW",
+        message: `${this.referenceFutureSourceSkewCount} reference observation(s) had source timestamps beyond clock skew tolerance of ${this.referenceClockSkewMs}ms in the future`,
       });
     }
     return { fresh: failures.length === 0, failures };

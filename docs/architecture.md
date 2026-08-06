@@ -166,9 +166,16 @@ incident, closes the socket, and schedules a reconnect. Open gaps are tracked in
 `openGapsByFeed`. A stale CLOB socket that closes and emits `DATA_GAP_STARTED` does not increment
 the synchronization epoch twice: the processor uses a `clobResyncPending` flag bound to the outage
 generation so that both the `STALE_STREAM` and the subsequent `DATA_GAP_STARTED` from the same
-outage count as one resync. The flag is cleared only when a valid CLOB book event (`book` or
-`price_change`) from a strictly newer connection generation is applied, not by non-book CLOB events
-or by late books from the stale generation.
+outage count as one resync. The flag is cleared only when a `book` event from a strictly newer
+connection generation is accepted by the active-generation check. `price_change` events no longer
+clear the resync guard, and late books from an inactive generation are rejected before mutating the
+live order book (marked `RECEIVED_NOT_APPLIED` with a stale-generation reason).
+
+The active-generation check is performed by calling `notifyValidDataMessage` before book mutation.
+If the feed has advanced to a newer generation, or if the frame's `receivedAt` precedes the current
+gap start time (`gapStartedAt`), the call returns `false` without refreshing the stale detector or
+emitting `DATA_GAP_ENDED`. This prevents pre-gap observations from retroactively closing a gap that
+started after the frame was received.
 
 Frames that are whitespace-only or belong to a different market condition are recorded as
 `EMPTY_FRAME` and `IGNORED_FOREIGN_MARKET` events respectively, preserving their exact wire content

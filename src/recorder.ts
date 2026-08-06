@@ -185,13 +185,14 @@ export async function runRecorder(
   const fatalController = new AbortController();
   const feedsBySource = new Map<string, ManagedWebSocket>();
   let currentClobGeneration: number | null = null;
-  const onValidData = (frame: FeedFrame): void => {
+  const onValidData = (frame: FeedFrame): boolean => {
     const feed = feedsBySource.get(frame.source);
-    if (feed === undefined) return;
+    if (feed === undefined) return false;
     const accepted = feed.notifyValidDataMessage(frame.receivedAt, frame.connectionGeneration);
     if (accepted && frame.source === "POLYMARKET_CLOB") {
       currentClobGeneration = frame.connectionGeneration;
     }
+    return accepted;
   };
   const onClobGap = (): void => {
     currentClobGeneration = null;

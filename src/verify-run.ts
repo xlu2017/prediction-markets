@@ -4,30 +4,49 @@ import path from "node:path";
 
 import { Command } from "commander";
 
-import type { BookHealth, HealthSummary, RawEventEnvelope, RunManifest } from "./types.js";
+import type {
+  BookHealth,
+  HealthSummary,
+  QualityFailureCode,
+  RawEventEnvelope,
+  RunManifest,
+} from "./types.js";
 
-const program = new Command()
-  .name("market:verify-run")
-  .description("Verify that a recorded run is usable for deterministic replay")
-  .argument("<runDirectory>", "path to the run directory containing manifest.json and health.json")
-  .option("--min-reference-observations <number>", "minimum unique Chainlink observations", "5");
-
-program.parse();
-const [runDirectory] = program.args;
-const opts = program.opts();
-const rawMin = Number(opts.minReferenceObservations ?? 5);
-if (!Number.isSafeInteger(rawMin) || rawMin <= 0) {
-  console.error(
-    JSON.stringify({
-      verified: false,
-      runDirectory,
-      error: `--min-reference-observations must be a positive safe integer, got ${String(opts.minReferenceObservations)}`,
-    }),
-  );
-  process.exitCode = 1;
-  throw new Error("invalid argument");
-}
-const minReferenceObservations = rawMin;
+const EVENT_SOURCES = [
+  "POLYMARKET_CLOB",
+  "POLYMARKET_MARKET",
+  "POLYMARKET_REFERENCE_PRICE",
+] as const;
+const BOOK_STATES = [
+  "UNINITIALIZED",
+  "SYNCHRONIZED",
+  "STALE",
+  "RESYNC_REQUIRED",
+  "INVALID",
+] as const;
+const BOOK_INTEGRITIES = ["NORMAL", "LOCKED", "CROSSED"] as const;
+const DEDUPE_STATES = ["UNIQUE_APPLIED", "DUPLICATE_APPLIED", "RECEIVED_NOT_APPLIED"] as const;
+const COMPLETION_STATUSES = ["COMPLETED", "FAILED", "RUNNING"] as const;
+const CAPTURE_STATUSES = ["COMPLETE", "PARTIAL", "UNUSABLE"] as const;
+const QUALITY_FAILURE_CODES = [
+  "MISSING_UP_SNAPSHOT",
+  "MISSING_DOWN_SNAPSHOT",
+  "REFERENCE_STREAM_MISSING",
+  "REFERENCE_STREAM_STALE",
+  "REFERENCE_CLOCK_SKEW",
+  "REFERENCE_TIMESTAMP_MISSING",
+  "REFERENCE_LOCAL_CLOCK_SKEW",
+  "OPEN_DATA_GAP",
+  "CLOSED_DATA_GAP",
+  "MALFORMED_EVENTS_PRESENT",
+  "BOOK_STALE",
+  "BOOK_INVALID",
+  "BOOK_RESYNC_REQUIRED",
+  "BOOK_SNAPSHOT_STALE_GENERATION",
+  "BOOK_CROSSED",
+  "FATAL_PROCESSOR_ERROR",
+  "PROCESS_FAILURE",
+] as const;
 
 function assertString(value: unknown, label: string): string {
   if (typeof value !== "string") throw new Error(`${label} is not a string`);
@@ -76,6 +95,11 @@ function assertNonNegativeSafeInteger(value: unknown, label: string): number {
   return n;
 }
 
+function assertOptionalNonNegativeSafeInteger(value: unknown, label: string): number | null {
+  if (value === null) return null;
+  return assertNonNegativeSafeInteger(value, label);
+}
+
 function assertEnum<T extends string>(value: unknown, allowed: readonly T[], label: string): T {
   const s = assertString(value, label);
   if (!allowed.includes(s as T)) {
@@ -84,58 +108,104 @@ function assertEnum<T extends string>(value: unknown, allowed: readonly T[], lab
   return s as T;
 }
 
-const BOOK_STATES = [
-  "UNINITIALIZED",
-  "SYNCHRONIZED",
-  "STALE",
-  "RESYNC_REQUIRED",
-  "INVALID",
-] as const;
-const BOOK_INTEGRITIES = ["NORMAL", "LOCKED", "CROSSED"] as const;
+function assertStringArray(value: unknown, label: string): string[] {
+  if (!Array.isArray(value)) throw new Error(`${label} is not an array`);
+  for (let i = 0; i < value.length; i += 1) {
+    if (typeof value[i] !== "string") throw new Error(`${label}[${i}] is not a string`);
+  }
+  return value as string[];
+}
 
-function runtimeValidateManifest(raw: unknown): RunManifest {
-  const record = raw as Record<string, unknown>;
-  if (typeof record !== "object") throw new Error("manifest is not an object");
+function assertOptionalStringArray(value: unknown, label: string): string[] | null {
+  if (value === null) return null;
+  return assertStringArray(value, label);
+}
+
+function assertRecord(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error(`${label} is not an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function assertQualityFailure(value: unknown, label: string): { code: string; message: string } {
+  const record = assertRecord(value, label);
+  assertEnum(record.code, QUALITY_FAILURE_CODES, `${label}.code`);
+  assertString(record.message, `${label}.message`);
+  if (record.feed !== undefined && record.feed !== null) assertString(record.feed, `${label}.feed`);
+  if (record.tokenId !== undefined && record.tokenId !== null)
+    assertString(record.tokenId, `${label}.tokenId`);
+  return record as unknown as { code: string; message: string };
+}
+
+function assertQualityFailureArray(
+  value: unknown,
+  label: string,
+): { code: string; message: string }[] {
+  if (!Array.isArray(value)) throw new Error(`${label} is not an array`);
+  return value.map((item, i) => assertQualityFailure(item, `${label}[${i}]`));
+}
+
+function assertCountRecord(value: unknown, label: string): Record<string, number> {
+  const record = assertRecord(value, label);
+  for (const [key, val] of Object.entries(record)) {
+    assertNonNegativeSafeInteger(val, `${label}.${key}`);
+  }
+  return record as Record<string, number>;
+}
+
+export function runtimeValidateManifest(raw: unknown): RunManifest {
+  const record = assertRecord(raw, "manifest");
   if (record.schemaVersion !== 2)
     throw new Error(`manifest schemaVersion is ${String(record.schemaVersion)}, expected 2`);
   assertString(record.runId, "manifest.runId");
   assertIsoTimestamp(record.startedAt, "manifest.startedAt");
-  if (
-    record.completionStatus !== "COMPLETED" &&
-    record.completionStatus !== "FAILED" &&
-    record.completionStatus !== "RUNNING"
-  ) {
-    throw new Error(`manifest.completionStatus is invalid: ${String(record.completionStatus)}`);
-  }
-  if (
-    record.captureStatus !== "COMPLETE" &&
-    record.captureStatus !== "PARTIAL" &&
-    record.captureStatus !== "UNUSABLE"
-  ) {
-    throw new Error(`manifest.captureStatus is invalid: ${String(record.captureStatus)}`);
-  }
-  assertBoolean(record.usableForReplay, "manifest.usableForReplay");
-  if (record.finalEventCount !== null && typeof record.finalEventCount !== "number") {
-    throw new Error("manifest.finalEventCount is not a number or null");
-  }
-  const market = record.market as Record<string, unknown>;
-  if (typeof market !== "object") throw new Error("manifest.market is not an object");
-  assertString(market.upTokenId, "manifest.market.upTokenId");
-  assertString(market.downTokenId, "manifest.market.downTokenId");
+  if (record.endedAt !== null) assertIsoTimestamp(record.endedAt, "manifest.endedAt");
+  assertString(record.recorderVersion, "manifest.recorderVersion");
+  if (record.gitCommit !== null) assertString(record.gitCommit, "manifest.gitCommit");
+  const market = assertRecord(record.market, "manifest.market");
+  if (market.schemaVersion !== 2)
+    throw new Error(`manifest.market.schemaVersion is ${String(market.schemaVersion)}, expected 2`);
+  assertString(market.eventId, "manifest.market.eventId");
   assertString(market.marketId, "manifest.market.marketId");
   assertString(market.conditionId, "manifest.market.conditionId");
+  assertString(market.slug, "manifest.market.slug");
+  assertString(market.question, "manifest.market.question");
+  assertIsoTimestamp(market.opensAt, "manifest.market.opensAt");
+  assertIsoTimestamp(market.closesAt, "manifest.market.closesAt");
+  assertString(market.resolutionSource, "manifest.market.resolutionSource");
+  assertString(market.referenceSymbol, "manifest.market.referenceSymbol");
+  assertString(market.referenceTopic, "manifest.market.referenceTopic");
+  assertString(market.upTokenId, "manifest.market.upTokenId");
+  assertString(market.downTokenId, "manifest.market.downTokenId");
+  if (market.tickSize !== null) assertString(market.tickSize, "manifest.market.tickSize");
+  assertBoolean(market.active, "manifest.market.active");
+  assertBoolean(market.closed, "manifest.market.closed");
+  assertRecord(record.commandArguments, "manifest.commandArguments");
+  if (!Array.isArray(record.outputFiles)) throw new Error("manifest.outputFiles is not an array");
+  for (let i = 0; i < record.outputFiles.length; i += 1) {
+    if (typeof record.outputFiles[i] !== "string")
+      throw new Error(`manifest.outputFiles[${i}] is not a string`);
+  }
+  assertEnum(record.completionStatus, COMPLETION_STATUSES, "manifest.completionStatus");
+  assertOptionalNonNegativeSafeInteger(record.finalEventCount, "manifest.finalEventCount");
+  if (record.failureReason !== null) assertString(record.failureReason, "manifest.failureReason");
+  assertEnum(record.captureStatus, CAPTURE_STATUSES, "manifest.captureStatus");
+  assertBoolean(record.usableForReplay, "manifest.usableForReplay");
+  assertQualityFailureArray(record.qualityFailures, "manifest.qualityFailures");
+  assertPositiveNumber(record.clobStaleAfterMs, "manifest.clobStaleAfterMs");
+  assertPositiveNumber(record.referenceStaleAfterMs, "manifest.referenceStaleAfterMs");
   return raw as RunManifest;
 }
 
-function runtimeValidateBookHealth(raw: unknown, tokenId: string): BookHealth {
-  const record = raw as Record<string, unknown>;
-  if (typeof record !== "object") throw new Error(`book health for ${tokenId} is not an object`);
+export function runtimeValidateBookHealth(raw: unknown, tokenId: string): BookHealth {
+  const record = assertRecord(raw, `book health for ${tokenId}`);
   assertString(record.tokenId, `book.${tokenId}.tokenId`);
   assertEnum(record.state, BOOK_STATES, `book.${tokenId}.state`);
   assertEnum(record.integrity, BOOK_INTEGRITIES, `book.${tokenId}.integrity`);
   assertNonNegativeSafeInteger(record.crossedIncidentCount, `book.${tokenId}.crossedIncidentCount`);
   assertNonNegativeSafeInteger(record.synchronizationEpoch, `book.${tokenId}.synchronizationEpoch`);
-  assertOptionalNumber(
+  assertOptionalNonNegativeSafeInteger(
     record.snapshotConnectionGeneration,
     `book.${tokenId}.snapshotConnectionGeneration`,
   );
@@ -143,30 +213,72 @@ function runtimeValidateBookHealth(raw: unknown, tokenId: string): BookHealth {
   assertOptionalString(record.bestAsk, `book.${tokenId}.bestAsk`);
   assertNonNegativeSafeInteger(record.bidDepthCount, `book.${tokenId}.bidDepthCount`);
   assertNonNegativeSafeInteger(record.askDepthCount, `book.${tokenId}.askDepthCount`);
-  assertOptionalNumber(record.lastSuccessfulUpdateTime, `book.${tokenId}.lastSuccessfulUpdateTime`);
+  assertOptionalNonNegativeSafeInteger(
+    record.lastSuccessfulUpdateTime,
+    `book.${tokenId}.lastSuccessfulUpdateTime`,
+  );
   assertBoolean(record.healthy, `book.${tokenId}.healthy`);
   return raw as BookHealth;
 }
 
-function runtimeValidateHealth(raw: unknown): HealthSummary {
-  const record = raw as Record<string, unknown>;
-  if (typeof record !== "object") throw new Error("health is not an object");
+export function runtimeValidateHealth(raw: unknown): HealthSummary {
+  const record = assertRecord(raw, "health");
   if (record.schemaVersion !== 2)
     throw new Error(`health schemaVersion is ${String(record.schemaVersion)}, expected 2`);
   assertString(record.runId, "health.runId");
   assertIsoTimestamp(record.startedAt, "health.startedAt");
   if (record.endedAt !== null) assertIsoTimestamp(record.endedAt, "health.endedAt");
   assertNonNegativeSafeInteger(record.totalEventsReceived, "health.totalEventsReceived");
+  assertCountRecord(record.eventCountsBySource, "health.eventCountsBySource");
+  assertCountRecord(record.eventCountsByType, "health.eventCountsByType");
   assertNonNegativeSafeInteger(record.malformedEventCount, "health.malformedEventCount");
   assertNonNegativeSafeInteger(record.duplicateEventCount, "health.duplicateEventCount");
   assertNonNegativeSafeInteger(record.reconnectCount, "health.reconnectCount");
+  assertOptionalNonNegativeSafeInteger(
+    record.maximumSourceToReceiveLatencyMs,
+    "health.maximumSourceToReceiveLatencyMs",
+  );
+  assertOptionalNonNegativeSafeInteger(
+    record.maximumReceiveToProcessLatencyMs,
+    "health.maximumReceiveToProcessLatencyMs",
+  );
   assertNonNegativeSafeInteger(record.staleFeedIncidents, "health.staleFeedIncidents");
   assertBoolean(record.bothTokenStreamsObserved, "health.bothTokenStreamsObserved");
   assertBoolean(record.referencePriceStreamObserved, "health.referencePriceStreamObserved");
+  const bookHealth = assertRecord(record.finalBookHealth, "health.finalBookHealth");
+  for (const [tokenId, book] of Object.entries(bookHealth)) {
+    runtimeValidateBookHealth(book, tokenId);
+  }
+  const openGaps = assertRecord(record.openGapsByFeed, "health.openGapsByFeed");
+  for (const [feed, gap] of Object.entries(openGaps)) {
+    const gapRecord = assertRecord(gap, `health.openGapsByFeed.${feed}`);
+    assertString(gapRecord.feed, `health.openGapsByFeed.${feed}.feed`);
+    assertNonNegativeSafeInteger(gapRecord.startedAt, `health.openGapsByFeed.${feed}.startedAt`);
+  }
+  assertNonNegativeSafeInteger(record.dataGapCount, "health.dataGapCount");
+  assertNonNegativeSafeInteger(record.closedGapCount, "health.closedGapCount");
+  assertNonNegativeSafeInteger(record.totalGapDurationMs, "health.totalGapDurationMs");
+  assertNonNegativeSafeInteger(record.maximumGapDurationMs, "health.maximumGapDurationMs");
+  assertEnum(record.captureStatus, CAPTURE_STATUSES, "health.captureStatus");
   assertBoolean(record.usableForReplay, "health.usableForReplay");
-  assertBoolean(record.referenceFresh, "health.referenceFresh");
+  assertQualityFailureArray(record.qualityFailures, "health.qualityFailures");
   assertPositiveNumber(record.clobStaleAfterMs, "health.clobStaleAfterMs");
   assertPositiveNumber(record.referenceStaleAfterMs, "health.referenceStaleAfterMs");
+  assertOptionalNonNegativeSafeInteger(
+    record.lastReferenceReceivedAt,
+    "health.lastReferenceReceivedAt",
+  );
+  assertOptionalNonNegativeSafeInteger(
+    record.lastReferenceConnectionGeneration,
+    "health.lastReferenceConnectionGeneration",
+  );
+  assertOptionalNonNegativeSafeInteger(
+    record.lastReferenceSourceTimestamp,
+    "health.lastReferenceSourceTimestamp",
+  );
+  assertOptionalNumber(record.finalReferenceAgeMs, "health.finalReferenceAgeMs");
+  assertOptionalNumber(record.finalReferenceSourceAgeMs, "health.finalReferenceSourceAgeMs");
+  assertBoolean(record.referenceFresh, "health.referenceFresh");
   assertPositiveNumber(record.referenceClockSkewMs, "health.referenceClockSkewMs");
   assertNonNegativeSafeInteger(
     record.referenceTimestampAnomalyCount,
@@ -184,50 +296,73 @@ function runtimeValidateHealth(raw: unknown): HealthSummary {
     record.referenceFutureSourceSkewCount,
     "health.referenceFutureSourceSkewCount",
   );
-  assertOptionalNumber(record.lastReferenceReceivedAt, "health.lastReferenceReceivedAt");
-  assertOptionalNumber(record.lastReferenceSourceTimestamp, "health.lastReferenceSourceTimestamp");
-  assertOptionalNumber(record.finalReferenceAgeMs, "health.finalReferenceAgeMs");
-  assertOptionalNumber(record.finalReferenceSourceAgeMs, "health.finalReferenceSourceAgeMs");
-  const bookHealth = record.finalBookHealth as Record<string, unknown>;
-  if (typeof bookHealth !== "object") throw new Error("health.finalBookHealth is not an object");
-  for (const [tokenId, book] of Object.entries(bookHealth)) {
-    runtimeValidateBookHealth(book, tokenId);
-  }
   return raw as HealthSummary;
 }
 
-function runtimeValidateEvent(raw: unknown, index: number): RawEventEnvelope {
-  const record = raw as Record<string, unknown>;
-  if (typeof record !== "object") {
-    throw new Error(`events.jsonl line ${index + 1} is not an object`);
-  }
+export function runtimeValidateEvent(raw: unknown, index: number): RawEventEnvelope {
+  const record = assertRecord(raw, `events.jsonl line ${index + 1}`);
   if (record.schemaVersion !== 2) {
     throw new Error(
       `events.jsonl line ${index + 1}: schemaVersion is ${String(record.schemaVersion)}, expected 2`,
     );
   }
-  if (typeof record.sequence !== "number" || !Number.isSafeInteger(record.sequence)) {
-    throw new Error(`events.jsonl line ${index + 1}: sequence is not a safe integer`);
-  }
-  if (typeof record.runId !== "string") {
-    throw new Error(`events.jsonl line ${index + 1}: runId is not a string`);
-  }
-  if (typeof record.eventType !== "string") {
-    throw new Error(`events.jsonl line ${index + 1}: eventType is not a string`);
-  }
-  if (typeof record.receivedAt !== "number" || !Number.isFinite(record.receivedAt)) {
-    throw new Error(`events.jsonl line ${index + 1}: receivedAt is not a finite number`);
-  }
-  if (typeof record.processedAt !== "number" || !Number.isFinite(record.processedAt)) {
-    throw new Error(`events.jsonl line ${index + 1}: processedAt is not a finite number`);
-  }
-  if (record.sourceTimestamp !== null && typeof record.sourceTimestamp !== "number") {
-    throw new Error(`events.jsonl line ${index + 1}: sourceTimestamp is not a number or null`);
-  }
+  assertString(record.runId, `events.jsonl line ${index + 1}: runId`);
+  assertNonNegativeSafeInteger(record.sequence, `events.jsonl line ${index + 1}: sequence`);
+  assertEnum(record.source, EVENT_SOURCES, `events.jsonl line ${index + 1}: source`);
+  assertString(record.eventType, `events.jsonl line ${index + 1}: eventType`);
+  if (record.marketId !== null)
+    assertString(record.marketId, `events.jsonl line ${index + 1}: marketId`);
+  if (record.conditionId !== null)
+    assertString(record.conditionId, `events.jsonl line ${index + 1}: conditionId`);
+  if (record.sourceMarketId !== null)
+    assertString(record.sourceMarketId, `events.jsonl line ${index + 1}: sourceMarketId`);
+  if (record.tokenId !== null)
+    assertString(record.tokenId, `events.jsonl line ${index + 1}: tokenId`);
+  assertOptionalStringArray(
+    record.observedTokenIds,
+    `events.jsonl line ${index + 1}: observedTokenIds`,
+  );
+  assertOptionalNumber(record.sourceTimestamp, `events.jsonl line ${index + 1}: sourceTimestamp`);
+  assertOptionalNumber(
+    record.topLevelSourceTimestamp,
+    `events.jsonl line ${index + 1}: topLevelSourceTimestamp`,
+  );
+  assertOptionalNumber(
+    record.payloadSourceTimestamp,
+    `events.jsonl line ${index + 1}: payloadSourceTimestamp`,
+  );
+  assertNumber(record.receivedAt, `events.jsonl line ${index + 1}: receivedAt`);
+  assertNumber(record.processedAt, `events.jsonl line ${index + 1}: processedAt`);
+  assertOptionalNonNegativeSafeInteger(
+    record.connectionGeneration,
+    `events.jsonl line ${index + 1}: connectionGeneration`,
+  );
+  if (record.frameId !== null)
+    assertString(record.frameId, `events.jsonl line ${index + 1}: frameId`);
+  assertOptionalNonNegativeSafeInteger(
+    record.messageIndex,
+    `events.jsonl line ${index + 1}: messageIndex`,
+  );
+  assertOptionalNonNegativeSafeInteger(
+    record.messageCount,
+    `events.jsonl line ${index + 1}: messageCount`,
+  );
+  assertBoolean(record.isDuplicate, `events.jsonl line ${index + 1}: isDuplicate`);
+  assertEnum(record.dedupeState, DEDUPE_STATES, `events.jsonl line ${index + 1}: dedupeState`);
+  assertOptionalNonNegativeSafeInteger(
+    record.duplicateOfSequence,
+    `events.jsonl line ${index + 1}: duplicateOfSequence`,
+  );
+  if (record.dedupeReason !== null)
+    assertString(record.dedupeReason, `events.jsonl line ${index + 1}: dedupeReason`);
+  if (record.rawText !== null)
+    assertString(record.rawText, `events.jsonl line ${index + 1}: rawText`);
+  if (record.rawMessageText !== null)
+    assertString(record.rawMessageText, `events.jsonl line ${index + 1}: rawMessageText`);
   return raw as RawEventEnvelope;
 }
 
-async function verifyRun(directory: string): Promise<void> {
+export async function verifyRun(directory: string, minReferenceObservations = 5): Promise<void> {
   const manifestPath = path.join(directory, "manifest.json");
   const healthPath = path.join(directory, "health.json");
   const eventsPath = path.join(directory, "events.jsonl");
@@ -281,6 +416,14 @@ async function verifyRun(directory: string): Promise<void> {
   if (manifest.finalEventCount === null || manifest.finalEventCount <= 0) {
     errors.push(`finalEventCount is ${manifest.finalEventCount}, expected a positive number`);
   }
+  if (manifest.endedAt === null) {
+    errors.push("manifest.endedAt is null on a completed run, expected a valid ISO timestamp");
+  } else {
+    assertIsoTimestamp(manifest.endedAt, "manifest.endedAt");
+  }
+  if (health.endedAt === null) {
+    errors.push("health.endedAt is null on a completed run, expected a valid ISO timestamp");
+  }
 
   if (health.runId !== manifest.runId) {
     errors.push(`health.runId ${health.runId} does not match manifest.runId ${manifest.runId}`);
@@ -290,11 +433,13 @@ async function verifyRun(directory: string): Promise<void> {
       `health.startedAt ${health.startedAt} does not match manifest.startedAt ${manifest.startedAt}`,
     );
   }
-  if (health.endedAt !== null && manifest.completionStatus === "COMPLETED") {
-    if (
-      health.endedAt !== manifest.startedAt &&
-      Date.parse(health.endedAt) < Date.parse(manifest.startedAt)
-    ) {
+  if (manifest.endedAt !== null && health.endedAt !== null) {
+    if (manifest.endedAt !== health.endedAt) {
+      errors.push(
+        `manifest.endedAt ${manifest.endedAt} does not match health.endedAt ${health.endedAt}`,
+      );
+    }
+    if (Date.parse(health.endedAt) < Date.parse(manifest.startedAt)) {
       errors.push(
         `health.endedAt ${health.endedAt} is before manifest.startedAt ${manifest.startedAt}`,
       );
@@ -309,6 +454,32 @@ async function verifyRun(directory: string): Promise<void> {
     errors.push(
       `health.referenceStaleAfterMs ${health.referenceStaleAfterMs} does not match manifest.referenceStaleAfterMs ${manifest.referenceStaleAfterMs}`,
     );
+  }
+  if (health.captureStatus !== manifest.captureStatus) {
+    errors.push(
+      `health.captureStatus ${health.captureStatus} does not match manifest.captureStatus ${manifest.captureStatus}`,
+    );
+  }
+  if (health.usableForReplay !== manifest.usableForReplay) {
+    errors.push(
+      `health.usableForReplay ${health.usableForReplay} does not match manifest.usableForReplay ${manifest.usableForReplay}`,
+    );
+  }
+  const manifestFailureCodes = new Set(manifest.qualityFailures.map((f) => f.code));
+  const healthFailureCodes = new Set(health.qualityFailures.map((f) => f.code));
+  if (manifestFailureCodes.size !== healthFailureCodes.size) {
+    errors.push(
+      `manifest.qualityFailures codes ${[...manifestFailureCodes].join(", ")} do not match health.qualityFailures codes ${[...healthFailureCodes].join(", ")}`,
+    );
+  } else {
+    for (const code of manifestFailureCodes) {
+      if (!healthFailureCodes.has(code)) {
+        errors.push(
+          `manifest.qualityFailures codes do not match health.qualityFailures codes (missing ${code})`,
+        );
+        break;
+      }
+    }
   }
   if (health.captureStatus !== "COMPLETE") {
     errors.push(`health captureStatus is ${health.captureStatus}, expected COMPLETE`);
@@ -375,7 +546,6 @@ async function verifyRun(directory: string): Promise<void> {
     }
   }
 
-  // Validate events.jsonl
   let eventsText: string;
   try {
     eventsText = await readFile(eventsPath, "utf8");
@@ -456,13 +626,109 @@ async function verifyRun(directory: string): Promise<void> {
           }
         }
       }
-      // Recompute reference freshness and historical anomalies from events
+      const recomputedSourceCounts: Record<string, number> = {};
+      const recomputedTypeCounts: Record<string, number> = {};
+      let recomputedMalformed = 0;
+      let recomputedDuplicates = 0;
+      let recomputedDataGapCount = 0;
+      let recomputedClosedGapCount = 0;
+      let recomputedTotalGapDurationMs = 0;
+      let recomputedMaxGapDurationMs = 0;
+      const openGaps = new Map<string, number>();
+      for (const event of events) {
+        recomputedSourceCounts[event.source] = (recomputedSourceCounts[event.source] ?? 0) + 1;
+        recomputedTypeCounts[`${event.source}:${event.eventType}`] =
+          (recomputedTypeCounts[`${event.source}:${event.eventType}`] ?? 0) + 1;
+        if (event.eventType === "MALFORMED_EVENT") recomputedMalformed += 1;
+        if (event.isDuplicate) recomputedDuplicates += 1;
+        if (event.eventType === "DATA_GAP_STARTED") {
+          const feed = (event.payload as Record<string, unknown>).feed;
+          if (typeof feed === "string") {
+            openGaps.set(feed, event.receivedAt);
+            recomputedDataGapCount += 1;
+          }
+        }
+        if (event.eventType === "DATA_GAP_ENDED") {
+          const feed = (event.payload as Record<string, unknown>).feed;
+          if (typeof feed === "string") {
+            const startedAt = openGaps.get(feed);
+            if (startedAt !== undefined) {
+              const duration = Math.max(0, event.receivedAt - startedAt);
+              recomputedTotalGapDurationMs += duration;
+              if (duration > recomputedMaxGapDurationMs) recomputedMaxGapDurationMs = duration;
+              recomputedClosedGapCount += 1;
+            }
+            openGaps.delete(feed);
+          }
+        }
+      }
+      if (recomputedMalformed !== health.malformedEventCount) {
+        errors.push(
+          `recomputed malformed count ${recomputedMalformed} does not match health.malformedEventCount ${health.malformedEventCount}`,
+        );
+      }
+      if (recomputedDuplicates !== health.duplicateEventCount) {
+        errors.push(
+          `recomputed duplicate count ${recomputedDuplicates} does not match health.duplicateEventCount ${health.duplicateEventCount}`,
+        );
+      }
+      const healthSourceKeys = Object.keys(health.eventCountsBySource).sort();
+      const recomputedSourceKeys = Object.keys(recomputedSourceCounts).sort();
+      if (JSON.stringify(healthSourceKeys) !== JSON.stringify(recomputedSourceKeys)) {
+        errors.push(
+          `recomputed eventCountsBySource keys ${recomputedSourceKeys.join(", ")} do not match health keys ${healthSourceKeys.join(", ")}`,
+        );
+      } else {
+        for (const key of recomputedSourceKeys) {
+          if (recomputedSourceCounts[key] !== health.eventCountsBySource[key]) {
+            errors.push(
+              `recomputed eventCountsBySource.${key} ${recomputedSourceCounts[key]} does not match health ${health.eventCountsBySource[key]}`,
+            );
+          }
+        }
+      }
+      const healthTypeKeys = Object.keys(health.eventCountsByType).sort();
+      const recomputedTypeKeys = Object.keys(recomputedTypeCounts).sort();
+      if (JSON.stringify(healthTypeKeys) !== JSON.stringify(recomputedTypeKeys)) {
+        errors.push(
+          `recomputed eventCountsByType keys ${recomputedTypeKeys.join(", ")} do not match health keys ${healthTypeKeys.join(", ")}`,
+        );
+      } else {
+        for (const key of recomputedTypeKeys) {
+          if (recomputedTypeCounts[key] !== health.eventCountsByType[key]) {
+            errors.push(
+              `recomputed eventCountsByType.${key} ${recomputedTypeCounts[key]} does not match health ${health.eventCountsByType[key]}`,
+            );
+          }
+        }
+      }
+      if (recomputedDataGapCount !== health.dataGapCount) {
+        errors.push(
+          `recomputed dataGapCount ${recomputedDataGapCount} does not match health.dataGapCount ${health.dataGapCount}`,
+        );
+      }
+      if (recomputedClosedGapCount !== health.closedGapCount) {
+        errors.push(
+          `recomputed closedGapCount ${recomputedClosedGapCount} does not match health.closedGapCount ${health.closedGapCount}`,
+        );
+      }
+      if (recomputedTotalGapDurationMs !== health.totalGapDurationMs) {
+        errors.push(
+          `recomputed totalGapDurationMs ${recomputedTotalGapDurationMs} does not match health.totalGapDurationMs ${health.totalGapDurationMs}`,
+        );
+      }
+      if (recomputedMaxGapDurationMs !== health.maximumGapDurationMs) {
+        errors.push(
+          `recomputed maximumGapDurationMs ${recomputedMaxGapDurationMs} does not match health.maximumGapDurationMs ${health.maximumGapDurationMs}`,
+        );
+      }
       const referenceObs = new Set<number>();
       let lastRefReceivedAt: number | null = null;
       let lastRefSourceTimestamp: number | null = null;
       let recomputedMissing = 0;
       let recomputedStaleAtReceipt = 0;
       let recomputedFutureSkew = 0;
+      const recomputedAnomalyCodes = new Set<QualityFailureCode>();
       for (const event of events) {
         if (event.eventType === "REFERENCE_PRICE" && !event.isDuplicate) {
           if (event.sourceTimestamp !== null) {
@@ -471,11 +737,14 @@ async function verifyRun(directory: string): Promise<void> {
             const sourceAge = event.receivedAt - event.sourceTimestamp;
             if (sourceAge < -health.referenceClockSkewMs) {
               recomputedFutureSkew += 1;
+              recomputedAnomalyCodes.add("REFERENCE_CLOCK_SKEW");
             } else if (sourceAge > health.referenceStaleAfterMs) {
               recomputedStaleAtReceipt += 1;
+              recomputedAnomalyCodes.add("REFERENCE_STREAM_STALE");
             }
           } else {
             recomputedMissing += 1;
+            recomputedAnomalyCodes.add("REFERENCE_TIMESTAMP_MISSING");
           }
           lastRefReceivedAt = event.receivedAt;
         }
@@ -487,7 +756,6 @@ async function verifyRun(directory: string): Promise<void> {
           `unique Chainlink reference observations ${referenceObs.size} < minimum ${minReferenceObservations}`,
         );
       }
-      // Compare recomputed anomaly counts with health summary
       if (recomputedAnomalyCount !== health.referenceTimestampAnomalyCount) {
         errors.push(
           `recomputed reference anomaly count ${recomputedAnomalyCount} does not match health.referenceTimestampAnomalyCount ${health.referenceTimestampAnomalyCount}`,
@@ -508,7 +776,33 @@ async function verifyRun(directory: string): Promise<void> {
           `recomputed future-skew count ${recomputedFutureSkew} does not match health.referenceFutureSourceSkewCount ${health.referenceFutureSourceSkewCount}`,
         );
       }
-      // Recompute freshness using the endedAt from health
+      const healthAnomalyCodes = new Set<QualityFailureCode>();
+      if (health.referenceTimestampMissingCount > 0)
+        healthAnomalyCodes.add("REFERENCE_TIMESTAMP_MISSING");
+      if (health.referenceStaleAtReceiptCount > 0) healthAnomalyCodes.add("REFERENCE_STREAM_STALE");
+      if (health.referenceFutureSourceSkewCount > 0) healthAnomalyCodes.add("REFERENCE_CLOCK_SKEW");
+      if (recomputedAnomalyCodes.size !== healthAnomalyCodes.size) {
+        errors.push(
+          `recomputed anomaly codes ${[...recomputedAnomalyCodes].join(", ")} do not match health anomaly codes ${[...healthAnomalyCodes].join(", ")}`,
+        );
+      } else {
+        for (const code of recomputedAnomalyCodes) {
+          if (!healthAnomalyCodes.has(code)) {
+            errors.push(
+              `recomputed anomaly codes do not match health anomaly codes (missing ${code})`,
+            );
+            break;
+          }
+        }
+      }
+      for (const code of recomputedAnomalyCodes) {
+        if (!healthFailureCodes.has(code)) {
+          errors.push(`recomputed anomaly code ${code} is not present in health.qualityFailures`);
+        }
+        if (!manifestFailureCodes.has(code)) {
+          errors.push(`recomputed anomaly code ${code} is not present in manifest.qualityFailures`);
+        }
+      }
       if (health.endedAt !== null) {
         const endedAtMs = Date.parse(health.endedAt);
         if (Number.isNaN(endedAtMs)) {
@@ -564,18 +858,47 @@ async function verifyRun(directory: string): Promise<void> {
   );
 }
 
-try {
-  if (runDirectory === undefined) throw new Error("runDirectory argument is required");
-  await verifyRun(runDirectory);
-} catch (error) {
-  if (!process.exitCode) {
+const isMainModule = process.argv[1]?.includes("verify-run") ?? false;
+
+if (isMainModule) {
+  const program = new Command()
+    .name("market:verify-run")
+    .description("Verify that a recorded run is usable for deterministic replay")
+    .argument(
+      "<runDirectory>",
+      "path to the run directory containing manifest.json and health.json",
+    )
+    .option("--min-reference-observations <number>", "minimum unique Chainlink observations", "5");
+
+  program.parse();
+  const [runDirectory] = program.args;
+  const opts = program.opts();
+  const rawMin = Number(opts.minReferenceObservations ?? 5);
+  if (!Number.isSafeInteger(rawMin) || rawMin <= 0) {
     console.error(
       JSON.stringify({
         verified: false,
         runDirectory,
-        error: error instanceof Error ? error.message : String(error),
+        error: `--min-reference-observations must be a positive safe integer, got ${String(opts.minReferenceObservations)}`,
       }),
     );
     process.exitCode = 1;
+    throw new Error("invalid argument");
+  }
+
+  try {
+    if (runDirectory === undefined) throw new Error("runDirectory argument is required");
+    await verifyRun(runDirectory, rawMin);
+  } catch (error) {
+    if (!process.exitCode) {
+      console.error(
+        JSON.stringify({
+          verified: false,
+          runDirectory,
+          error: error instanceof Error ? error.message : String(error),
+        }),
+      );
+      process.exitCode = 1;
+    }
   }
 }

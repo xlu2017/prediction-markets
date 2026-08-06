@@ -35,6 +35,7 @@ describe("array slicing with primitive elements", () => {
     const noop = (): void => {
       void 0;
     };
+    const acceptAll = (): boolean => true;
     const processor = new RecorderEventProcessor(
       "test-run",
       market,
@@ -43,7 +44,7 @@ describe("array slicing with primitive elements", () => {
       health,
       logger,
       () => FIXED_NOW,
-      noop,
+      acceptAll,
       noop,
       noop,
     );
