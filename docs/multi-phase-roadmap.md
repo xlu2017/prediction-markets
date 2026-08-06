@@ -1,1206 +1,1202 @@
 # Prediction Markets: Multi-Phase Delivery Roadmap
 
-Status: proposed
+Status: active planning document
 
 Last updated: 2026-08-05
 
-Repository baseline: `main` at `17b5453e12065be17e8c766434a88cf54211f371`
+Planning branch: `agent/multi-phase-concurrent-plan`
 
-## 1. Purpose
+Recorder implementation branch under review: `devin/recorder-schema-v2`
 
-This document defines the delivery plan for a research-grade and eventually production-capable environment for Polymarket BTC five-minute Up/Down markets.
+## 1. Executive decision
 
-The plan is designed for multiple ChatGPT, Devin, Codex, or human engineering sessions to work concurrently without silently changing shared contracts, duplicating work, or invalidating recorded data.
+This project will keep a custom component only where it provides a clear capability that is not available as a coherent open-source Polymarket package: a lossless, auditable market-data recorder that certifies whether a capture is suitable for downstream replay.
 
-The target progression is:
+The project will not assume that every later subsystem should be implemented from scratch. Deterministic event processing, catalogs, backtesting, fill simulation, portfolio accounting, reconciliation, paper trading, and live execution already exist in mature open-source systems. Those capabilities must be evaluated and adopted where they satisfy the project's contracts.
 
-1. trustworthy public data capture;
-2. deterministic offline replay;
-3. research-ready datasets and labels;
-4. calibrated probability models;
-5. explicit decision policies;
-6. realistic paper execution;
-7. continuous shadow operation;
-8. optional live execution behind independent safety gates.
+The target architecture is therefore:
 
-The project must not claim that a profitable or "winning" policy exists merely because the infrastructure is complete. Profitability is an empirical result that must survive untouched chronological testing and conservative execution assumptions.
+```text
+Gamma + Polymarket CLOB V2 + Chainlink RTDS
+                       │
+                       ▼
+       custom lossless recorder and verifier
+               recorder schema v2
+                       │
+                       ▼
+      versioned normalization and lineage adapter
+                       │
+                       ▼
+       selected catalog/replay/trading engine
+          preferably NautilusTrader if proven
+                       │
+          ┌────────────┼────────────┐
+          ▼            ▼            ▼
+       research     paper/shadow   live later
+```
 
-## 2. Current baseline
+The custom recorder is an evidence boundary, not a replacement for a mature trading platform.
 
-The repository currently contains a read-only TypeScript recorder that:
+No custom replay engine, matching engine, portfolio ledger, or live order-management system should be approved until the corresponding build-versus-adopt gate has been completed.
 
-- discovers an active BTC five-minute Up/Down market through public Gamma interfaces;
-- validates the event and extracts Up and Down token IDs;
-- subscribes to the public Polymarket CLOB market WebSocket;
-- subscribes to the public Chainlink BTC/USD real-time stream;
-- records normalized envelopes and original WebSocket text in JSONL;
-- maintains a minimal health-only order-book projection;
-- emits manifest and health files;
-- includes mocked tests, a synthetic fixture, CI, and a manual public smoke workflow.
+## 2. Project purpose
 
-This is a useful foundation, but deterministic replay must not be built on top of schema version 1 until Phase 0 repairs the known identity, deduplication, gap, book-state, and capture-quality defects described below.
+The project aims to produce a research-grade and eventually production-capable environment for Polymarket BTC five-minute Up/Down markets.
 
-## 3. System boundaries
+The required progression is:
 
-### 3.1 Data sources
+1. trustworthy public-data capture;
+2. verified schema and evidence lineage;
+3. an explicit build-versus-adopt decision for downstream infrastructure;
+4. deterministic offline replay;
+5. leakage-safe datasets and settlement labels;
+6. calibrated probability forecasts;
+7. explicit decision policies with abstention;
+8. conservative paper execution and accounting;
+9. continuous shadow operation;
+10. optional authenticated execution behind independent safety gates.
 
-The system uses three distinct public-data roles:
+Infrastructure completion does not establish predictive edge or profitability. Any positive-alpha claim must survive untouched chronological testing, calibration analysis, conservative execution assumptions, operational failure testing, and independent reconciliation.
 
-- **Gamma API:** event discovery, contract metadata, rules, timing, condition identity, outcome labels, and outcome-token IDs.
-- **Polymarket CLOB V2 market channel:** executable bids and asks, level-two snapshots and updates, trades, tick-size changes, and market lifecycle events.
-- **Polymarket Chainlink RTDS:** settlement-aligned BTC/USD observations when required by the contract rules.
+## 3. Current state
 
-These roles must remain separate. Chainlink prices must not be treated as executable contract prices, and CLOB token prices must not be treated as the BTC settlement source.
+### 3.1 Implemented foundation
 
-### 3.2 Operating modes
+The repository contains a read-only TypeScript recorder that uses the current Polymarket architecture:
 
-The long-term system will support four explicit modes:
+- Gamma for event discovery, rules, timing, condition identity, outcome labels, and token IDs;
+- the public Polymarket CLOB V2 market WebSocket for executable order-book and trade data;
+- Polymarket Chainlink RTDS for settlement-aligned BTC/USD reference observations.
 
-| Mode | External data | Authenticated trading | Purpose |
+The schema-v2 work under review adds or substantially improves:
+
+- consistent Gamma market ID, CLOB condition ID, and outcome-token identity;
+- exact raw-frame and raw-message retention;
+- array-message indexing and lineage;
+- exact decimal lexeme preservation;
+- evidence-preserving duplicate classification;
+- connection-generation identity;
+- explicit gap and stale-feed lifecycle events;
+- mandatory post-gap book resynchronization;
+- transactional order-book updates;
+- final and historical crossed-book detection;
+- Chainlink receipt-time and source-time quality checks;
+- cumulative capture-quality failures;
+- `COMPLETE`, `PARTIAL`, and `UNUSABLE` capture classifications;
+- an independent run verifier over `manifest.json`, `health.json`, and `events.jsonl`;
+- a read-only public smoke workflow.
+
+### 3.2 Phase-0 status
+
+Recorder schema v2 is close to a freeze but remains under review. It must not be treated as frozen merely because CI and the public smoke workflow pass.
+
+The final schema-freeze review must confirm that every historical Chainlink observation is evaluated using the configured reference-staleness and clock-skew policies, not an unrelated hard-coded threshold. The persisted health summary and the independent verifier must derive the same anomaly result from the underlying events.
+
+Until all Phase-0 blockers are closed:
+
+- PR #2 remains draft;
+- downstream work may prototype against the branch;
+- downstream contracts must not be declared stable;
+- replay or catalog output must be disposable and regenerable.
+
+### 3.3 Meaningful differentiation
+
+The custom implementation is differentiated at the pre-normalization evidence boundary. It combines capabilities that are usually separate or absent in open-source Polymarket projects:
+
+- exact source-frame retention;
+- exact per-message text and decimal representations;
+- frame, message, sequence, connection, market, condition, and token lineage;
+- duplicate evidence retained without duplicate state mutation;
+- explicit gap history and resynchronization requirements;
+- cumulative book and reference-feed integrity incidents;
+- fail-closed capture certification;
+- verification of persisted output independently from the recorder process.
+
+This is valuable for corpus integrity, adapter debugging, reproducible microstructure research, and proving that normalized downstream events can be traced to source evidence.
+
+It is not a reason to rebuild the mature replay, backtesting, accounting, risk, and execution functionality available elsewhere.
+
+## 4. Data-source and identity boundaries
+
+### 4.1 Public data roles
+
+The sources have distinct semantics:
+
+| Source | Role | Must not be treated as |
+| --- | --- | --- |
+| Gamma API | Discovery, contract metadata, timing, rules, market ID, condition ID, token IDs | Executable price feed |
+| CLOB V2 market channel | Up/Down snapshots, deltas, trades, liquidity and market events | BTC settlement source |
+| Chainlink RTDS | Settlement-aligned BTC/USD reference observations | Executable outcome-token price |
+| Polygon/on-chain fills, optional later | Authoritative executed fills and settlement-side evidence | Complete resting CLOB history |
+
+In a CLOB event, the source field named `market` is the condition ID. It must be validated against the discovered condition ID and must not overwrite the normalized Gamma market ID.
+
+### 4.2 Canonical identity
+
+Every downstream record must be able to retain or recover:
+
+```text
+run_id
+sequence
+frame_id
+message_index
+connection_generation
+gamma_market_id
+condition_id
+outcome_token_id
+source_timestamp
+received_at
+processed_at
+raw_event_type
+schema_version
+code_commit
+```
+
+No external SDK object is a stable project contract.
+
+## 5. Operating modes
+
+| Mode | Network input | Authenticated trading | Purpose |
 | --- | --- | --- | --- |
-| `DATA_ONLY` | Public live data | Forbidden | Capture and validation |
-| `REPLAY` | Saved local data only | Forbidden | Deterministic research and simulation |
-| `PAPER` | Public live data | Forbidden | Continuous shadow decisions and simulated execution |
-| `LIVE` | Public and authenticated APIs | Allowed only behind gates | Optional production execution |
+| `DATA_ONLY` | Public live data | Forbidden | Lossless capture and validation |
+| `REPLAY` | Saved local data only | Forbidden | Deterministic reconstruction and research |
+| `PAPER` | Saved or public live data | Forbidden | Decisions and simulated execution |
+| `SHADOW` | Public live data plus account-independent simulation | Forbidden | Continuous operational validation |
+| `LIVE` | Public and authenticated APIs | Allowed only behind all gates | Optional production execution |
 
 Missing or invalid configuration must never cause an implicit transition to a more permissive mode.
 
-### 3.3 Explicit non-goals before the applicable phase
+Unit tests, CI, fixtures, documentation examples, and public smoke workflows must remain unable to submit orders.
 
-Until the roadmap reaches the corresponding phase, do not add:
+## 6. Build-versus-adopt allocation
 
-- wallet or private-key handling;
-- authenticated order submission;
-- live positions or capital exposure;
-- claims of predictive edge;
-- claims of profitable execution;
-- a strategy forced to trade every market;
-- reinforcement learning merely because the word "policy" is used;
-- maker fills that assume favorable queue priority without evidence;
-- backtests using midpoint prices as executable prices;
-- models trained with future information or settlement leakage.
+The default allocation is:
 
-## 4. Core engineering principles
+| Component | Default decision | Candidate implementation | Reason |
+| --- | --- | --- | --- |
+| Lossless raw recorder | Keep custom | TypeScript schema-v2 recorder | Clear differentiated capability |
+| Capture certification | Keep custom | Health summary plus independent verifier | Required evidence contract |
+| Gamma discovery | Wrap official/current interfaces | Local gateway or current official SDK | Avoid volatile API types in domain code |
+| CLOB public transport | Keep focused wrapper or official SDK adapter | Current CLOB V2 protocol | Recorder requires raw-wire access |
+| Chainlink RTDS transport | Keep reliability wrapper | Official RTDS client may be used internally | Raw retention and stale detection remain local |
+| Versioned normalized adapter | Keep custom | Schema-v2 adapter | Required lineage boundary |
+| Normalized data catalog | Prefer adoption | Nautilus catalog or equivalent | Mature implementation already exists |
+| Deterministic event engine | Prefer adoption | NautilusTrader | Avoid rebuilding clock and event infrastructure |
+| Backtester | Prefer adoption | NautilusTrader or proven Polymarket framework | Existing event-driven simulation |
+| Matching/fill models | Prefer adoption with project-specific calibration | Nautilus plus conservative local models | Generic engine plus venue assumptions |
+| Portfolio accounting | Prefer adoption | NautilusTrader | Mature cash, inventory, order and reconciliation state |
+| Paper trading | Prefer adoption | NautilusTrader | Research-to-live parity |
+| Live execution | Official SDK or proven adapter behind gateway | Current official unified Polymarket SDK; Nautilus only after comparison | Protocol correctness and isolation |
+| Research methodology | Reuse selectively | OpenMarket and other credible research projects | Avoid repeating established synchronization and walk-forward work |
+| On-chain executed-fill truth | Optional adoption | Substreams/indexing project | Complements, but does not replace, CLOB capture |
 
-### 4.1 Raw evidence before derived state
+Any deviation requires a written decision record with evidence that the adopted option cannot satisfy the contract.
 
-Every external frame must be preserved before normalization, deduplication, filtering, or state application. Derived order books, features, forecasts, decisions, fills, and reports must be reproducible from retained evidence.
+## 7. Core engineering principles
 
-### 4.2 Stable internal contracts
+### 7.1 Raw evidence before derived state
 
-External API objects must be converted into versioned internal types. Model, policy, and execution code must not depend directly on volatile SDK or WebSocket payload shapes.
+Every external frame must be preserved before normalization, filtering, duplicate classification, or state application. Derived books, normalized events, features, forecasts, decisions, simulated fills, and reports must remain traceable to source evidence.
 
-### 4.3 Determinism
+### 7.2 Stable internal contracts
 
-Given identical input bytes, configuration, code version, and random seed, replay must produce byte-identical canonical output.
+External API and SDK objects must be converted into versioned project types. Models, policies, reports, and risk code must not depend directly on transport payloads or SDK-native structures.
 
-### 4.4 Fail closed
+### 7.3 Determinism
 
-Ambiguous market rules, unknown token identities, stale feeds, uninitialized books, sequence defects, unresolved gaps, invalid decimals, and inconsistent settlement data must disable downstream use rather than trigger a guess.
+Given identical input bytes, configuration, code versions, dependency versions, and random seed, independent replay processes must produce identical canonical hashes.
 
-### 4.5 Prediction is separate from policy
+### 7.4 Fail closed
 
-A probability model estimates an outcome distribution. A policy maps state, probabilities, executable prices, portfolio state, and risk constraints into actions such as buy, sell, cancel, or abstain.
+Unknown identity, malformed decimals, stale reference data, missing snapshots, unresolved or historical gaps, invalid state transitions, schema disagreement, and reconciliation mismatch must disable downstream use.
 
-### 4.6 Execution is separate from policy
+### 7.5 Prediction, policy, and execution are separate
 
-The policy proposes an intended action. The execution layer decides whether and how that action can be represented, submitted, filled, reconciled, cancelled, or rejected under the selected operating mode.
+A model estimates probabilities. A policy maps probabilities and observable state into an intended action or abstention. The execution layer decides whether and how the action can be simulated or submitted.
 
-### 4.7 Abstention is first-class
+No layer may silently absorb the responsibilities of another.
 
-A policy must be allowed to do nothing when estimated edge is inadequate, data quality is insufficient, uncertainty is too high, or risk limits would be violated.
+### 7.6 Abstention is first-class
 
-### 4.8 Research and live parity without shared failure domains
+The policy must be able to abstain because of insufficient edge, uncertainty, spread, depth, time remaining, data quality, operational health, or risk limits.
 
-Replay, paper, and live modes should share domain interfaces and decision logic, but live credentials and authenticated adapters must remain isolated so tests and research commands cannot reach them.
+### 7.7 Adopt before rebuilding
 
-## 5. Concurrent-session operating model
+Before implementing a generic subsystem, the owner must identify credible existing projects, test them against the required contract, and document the adoption decision.
 
-## 5.1 Unit of work
+### 7.8 Independent verification
 
-Each concurrent session must own one bounded work package with:
+The component that creates an artifact must not be the only component that declares the artifact valid. Run verification, replay hash comparison, book comparison, and accounting reconciliation must be independently executable.
 
-- a unique work-package ID;
+## 8. Concurrent-session operating model
+
+### 8.1 Unit of work
+
+Each session owns one bounded work package with:
+
+- a unique ID;
 - one objective;
-- explicit dependencies;
-- an allowed file set or subsystem boundary;
+- dependencies and base commit;
+- allowed paths;
+- prohibited scope;
+- contracts consumed and changed;
 - acceptance criteria;
-- tests it owns;
-- contracts it consumes;
-- contracts it proposes to change;
+- tests and evidence;
 - a handoff note.
 
-A session must not expand into a neighboring work package without updating the plan or recording the new dependency.
-
-## 5.2 Branch convention
+### 8.2 Branch convention
 
 Use:
 
 ```text
 agent/<phase>-<work-package>-<short-description>
+devin/<phase>-<work-package>-<short-description>
 ```
 
-Examples:
+A branch starts from the latest approved integration point for its phase. It must not assume unmerged sibling changes unless explicitly based on that branch.
 
-```text
-agent/p0-wp01-envelope-identity
-agent/p1-wp03-public-smoke-fixture
-agent/p2-wp02-book-replay
-agent/p4-wp04-calibration-report
-```
+### 8.3 Pull-request convention
 
-Every branch starts from the latest approved integration point for its phase, not an arbitrary sibling branch.
+Every PR must state:
 
-## 5.3 Pull request convention
-
-Each PR must include:
-
-- work-package ID;
-- phase and dependency list;
+- work-package ID and phase;
+- base and head commits;
+- dependency list;
 - exact scope;
-- contracts changed;
-- schema-version impact;
-- fixtures added or migrated;
-- commands and tests run;
-- unresolved limitations;
-- confirmation that forbidden capabilities were not added.
+- schema and contract impact;
+- fixtures changed;
+- commands and test output;
+- current limitations;
+- authenticated capabilities added or explicitly excluded;
+- whether an external project or SDK was evaluated or adopted.
 
-Default all agent-created PRs to draft until their dependencies are merged and their acceptance criteria pass.
+Agent-created PRs remain draft until their dependencies and phase gates pass.
 
-## 5.4 File ownership
+### 8.4 Shared-contract ownership
 
-Concurrent sessions should avoid overlapping files. The following ownership model is the default:
+Changes to the following are serialized:
 
-| Area | Primary paths | Notes |
+- recorder envelopes;
+- health and manifest schemas;
+- normalized adapter schema;
+- replay state schema;
+- dataset schema;
+- forecast schema;
+- policy action schema;
+- execution and order lifecycle schema.
+
+Downstream work may prototype against a proposed contract, but it must rebase onto the final freeze commit before approval.
+
+### 8.5 Default file ownership
+
+| Area | Paths | Ownership rule |
 | --- | --- | --- |
-| External discovery | `src/gamma.ts`, market discovery tests | One owner per phase |
-| Domain contracts | `src/types.ts`, schema docs, fixture migrations | Serialized work only |
-| Feed transport | `src/feeds/**`, reliability tests | May run parallel to replay after contracts freeze |
-| Recording pipeline | `src/processor.ts`, `src/store.ts`, health | Coordinate with schema owner |
-| Book state | `src/book.ts`, later `src/replay/book/**` | One state-machine owner |
-| Replay | later `src/replay/**` | Must consume frozen recorder schema |
-| Research data | later `src/dataset/**`, `src/features/**` | No recorder mutation |
-| Models | later `src/models/**` or separate Python package | No execution mutation |
-| Policy | later `src/policy/**` | No direct SDK calls |
-| Paper execution | later `src/execution/paper/**` | No model internals |
-| Live adapter | later `src/execution/live/**` | Isolated and gated |
-| Reports | later `src/reporting/**` | Consume versioned outputs |
-| Documentation | `docs/**` | Avoid editing the same document concurrently |
+| Recorder contracts | `src/types.ts`, schema docs, fixtures | One contract owner |
+| Recorder transport | `src/feeds/**`, `src/gamma.ts` | One feed owner per source |
+| Recorder processing | `src/processor.ts`, `src/store.ts`, `src/health.ts`, `src/book.ts` | Coordinate with contract owner |
+| Platform evaluation | `docs/open-source-platform-evaluation.md` | Independent research owner |
+| Adapter/replay spike | `python/**` or isolated adapter package | No recorder semantic changes |
+| Datasets/features | `src/dataset/**`, `python/**/dataset/**` | Consume frozen replay contract |
+| Models | isolated model package | No transport or execution calls |
+| Policy | policy package | No direct SDK calls |
+| Paper/live integration | isolated execution package/service | No model internals |
+| Documentation | `docs/**` | Avoid overlapping document edits |
 
-Changes to shared contract files are merge bottlenecks and must be serialized through a designated contract-owner PR.
-
-## 5.5 Contract freeze points
-
-Each phase has a contract freeze. Downstream sessions may begin from the freeze commit, but they must not merge until the corresponding phase gate passes.
-
-Freeze points:
+### 8.6 Freeze points
 
 1. recorder schema v2;
-2. replay state schema v1;
-3. research dataset schema v1;
-4. forecast schema v1;
-5. policy action schema v1;
-6. execution event schema v1;
-7. live-order lifecycle schema v1.
+2. normalized adapter contract v1;
+3. replay/catalog state contract v1;
+4. dataset and label schema v1;
+5. probability forecast schema v1;
+6. policy action schema v1;
+7. execution event and accounting schema v1;
+8. authenticated order lifecycle schema v1.
 
-## 5.6 Handoff template
+## 9. Phase map
 
-Every session must add or update a handoff note containing:
-
-```markdown
-## Work package
-
-- ID:
-- Branch:
-- Base commit:
-- Objective:
-
-## Completed
-
-- ...
-
-## Contracts consumed
-
-- ...
-
-## Contracts changed
-
-- ...
-
-## Validation
-
-- command: result
-
-## Known limitations
-
-- ...
-
-## Safe next work
-
-- ...
-
-## Work that must wait
-
-- ...
-```
-
-## 5.7 Merge order
-
-Within a phase, merge in this order unless the phase specifies otherwise:
-
-1. contract and schema changes;
-2. fixture migrations;
-3. core implementation;
-4. integration adapters;
-5. reporting and documentation;
-6. acceptance and smoke evidence.
-
-A downstream implementation must rebase or merge the final contract-owner commit before approval.
-
-## 6. Phase map
-
-| Phase | Outcome | Parallelism | Exit gate |
+| Phase | Outcome | Primary build/adopt decision | Exit gate |
 | --- | --- | --- | --- |
-| 0 | Recorder correctness and schema v2 | Moderate | No known corruption paths; tests pass |
-| 1 | Real public compatibility and capture operations | High after v2 freeze | Valid real capture artifact |
-| 2 | Deterministic replay and full book reconstruction | High by subsystem | Byte-deterministic replay |
-| 3 | Research dataset and settlement labels | High | Leakage-safe dataset v1 |
-| 4 | Probability baselines and calibration | High by model | Untouched chronological evaluation |
-| 5 | Policy engine and risk-neutral reference policy | Moderate | Reproducible action decisions |
-| 6 | Paper execution and accounting | High by order type/reporting | Conservative simulator reconciliation |
-| 7 | Continuous shadow operation | High by operations/reporting | Stable multi-day paper run |
-| 8 | Dormant authenticated live adapter | Low to moderate | All gates proven; no live order required |
-| 9 | Limited live pilot and production hardening | Serialized | Explicit launch decision |
+| 0 | Lossless recorder and schema-v2 freeze | Keep custom | No known corruption or false-complete path |
+| 1 | Continuous public capture operations | Keep custom recorder; reuse transport where safe | Verified rollover and supervised capture |
+| 2 | Open-source platform and adapter spike | Decide Nautilus and SDK adoption | Executable `ADOPT`, `ADOPT_WITH_CUSTOM_ADAPTER`, or `DO_NOT_ADOPT` decision |
+| 3 | Deterministic normalization, catalog and replay | Prefer selected open-source engine | Independent replay hashes and book comparison |
+| 4 | Settlement labels and research dataset | Custom transformations over adopted storage tools | Leakage-safe dataset v1 |
+| 5 | Probability models and calibration | Reuse standard ML libraries | Untouched chronological evaluation |
+| 6 | Policy and risk decision layer | Keep project-specific | Reproducible actions and abstentions |
+| 7 | Paper execution and accounting | Prefer adopted trading engine | Conservative simulator and ledger reconciliation |
+| 8 | Continuous shadow operation | Adopt mature operational primitives | Stable multi-day run without authenticated trading |
+| 9 | Dormant authenticated adapter | Official SDK or proven engine adapter | All live gates proven; disabled by default |
+| 10 | Limited live pilot and hardening | Explicit launch decision | Documented go, revise, or stop decision |
 
-# Phase 0: Stabilize the recorder
-
-## Objective
-
-Repair defects that could make saved evidence internally inconsistent, silently incomplete, or unsuitable for replay.
-
-No replay, modelling, paper execution, wallet support, or authenticated client work should merge before the Phase 0 gate.
-
-## Phase 0 work packages
-
-### P0-WP01: Envelope identity and schema v2
-
-Scope:
-
-- keep the normalized Gamma market ID consistent across all event sources;
-- add the condition ID explicitly to each envelope;
-- preserve source-native identifiers separately;
-- validate that CLOB `market` identity matches the discovered condition ID;
-- add raw-frame identity fields;
-- increment schema versions;
-- migrate synthetic fixtures and schema documentation.
-
-Required fields should include, at minimum:
-
-```ts
-type RawEventEnvelopeV2 = {
-  schemaVersion: 2;
-  runId: string;
-  sequence: number;
-  frameId: string;
-  messageIndex: number;
-  messageCount: number;
-  source: EventSource;
-  eventType: string;
-  marketId: string;
-  conditionId: string;
-  sourceMarketId: string | null;
-  tokenId: string | null;
-  sourceTimestamp: number | null;
-  receivedAt: number;
-  processedAt: number;
-  connectionGeneration: number | null;
-  payload: JsonValue;
-  rawText: string | null;
-  rawFrameSha256: string | null;
-};
-```
-
-Acceptance:
-
-- all event sources share the same normalized `marketId` and `conditionId`;
-- condition mismatch fails closed;
-- arrays have stable frame/message indexing;
-- fixture migration is explicit and tested.
-
-### P0-WP02: Evidence-preserving duplicate classification
-
-Scope:
-
-- remove hash-only event dropping;
-- persist every external frame;
-- classify suspected duplicates without deleting evidence;
-- prevent confirmed duplicates from mutating derived book state twice;
-- distinguish repeated transport delivery from legitimate state changes.
-
-Acceptance:
-
-- two changes with the same order hash but different sizes are both retained and applied in order;
-- an exact repeated frame can be identified through conservative raw-frame identity;
-- duplicate classification is reproducible in replay;
-- health reports count observed and classified events separately.
-
-### P0-WP03: Connection, gap, and stale-state semantics
-
-Scope:
-
-- separate socket-open state from usable-data state;
-- end a data gap only after a valid subscribed message;
-- reconnect stale but open sockets;
-- preserve open gaps through repeated reconnect failures;
-- include unresolved gaps in final health output.
-
-Acceptance:
-
-- open-but-silent sockets cause stale handling and reconnect;
-- `DATA_GAP_ENDED` cannot occur before relevant data resumes;
-- controlled shutdown records an unresolved gap when applicable;
-- reconnection restores subscriptions.
-
-### P0-WP04: Transactional book-health state machine
-
-Scope:
-
-- introduce `UNINITIALIZED`, `SYNCHRONIZED`, `STALE`, and `INVALID` states;
-- require a complete snapshot before deltas;
-- validate entire events before mutation;
-- reject invalid sides, negative quantities, invalid prices, unknown tokens, and crossed books;
-- ensure trade-only events do not refresh book freshness;
-- require a new snapshot after invalidation.
-
-Acceptance:
-
-- malformed multi-change frames leave no partial mutation;
-- deltas before initial snapshots are rejected or quarantined;
-- only complete validated state transitions update freshness;
-- invariant failures are explicit in the event and health records.
-
-### P0-WP05: Capture-status and fatal-error propagation
-
-Scope:
-
-- separate process termination from capture usability;
-- stop feeds promptly after persistent storage or processor failure;
-- report quality failures explicitly;
-- use the CLOB-specific threshold for book health;
-- record signed clock differences rather than clamping them away.
-
-Add:
-
-```ts
-type CaptureAssessment = {
-  captureStatus: "COMPLETE" | "PARTIAL" | "UNUSABLE";
-  usableForReplay: boolean;
-  qualityFailures: string[];
-};
-```
-
-Acceptance:
-
-- `COMPLETED` process status does not imply replay usability;
-- missing snapshots, missing Chainlink data, unresolved gaps, fatal processing errors, and sequence defects produce explicit failures;
-- fatal write failures terminate the run promptly.
-
-### P0-WP06: Gamma resilience and exact HTTP evidence
-
-Scope:
-
-- retain original Gamma response text and normalized data;
-- add bounded retry for 429 and transient 5xx responses;
-- validate realistic timing fields including `eventStartTime`;
-- distinguish HTTP transport failure from contract-validation failure.
-
-Acceptance:
-
-- raw response bytes or text are retained;
-- retry behavior is deterministic under tests;
-- invalid or ambiguous contracts still fail closed.
-
-## Phase 0 concurrency
-
-Safe parallel groups after P0-WP01 publishes the proposed v2 contract:
-
-- Group A: P0-WP02 duplicate classification;
-- Group B: P0-WP03 feed lifecycle;
-- Group C: P0-WP04 book state machine;
-- Group D: P0-WP06 Gamma resilience.
-
-P0-WP05 integrates outputs from Groups A-C and should merge after them.
-
-## Phase 0 exit gate
-
-All of the following must pass:
-
-- schema v2 committed and documented;
-- all fixtures migrated;
-- no hash-only frame dropping;
-- transactional book updates;
-- gap semantics corrected;
-- capture assessment implemented;
-- lint, typecheck, unit, integration, and read-only boundary checks pass;
-- no authenticated dependency or endpoint added.
-
-# Phase 1: Public compatibility and capture operations
+# Phase 0: Freeze the lossless recorder contract
 
 ## Objective
 
-Prove that the corrected recorder works against current public interfaces and can generate operationally useful capture artifacts.
+Complete and independently verify the narrow component that is meaningfully differentiated: lossless Polymarket capture plus fail-closed run certification.
 
-## Phase 1 work packages
+No production replay, modelling, paper execution, wallet support, or authenticated client work may merge before the recorder contract freezes.
 
-### P1-WP01: Real public compatibility fixture
+## P0-WP01: Identity and envelope contract
 
-- run the manual read-only smoke workflow;
-- capture a current Gamma response and live WebSocket shapes;
-- sanitize only identifiers that are genuinely sensitive or excessive;
-- retain realistic timing, field, array, and numeric representations;
-- add contract tests against the real shape.
+Required outcomes:
 
-### P1-WP02: Market rollover recorder
+- stable Gamma market ID across all sources;
+- explicit condition ID;
+- separate source-native identifiers;
+- condition validation on all supported CLOB events;
+- outcome-token identity preservation;
+- frame and message indexing;
+- exact raw frame and raw message text;
+- schema-versioned fixtures and documentation.
 
-- discover the next five-minute market before the current market closes;
-- preserve separate run/market boundaries;
-- never mix token IDs across markets;
-- support a controlled multi-market capture session;
-- emit explicit rollover lifecycle events.
+## P0-WP02: Message identity and duplicate semantics
 
-### P1-WP03: Capture supervisor
+Required outcomes:
 
-- add restart policy and process-level health checks;
-- preserve incomplete runs rather than overwriting them;
-- support clean recovery after process restart;
-- report storage capacity and write failures;
-- keep all functionality read-only.
+- every external message is retained;
+- duplicate classification is message-level rather than only frame-level;
+- a rejected first occurrence cannot poison a later valid retransmission;
+- duplicates identify the prior successfully applied sequence;
+- confirmed duplicates do not mutate derived state twice;
+- duplicate behavior is reproducible from recorded evidence.
 
-### P1-WP04: Capture validation command
+## P0-WP03: Feed lifecycle, gaps and resynchronization
 
-Add a local command such as:
+Required outcomes:
 
-```bash
-pnpm market:validate-run --run <path>
-```
+- socket-open state is distinct from usable-data state;
+- stale but open sockets reconnect;
+- a gap ends only after validated current-generation data;
+- closed and open gaps remain in cumulative health output;
+- a CLOB interruption requires new snapshots for both outcome books;
+- stale-generation callbacks cannot close a newer gap or overwrite active generation state.
 
-It must validate:
+## P0-WP04: Book-health projection
 
-- file presence;
-- schema versions;
-- JSONL integrity;
-- event-count agreement;
-- sequence continuity;
-- frame/message indexing;
-- identity consistency;
-- initial snapshots;
-- reference observations;
-- closed and unresolved gaps;
-- final capture assessment.
+Required outcomes:
 
-### P1-WP05: Compact archival format
+- explicit `UNINITIALIZED`, `SYNCHRONIZED`, `STALE`, `INVALID`, and `RESYNC_REQUIRED` states;
+- complete snapshot required before deltas;
+- validate-before-mutate transactionality;
+- exact decimal price and quantity handling;
+- unknown token, invalid side, negative size, duplicate level, and invalid price rejection;
+- `NORMAL`, `LOCKED`, and `CROSSED` integrity classifications;
+- cumulative transient crossed-book incidents;
+- current-generation snapshot requirements.
 
-- add an optional immutable compressed archive of a completed run;
-- preserve canonical JSONL as the source of truth;
-- include checksums in the manifest;
-- verify archive extraction and checksum reproduction.
+This projection is a recorder-health mechanism. It is not the long-term full trading engine.
 
-## Phase 1 concurrency
+## P0-WP05: Chainlink quality semantics
 
-After recorder schema v2 freezes:
+Required outcomes:
 
-- P1-WP01, P1-WP02, P1-WP03, and P1-WP04 may proceed concurrently;
-- P1-WP05 depends on P1-WP04's validation contract.
+- payload timestamp preferred when available;
+- top-level and payload timestamps both retained;
+- receipt time and source time preserved;
+- duplicate reference observations do not refresh final quality;
+- missing timestamp, stale source, future source skew, and local receipt-time skew fail closed;
+- historical anomalies are cumulative;
+- every historical observation uses the configured staleness and skew policy;
+- recorder health and independent verification produce the same anomaly result.
 
-## Phase 1 exit gate
+## P0-WP06: Capture assessment and independent verifier
 
-- one real public capture is retained as evidence;
-- both token snapshots and multiple Chainlink observations are present;
-- the capture validator marks it replay-usable;
-- market rollover works without identity mixing;
+Required outcomes:
+
+- process completion is separate from replay usability;
+- machine-readable quality-failure codes;
+- failed processes cannot be replay-usable;
+- malformed events, gaps, stale state, invalid books, crossed incidents, missing snapshots, and reference anomalies prevent `COMPLETE`;
+- `events.jsonl` sequence, identity, counts, timestamps, and schema versions are validated;
+- manifest and health fields agree;
+- final book keys match the discovered Up and Down token IDs;
+- reference quality is recomputed from events rather than trusted from self-reported health.
+
+## P0-WP07: Public smoke and freeze evidence
+
+Required evidence:
+
+- current Gamma response shape;
+- current CLOB V2 snapshots and updates;
+- multiple valid Chainlink observations;
+- no authenticated calls;
+- no order placement;
+- `captureStatus: COMPLETE`;
+- `usableForReplay: true`;
+- zero quality failures;
+- zero malformed events;
+- zero open or closed gaps;
+- current-generation synchronized books;
+- independent verification success;
+- retained workflow artifact.
+
+## Phase-0 exit gate
+
+All of the following must be true:
+
+- every open P0 review finding is closed;
+- schema v2 and quality-failure meanings are documented;
+- fixtures are current and versioned;
+- the TypeScript CI and build are green;
+- the independent verifier passes a retained live smoke artifact;
+- no known path can report `COMPLETE` while a published health field reports invalid or stale data;
+- no authenticated dependency, endpoint, credential, or order capability is required;
+- a freeze commit is recorded in this roadmap.
+
+# Phase 1: Continuous public capture operations
+
+## Objective
+
+Turn the frozen recorder into a reliable read-only data service without expanding it into a trading engine.
+
+## Work packages
+
+### P1-WP01: Market rollover
+
+- discover the next BTC five-minute market before the current market closes;
+- preserve strict run and market boundaries;
+- never mix condition or token identities across markets;
+- record explicit rollover lifecycle events;
+- handle unavailable or ambiguous next markets fail closed.
+
+### P1-WP02: Capture supervisor
+
+- restart policy;
+- process health and readiness;
+- storage-capacity checks;
+- preservation of incomplete runs;
+- recovery without overwriting evidence;
+- bounded failure escalation.
+
+### P1-WP03: Immutable archival and indexing
+
+- canonical JSONL remains source of truth;
+- optional compressed immutable archive;
+- checksums in the manifest;
+- searchable run index;
+- extraction and checksum reproduction tests.
+
+### P1-WP04: Coverage and operations report
+
+- captured markets versus expected markets;
+- complete versus partial versus unusable counts;
+- gaps, stale incidents, malformed events, and crossed incidents;
+- Chainlink observation coverage;
+- storage growth and retention projections.
+
+## Phase-1 exit gate
+
+- supervised multi-market capture succeeds;
+- rollover identity remains correct;
+- incomplete captures remain preserved and classified;
+- archives reproduce canonical checksums;
 - no authenticated interface is used.
 
-# Phase 2: Deterministic replay and canonical market state
+# Phase 2: Open-source platform and adapter spike
 
 ## Objective
 
-Reconstruct the exact observable state sequence from a saved run without external network calls.
+Prove which downstream capabilities should be adopted rather than built.
 
-## Phase 2 work packages
+This phase is mandatory. A generic custom replay, matching, accounting, or live engine may not proceed around it.
 
-### P2-WP01: Replay input validator and deterministic clock
+## P2-WP01: Platform evaluation
 
-- accept only local saved runs;
-- reject unsupported schema versions or provide explicit migration;
-- validate all run invariants before replay;
-- implement a deterministic clock using recorded timestamps;
-- expose controlled ordering rules for ties.
+Evaluate current maintained versions and licenses of:
 
-### P2-WP02: Full order-book reconstruction
+- NautilusTrader and its Polymarket integration;
+- current official unified Polymarket SDKs;
+- official RTDS tooling;
+- OpenMarket as a research and data-methodology reference;
+- credible Polymarket backtesting projects;
+- optional on-chain fill indexing projects.
 
-- reconstruct independent Up and Down books;
-- require valid snapshots before deltas;
-- maintain sorted levels using decimal-safe representations;
-- check nonnegative depth, valid prices, and uncrossed books;
-- mark state unavailable through gaps and invalid periods.
+Record versions, commits, licenses, maintenance status, supported APIs, raw-data access, catalog support, replay support, execution support, limitations, and operational risks.
 
-### P2-WP03: Reference-price reconstruction
+Deliver:
 
-- reconstruct the latest valid Chainlink state;
-- preserve source/receive/process timestamps;
-- expose data age and latency fields;
-- do not invent observations within gaps.
-
-### P2-WP04: Canonical `MarketState` schema
-
-Define and freeze a versioned state such as:
-
-```ts
-type MarketStateV1 = {
-  schemaVersion: 1;
-  runId: string;
-  sequence: number;
-  marketId: string;
-  conditionId: string;
-  observedAt: number;
-  marketOpenAt: number;
-  marketCloseAt: number;
-  millisecondsRemaining: number;
-  openingReferencePrice: string | null;
-  currentReferencePrice: string | null;
-  distanceFromOpenBps: string | null;
-  upBook: TokenBookState;
-  downBook: TokenBookState;
-  dataQuality: MarketStateQuality;
-};
+```text
+docs/open-source-platform-evaluation.md
 ```
 
-### P2-WP05: Replay checkpoints and canonical output
+## P2-WP02: Versioned adapter contract
 
-- output deterministic state-change JSONL;
-- provide periodic checkpoints for fast seeking;
-- include code, schema, configuration, and input checksums;
-- produce byte-identical output for identical inputs.
+Define normalized records independent of any engine-specific classes:
 
-### P2-WP06: Replay diagnostics report
+```text
+NormalizedInstrument
+NormalizedBookSnapshot
+NormalizedBookDelta
+NormalizedTrade
+NormalizedReferencePrice
+NormalizedLifecycleEvent
+NormalizedAuditEvent
+```
 
-- state counts;
-- unavailable periods;
-- gaps;
-- book invalidations;
-- crossed-book attempts;
-- reference-feed age;
-- time coverage;
-- checksum results.
+Every record retains source-envelope lineage.
 
-## Phase 2 concurrency
+Deliver:
 
-- P2-WP01 must establish the replay runner and clock first.
-- P2-WP02 and P2-WP03 may then proceed concurrently.
-- P2-WP04 is contract-owner work and integrates both state streams.
-- P2-WP05 and P2-WP06 proceed after the state contract freezes.
+```text
+docs/nautilus-adapter-contract.md
+```
 
-## Phase 2 exit gate
+The file name may be generalized later if Nautilus is rejected, but the contract must remain engine-independent.
 
-- no replay command performs network I/O;
-- order books and Chainlink state reconstruct deterministically;
-- identical inputs produce byte-identical canonical output;
-- gaps and unavailable periods remain explicit;
-- malformed fixtures fail with stable reason codes.
+## P2-WP03: Catalog conversion proof
 
-# Phase 3: Research dataset and settlement labels
+- read only verified schema-v2 runs;
+- convert snapshots, deltas, trades, metadata, Chainlink reference prices, and lifecycle boundaries;
+- retain unsupported and audit-only events in a sidecar stream;
+- preserve decimal precision;
+- create a local catalog using the candidate engine's standard format;
+- report every converted, audit-only, ignored, and failed event.
+
+## P2-WP04: Deterministic replay proof
+
+Replay the same catalog twice in independent processes and compare hashes for:
+
+- normalized inputs;
+- Up book evolution;
+- Down book evolution;
+- final books;
+- reference-price stream;
+- strategy-visible stream;
+- deterministic no-order or intent-only strategy output.
+
+## P2-WP05: Cross-engine and recorder comparison
+
+Compare the selected engine's reconstructed final state against an independent reconstruction from schema-v2 evidence.
+
+At minimum compare:
+
+- token identity;
+- best bid and ask;
+- bid and ask depth counts;
+- final integrity;
+- last applicable source sequence;
+- complete depth when exposed by both sides.
+
+## P2-WP06: Adoption decision
+
+Deliver:
+
+```text
+docs/nautilus-adoption-decision.md
+```
+
+Use exactly one conclusion:
+
+```text
+ADOPT
+ADOPT_WITH_CUSTOM_ADAPTER
+DO_NOT_ADOPT
+```
+
+A `DO_NOT_ADOPT` conclusion must identify the concrete contract failures that justify custom implementation.
+
+## Phase-2 exit gate
+
+- an executable conversion exists;
+- source lineage is preserved;
+- Chainlink remains semantically distinct from trades and quotes;
+- two independent replays produce identical hashes;
+- final-book differences are resolved or documented as blockers;
+- CI runs the spike;
+- a formal adoption decision is approved.
+
+# Phase 3: Deterministic normalization, catalog and replay
 
 ## Objective
 
-Convert replayed state into leakage-safe, auditable training and evaluation data.
+Productionize the selected architecture from Phase 2.
 
-## Phase 3 work packages
+## Rules
 
-### P3-WP01: Opening and closing reference determination
+- Keep schema-v2 run directories immutable.
+- Persist an engine-independent normalized contract before engine-native serialization.
+- Do not make Nautilus or another framework's Python classes the only durable representation.
+- Do not perform network I/O during replay.
+- Do not discard unsupported source events silently.
+- Maintain exact lineage from normalized records to recorder sequence and message identity.
 
-- formalize how the contract's opening and ending Chainlink values are selected;
-- preserve surrounding observations and selection evidence;
-- distinguish observed boundary values from inferred approximations;
-- mark markets unusable when settlement-aligned values cannot be established reliably.
+## Work packages
 
-### P3-WP02: Resolution and label ingestion
+### P3-WP01: Cross-language schema governance
 
-- obtain and persist official market resolution;
+Choose and implement a single versioned validation mechanism, such as JSON Schema generated from source definitions, that can be consumed by TypeScript and Python without divergent handwritten semantics.
+
+### P3-WP02: Production converter
+
+- streaming input;
+- bounded memory;
+- deterministic sorting and tie rules;
+- explicit duplicate handling;
+- lifecycle and gap boundaries;
+- conversion reports and checksums;
+- catalog round-trip tests.
+
+### P3-WP03: Reference-price custom data
+
+Represent Chainlink observations as a dedicated data type. Do not misrepresent them as Polymarket trades, token quotes, marks, or fills.
+
+### P3-WP04: Canonical market-state output
+
+Expose a versioned engine-independent state containing:
+
+- run and source sequence;
+- market and condition identity;
+- event and market-relative time;
+- opening and current reference price;
+- Up and Down book state;
+- gap and data-quality state;
+- lineage pointers.
+
+### P3-WP05: Replay diagnostics
+
+- input and output hashes;
+- unavailable periods;
+- gaps and resynchronizations;
+- crossed and locked states;
+- reference age and anomalies;
+- unsupported events;
+- catalog coverage;
+- final-book comparison.
+
+## Phase-3 exit gate
+
+- no replay command uses external network access;
+- independent processes produce identical hashes;
+- every normalized event has source lineage;
+- catalog serialization preserves required precision;
+- final state agrees with the recorder or an approved independent reconstruction;
+- unsupported events are explicit.
+
+# Phase 4: Settlement labels and research dataset
+
+## Objective
+
+Convert deterministic replay state into auditable, leakage-safe research data.
+
+## Work packages
+
+### P4-WP01: Opening and closing reference selection
+
+- formalize contract boundary rules;
+- preserve surrounding Chainlink observations;
+- distinguish observed values from approximations;
+- quarantine markets without defensible boundary values.
+
+### P4-WP02: Official outcome and resolution
+
+- persist official resolution evidence;
 - define Up and Down exactly as the contract specifies;
-- reconcile official outcome with reconstructed boundary values;
+- reconcile official outcome with reconstructed reference boundaries;
 - quarantine disagreements.
 
-### P3-WP03: Feature-window builder
+### P4-WP03: Feature windows
 
-- generate features only from information available at the forecast timestamp;
-- support multiple decision horizons within each five-minute interval;
-- preserve feature timestamp, source timestamp, and latest allowed source event;
-- prevent settlement and post-decision leakage.
+- use only information available at the decision timestamp;
+- support multiple decision horizons;
+- preserve latest source sequence and source timestamp;
+- prevent post-decision and settlement leakage.
 
-### P3-WP04: Dataset storage
+### P4-WP04: Dataset storage
 
-- add Parquet for high-volume research data;
-- optionally use DuckDB for local analysis;
-- retain links back to run, sequence, frame, market, and raw evidence;
-- version dataset schemas and transformation code.
+- Parquet for bulk research data;
+- DuckDB or equivalent for local analysis;
+- schema and transformation versions;
+- links back to run, event, frame, and raw evidence.
 
-### P3-WP05: Dataset audit
+### P4-WP05: Optional on-chain fill evidence
+
+Use an on-chain indexing source to validate executed-trade history where useful. Treat it as complementary to, not a replacement for, off-chain CLOB evidence.
+
+### P4-WP06: Dataset audit
 
 - missingness;
 - feed age;
 - spread and depth distributions;
 - volatility regimes;
 - class balance;
-- invalid or unresolved markets;
-- overlap between train, validation, and test periods;
-- leakage checks.
+- unusable-market reasons;
+- split overlap;
+- leakage tests.
 
-## Phase 3 concurrency
+## Phase-4 exit gate
 
-P3-WP01 and P3-WP02 may run concurrently but must agree before labels are accepted. P3-WP03 and P3-WP04 may proceed against provisional schemas, but final merge waits for the label contract. P3-WP05 merges last.
-
-## Phase 3 exit gate
-
-- every row traces to a replay sequence and raw run;
+- every row traces to replay and raw evidence;
 - chronological splits are explicit;
-- outcome labels reconcile with official resolution;
-- no post-decision feature is included;
-- unusable markets are retained in audit output but excluded from modelling.
+- outcomes reconcile with official resolution;
+- no future feature is present;
+- unusable markets remain visible in audit output and excluded by predefined rules.
 
-# Phase 4: Probability baselines and calibration
+# Phase 5: Probability models and calibration
 
 ## Objective
 
-Estimate calibrated probabilities, not merely Up/Down classifications.
+Estimate calibrated outcome probabilities rather than only classifications.
 
 ## Forecast contract
 
-Freeze a contract similar to:
+A versioned forecast must include:
 
-```ts
-type ProbabilityForecastV1 = {
-  schemaVersion: 1;
-  marketId: string;
-  decisionSequence: number;
-  generatedAt: number;
-  featureTimestamp: number;
-  modelName: string;
-  modelVersion: string;
-  pUp: string;
-  uncertainty: string | null;
-  calibrationVersion: string | null;
-  diagnostics: Record<string, JsonValue>;
-};
+```text
+market_id
+decision_sequence
+generated_at
+feature_timestamp
+model_name
+model_version
+p_up
+uncertainty
+calibration_version
+dataset_version
+code_commit
+diagnostics
 ```
 
-## Phase 4 work packages
+## Work packages
 
-### P4-WP01: No-information and market baselines
+### P5-WP01: Baselines
 
 - 50% baseline;
-- current executable-price or midpoint baseline clearly labeled;
+- clearly labelled market-price baseline;
 - time-and-distance analytical baseline where justified;
-- no claim that market price is ground truth.
+- no treatment of market price as outcome ground truth.
 
-### P4-WP02: Transparent statistical baseline
+### P5-WP02: Transparent statistical model
 
-- logistic regression or similarly interpretable model;
-- walk-forward fitting;
-- regularization selected without test-set reuse;
+- logistic regression or similar interpretable baseline;
+- regularization without test-set reuse;
+- walk-forward estimation;
 - coefficient and stability reports.
 
-### P4-WP03: Tree or nonlinear baseline
+### P5-WP03: Bounded nonlinear model
 
-- one bounded nonlinear model;
+- one justified nonlinear baseline;
 - controlled hyperparameter search;
-- chronological validation only;
-- feature-importance stability checks.
+- chronological validation;
+- feature-importance and regime stability.
 
-### P4-WP04: Calibration
+### P5-WP04: Calibration
 
 - reliability diagrams;
 - Brier score;
 - log loss;
 - expected calibration error;
 - calibration by time remaining and volatility regime;
-- post-hoc calibration fitted only on designated calibration periods.
+- calibration fit only on designated periods.
 
-### P4-WP05: Model registry and reproducibility
+### P5-WP05: Model registry
 
-- model artifact checksums;
-- training dataset version;
-- feature schema version;
+- model and dataset checksums;
+- feature schema;
+- training and evaluation periods;
 - code commit;
+- dependency versions;
 - random seed;
-- evaluation period;
-- rejected or unsupported model versions.
+- rejected versions and reasons.
 
-## Phase 4 concurrency
+## Phase-5 exit gate
 
-Baseline model work packages may proceed concurrently against the frozen dataset schema. P4-WP04 owns shared calibration utilities. P4-WP05 owns the registry contract and merges before final model reports.
-
-## Phase 4 exit gate
-
-- untouched chronological test periods remain untouched until final evaluation;
-- forecasts remain within `[0,1]`;
-- calibration is evaluated separately from directional accuracy;
-- performance is compared with market-based baselines;
+- final chronological periods remain untouched until evaluation;
+- forecasts remain bounded;
+- calibration and directional discrimination are reported separately;
+- market-based baselines are included;
 - no profitability claim is made without execution simulation.
 
-# Phase 5: Policy engine
+# Phase 6: Policy and risk decision layer
 
 ## Objective
 
-Convert forecasts and observable state into auditable actions under explicit objectives and constraints.
+Convert forecasts and observable state into auditable intended actions under explicit objectives and constraints.
 
-## Policy action contract
+## Required action types
 
-```ts
-type PolicyActionV1 =
-  | { type: "ABSTAIN"; reasonCodes: string[] }
-  | {
-      type: "PLACE_ORDER";
-      token: "UP" | "DOWN";
-      side: "BUY" | "SELL";
-      orderStyle: "TAKER_FAK" | "TAKER_FOK" | "MAKER_GTC" | "MAKER_GTD";
-      limitPrice: string;
-      quantity: string;
-      expiresAt: number | null;
-      reasonCodes: string[];
-    }
-  | { type: "CANCEL_ORDER"; orderId: string; reasonCodes: string[] }
-  | { type: "CANCEL_ALL"; reasonCodes: string[] };
+```text
+ABSTAIN
+PLACE_ORDER_INTENT
+CANCEL_ORDER_INTENT
+CANCEL_ALL_INTENT
 ```
 
-## Phase 5 work packages
+The policy does not call a Polymarket SDK or execution client.
 
-### P5-WP01: Expected-value primitives
+## Work packages
 
-- executable depth-weighted acquisition cost;
-- fee schedule input;
-- spread and slippage estimates;
-- conservative probability bound;
+### P6-WP01: Expected-value primitives
+
+- executable depth-weighted price;
+- fees;
+- spread and slippage buffer;
+- uncertainty-adjusted probability;
 - all-in break-even probability;
-- decimal-safe arithmetic.
+- exact decimal arithmetic.
 
-### P5-WP02: Reference abstaining policy
+### P6-WP02: Reference abstaining policy
 
-- buy Up only above conservative all-in break-even;
-- buy Down only above conservative all-in break-even;
+- buy only above conservative all-in break-even;
 - abstain otherwise;
-- reject stale, gapped, invalid, or incomplete state;
-- enforce pre-close safety window.
+- reject stale, gapped, invalid, incomplete, or low-depth state;
+- enforce time-remaining restrictions.
 
-### P5-WP03: Portfolio and sizing interface
+### P6-WP03: Sizing and portfolio constraints
 
 - no-position baseline;
-- fixed-notional sizing;
-- capped fractional Kelly as an optional research policy;
-- strict maximum exposure and drawdown inputs;
-- no sizing method may bypass risk checks.
+- fixed-notional baseline;
+- optional capped fractional Kelly for research only;
+- maximum order, market, session, and total exposure;
+- drawdown and loss limits.
 
-### P5-WP04: Policy explanation record
+### P6-WP04: Explanation record
 
-Persist every input and intermediate calculation:
+Persist the forecast, uncertainty, book levels, fees, slippage, expected value, risk checks, final action, and reason codes.
 
-- forecast and uncertainty;
-- executable book levels used;
-- fee version;
-- slippage buffer;
-- expected gross and net value;
-- risk checks;
-- final action and reason codes.
+### P6-WP05: Policy evaluation
 
-### P5-WP05: Policy evaluation
-
-- action rate and abstention rate;
+- action and abstention rates;
 - edge distribution;
-- sensitivity to uncertainty margin;
-- sensitivity to fee and slippage assumptions;
-- stability across regimes.
+- parameter sensitivity;
+- regime stability;
+- data-quality exclusion rates.
 
-## Phase 5 concurrency
-
-P5-WP01 and the action contract merge first. P5-WP02 and P5-WP03 may then proceed concurrently. P5-WP04 is shared audit infrastructure. P5-WP05 merges after all policy variants stabilize.
-
-## Phase 5 exit gate
+## Phase-6 exit gate
 
 - every action is reproducible;
-- abstention works and is tested;
-- policy never consumes future state;
-- policy uses executable depth rather than only midpoint;
-- policy has no network or SDK dependency.
+- abstention is tested;
+- no future state is consumed;
+- executable depth is used;
+- the policy has no network or SDK dependency;
+- risk checks cannot be bypassed by order splitting or repeated intents.
 
-# Phase 6: Paper execution and accounting
+# Phase 7: Paper execution and accounting
 
 ## Objective
 
-Simulate orders, fills, positions, fees, and settlement under explicit conservative assumptions.
+Use the selected mature trading engine where possible to simulate orders, fills, positions, fees, and settlement under conservative Polymarket-specific assumptions.
 
-## Phase 6 work packages
+## Work packages
 
-### P6-WP01: Aggressive FAK/FOK simulator
+### P7-WP01: Engine integration
 
-- walk contemporaneous asks or bids;
-- respect limits and available depth;
-- implement partial fills for FAK;
-- require complete fills for FOK;
-- apply current fee configuration;
-- produce deterministic fills.
+- map policy intents into engine-native orders;
+- preserve intent and source lineage;
+- prohibit authenticated clients;
+- maintain deterministic clocks and seeds.
 
-### P6-WP02: Passive-order simulation bands
+### P7-WP02: Aggressive-order simulation
+
+- walk contemporaneous executable depth;
+- implement FAK partial fills;
+- enforce FOK full-or-zero;
+- apply fee configuration;
+- model latency and unavailable depth conservatively.
+
+### P7-WP03: Passive-order assumption bands
 
 Because exact queue position is generally unavailable:
 
-- conservative fill model;
-- neutral or evidence-based intermediate model;
+- conservative lower-bound model;
+- evidence-based intermediate model;
 - optimistic upper bound;
-- clear labels on every result;
-- no optimistic result may be described as realized performance.
+- explicit labels on every report.
 
-### P6-WP03: Portfolio accounting
+### P7-WP04: Portfolio and settlement
 
 - cash;
-- inventory by token and market;
+- inventory;
 - reserved capital;
-- average acquisition cost;
+- average cost;
 - realized and unrealized P&L;
 - fees;
-- settlement;
-- void or cancellation handling.
+- settlement and void handling;
+- accounting identities.
 
-### P6-WP04: Risk engine
+### P7-WP05: Independent comparison
 
-- maximum order notional;
-- maximum market exposure;
-- maximum total exposure;
-- maximum daily and session loss;
-- minimum expected net edge;
-- maximum data age;
-- minimum time remaining;
-- maximum spread and slippage;
-- circuit breakers;
-- duplicate-order protection.
+Compare selected fixtures against a second implementation or a narrow independent checker. Discrepancies in fills, cash, inventory, fees, or settlement block conclusions.
 
-### P6-WP05: Independent simulator comparison
-
-Use an independent implementation or framework, potentially NautilusTrader, as a benchmark for selected fixtures. The project remains authoritative for its own domain contracts, but discrepancies in fills, fees, cash, inventory, or settlement must block conclusions until resolved.
-
-### P6-WP06: Paper report
+### P7-WP06: Paper report
 
 - gross and net P&L;
 - fees and slippage;
-- exposure through time;
-- maximum drawdown;
-- return on capital at risk;
-- results by time remaining, spread, depth, and volatility;
-- maker-fill assumption sensitivity;
-- forecast metrics separately from trading metrics.
+- exposure and drawdown;
+- capital at risk;
+- results by time remaining, spread, depth, and regime;
+- maker-assumption sensitivity;
+- forecast metrics separated from trading metrics.
 
-## Phase 6 concurrency
-
-P6-WP01, P6-WP02, and P6-WP03 can begin concurrently against a frozen execution schema, but final accounting tests must integrate all order types. P6-WP04 may proceed independently. P6-WP05 and P6-WP06 merge after the core simulator stabilizes.
-
-## Phase 6 exit gate
+## Phase-7 exit gate
 
 - deterministic fill fixtures pass;
-- FOK is full-or-zero;
-- accounting identities reconcile;
+- FOK behavior is correct;
+- accounting reconciles;
 - settlement is correct;
-- conservative results remain positive before any edge claim;
-- independent comparison discrepancies are resolved or documented as blockers.
+- conservative assumptions are primary;
+- independent discrepancies are resolved;
+- no authenticated endpoint is required.
 
-# Phase 7: Continuous paper and shadow operation
+# Phase 8: Continuous shadow operation
 
 ## Objective
 
-Run the complete public-data, forecast, policy, and paper-execution pipeline continuously without authenticated trading.
+Run capture, normalization, forecasting, policy, and paper execution continuously without authenticated trading.
 
-## Phase 7 work packages
+## Work packages
 
-### P7-WP01: Runtime orchestration
+### P8-WP01: Orchestration
 
-- automatic market rollover;
+- market rollover;
 - restart recovery;
-- single active policy decision stream;
+- one active decision stream;
 - idempotent decisions;
-- process supervision;
-- graceful shutdown.
+- graceful shutdown;
+- process supervision.
 
-### P7-WP02: Operational storage
+### P8-WP02: Operational storage
 
-- PostgreSQL for run metadata, forecasts, decisions, simulated orders, fills, positions, and incidents;
-- Parquet for bulk ticks and research states;
-- schema migrations;
-- retention policy;
-- backup and restore test.
+- run and incident metadata;
+- forecasts and policy decisions;
+- simulated orders and fills;
+- positions and reports;
+- bulk event/catalog retention;
+- migration, backup, and restore tests.
 
-### P7-WP03: Observability
+### P8-WP03: Observability
 
-- structured logs;
-- health and readiness endpoints;
-- event lag;
-- feed age;
-- reconnect counts;
-- book invalidation counts;
+- feed age and event lag;
+- reconnects and gaps;
+- book and reference anomalies;
 - forecast and decision latency;
-- paper order and fill metrics;
-- current risk state.
+- simulated order state;
+- current risk state;
+- capture and replay coverage.
 
-### P7-WP04: Daily and session reports
+### P8-WP04: Long-running failure tests
 
-- market coverage;
-- data-quality exclusions;
-- forecast calibration;
-- policy actions;
+- forced disconnects;
+- slow or failed storage;
+- malformed frames;
+- unavailable Gamma;
+- stale Chainlink;
+- process restart during a market;
+- rollover races;
+- disk exhaustion;
+- catalog corruption.
+
+### P8-WP05: Daily reports
+
+- market coverage and exclusions;
+- calibration;
+- decisions and abstentions;
 - simulated fills;
 - P&L and drawdown;
 - assumption sensitivity;
 - operational incidents.
 
-### P7-WP05: Long-running reliability tests
+## Phase-8 exit gate
 
-- forced disconnects;
-- slow storage;
-- malformed frames;
-- unavailable Gamma;
-- stale Chainlink;
-- process restart during an open market;
-- rollover race conditions;
-- disk exhaustion simulation.
-
-## Phase 7 exit gate
-
-- stable multi-day paper operation;
+- stable multi-day operation;
 - no silent gaps;
-- restart recovery is demonstrated;
-- reports reconcile with stored events;
+- restart recovery demonstrated;
+- reports reconcile to stored artifacts;
 - kill and shutdown procedures work;
-- no wallet or authenticated endpoint is required.
+- no wallet or authenticated endpoint is needed.
 
-# Phase 8: Dormant authenticated live adapter
+# Phase 9: Dormant authenticated adapter
 
 ## Objective
 
-Implement, but do not enable by default, the authenticated execution boundary using the current official Polymarket SDK and CLOB V2 order workflows.
+Implement an authenticated boundary using the current official Polymarket SDK or a proven adopted engine adapter, but keep it disabled by default.
 
-## Phase 8 work packages
+## Work packages
 
-### P8-WP01: Official SDK gateway
+### P9-WP01: Gateway and dependency pinning
 
-- pin the official unified SDK exactly;
-- wrap it behind a local gateway interface;
+- pin exact versions;
 - isolate SDK-native types;
-- add contract tests for supported wallet and order configurations;
-- document upgrade procedure.
+- define supported wallet and order configurations;
+- add contract tests and upgrade procedure;
+- compare official SDK and engine-adapter behavior.
 
-### P8-WP02: Secret and identity boundary
+### P9-WP02: Secrets and identity
 
-- separate live configuration and secret namespace;
-- prevent secrets from entering logs, fixtures, reports, or CI;
-- define supported wallet type explicitly;
-- fail closed on identity mismatch.
+- isolated secret namespace;
+- no secrets in logs, fixtures, reports, or CI;
+- explicit wallet identity;
+- fail closed on mismatch.
 
-### P8-WP03: Order lifecycle adapter
+### P9-WP03: Order lifecycle and reconciliation
 
-- submit;
-- acknowledge;
-- reject;
-- partially fill;
-- fill;
-- cancel;
-- expire;
-- reconcile ambiguous submissions before retry;
-- maintain unique local correlation IDs.
+- submit, acknowledge, reject, partially fill, fill, cancel, and expire;
+- unique local correlation IDs;
+- ambiguous-submission reconciliation before retry;
+- user-stream and REST reconciliation;
+- stop on mismatch.
 
-### P8-WP04: Authenticated user stream and reconciliation
+### P9-WP04: Heartbeat and emergency controls
 
-- process order and trade updates;
-- periodically reconcile against REST state;
-- reconcile after reconnect;
-- detect duplicate or missing fills;
-- stop trading on mismatch.
+- required heartbeat mechanism;
+- cancel-all;
+- cancel on shutdown, stale data, auth failure, or reconciliation failure;
+- local and remote kill switches.
 
-### P8-WP05: Heartbeat and emergency cancellation
+### P9-WP05: Compliance and availability gate
 
-- official heartbeat mechanism when required;
-- explicit cancel-all;
-- cancel on controlled shutdown;
-- cancel on stale market data;
-- cancel on auth failure;
-- local and remote kill-switch pathways.
-
-### P8-WP06: Compliance and geoblock gate
-
-- perform the current official availability/geoblock check;
-- never bypass or evade geographic restrictions;
-- disable live submission when unavailable;
-- record gate result without exposing sensitive data.
+- current official availability or geoblock check;
+- no evasion of restrictions;
+- disable submission when unavailable;
+- retain a non-sensitive gate result.
 
 ## Mandatory live gates
-
-Live order placement must require all of the following independently:
 
 ```text
 MODE=LIVE
 LIVE_TRADING_ENABLED=true
 explicit command-line confirmation
-valid authenticated credentials
-successful compliance/geoblock check
+valid credentials and expected wallet identity
+successful compliance/availability check
 healthy CLOB stream
 healthy Chainlink stream
-healthy clock
+healthy local clock
 validated market specification
 successful account reconciliation
 nonzero configured limits
 kill switch inactive
 ```
 
-No unit test, integration test, CI job, migration, startup probe, or documentation example may satisfy all gates.
+No test, CI job, fixture, migration, startup probe, or documentation example may satisfy all gates.
 
-## Phase 8 exit gate
+## Phase-9 exit gate
 
-- authenticated adapter tests pass with mocks or approved sandbox-like controls;
-- order reconciliation is deterministic under fixtures;
+- authenticated behavior is verified with mocks or approved controlled environments;
+- reconciliation is deterministic under fixtures;
 - live mode remains disabled by default;
 - CI cannot access live secrets;
-- no live order is required to complete this phase.
+- no live order is required.
 
-# Phase 9: Limited live pilot and production hardening
+# Phase 10: Limited live pilot and hardening
 
 ## Objective
 
-Only after a separate explicit decision, operate a tightly limited live pilot and determine whether the system is economically and operationally viable.
+Only after a separate explicit decision, run a tightly limited pilot and determine whether the system is economically, operationally, and legally viable.
 
 ## Prerequisites
 
-- legal and compliance review completed;
-- account and geographic eligibility confirmed;
-- continuous paper results reviewed;
-- conservative execution assumptions remain acceptable;
-- explicit capital and loss limits approved;
+- legal, compliance, and geographic eligibility reviewed;
+- continuous paper results approved;
+- conservative assumptions remain acceptable;
+- capital and loss limits approved;
 - incident owner and shutdown procedure assigned;
-- live adapter independently reviewed.
+- live adapter independently reviewed;
+- official SDK and selected engine agree on controlled fixtures.
 
 ## Pilot sequence
 
 1. read-only account reconciliation;
-2. authenticated cancel test with no open exposure where possible;
+2. cancellation and heartbeat validation without exposure where possible;
 3. smallest permitted order notional;
 4. one market at a time;
-5. taker order types before maker assumptions;
-6. manual observation of every order and reconciliation event;
+5. taker orders before maker assumptions;
+6. manual observation of every lifecycle event;
 7. automatic stop after predefined count, loss, or inconsistency;
 8. post-pilot reconciliation against platform records.
 
-## Production-hardening work
+## Production hardening
 
 - deployment isolation;
 - secret rotation;
 - backup and disaster recovery;
-- incident response drills;
-- dependency and SDK upgrade testing;
-- audit logs;
-- operational dashboards;
-- explicit release and rollback procedures;
-- capital scaling rules based on measured slippage and drawdown, not win rate alone.
+- incident drills;
+- dependency and SDK upgrade tests;
+- audit logs and dashboards;
+- release and rollback procedures;
+- capital scaling based on realized slippage and drawdown, not win rate.
 
-## Phase 9 exit gate
+## Phase-10 exit gate
 
-There is no automatic promotion. The project requires a documented go, revise, or stop decision based on:
+There is no automatic promotion. Produce a documented `GO`, `REVISE`, or `STOP` decision based on realized net results, execution quality, calibration stability, drawdown, operational incidents, compliance status, and evidence that results are not caused by optimistic simulation assumptions.
 
-- net realized results;
-- execution quality;
-- calibration stability;
-- drawdown;
-- operational incidents;
-- compliance status;
-- evidence that results are not explained by optimistic simulation assumptions.
+# 10. Shared testing strategy
 
-# 7. Shared testing strategy
+## Unit and contract tests
 
-## 7.1 Unit tests
-
-- decimal parsing and arithmetic;
 - schema validation and migration;
 - identity mapping;
-- frame splitting and hashing;
-- gap state machine;
-- order-book transactionality;
-- replay ordering;
+- raw-frame and array-message splitting;
+- exact decimal handling;
+- duplicate registration timing;
+- feed lifecycle and gap state;
+- book transactionality and integrity;
+- reference timestamp policies;
+- run verification;
+- adapter lineage;
+- catalog serialization;
+- replay ordering and hashing;
 - feature timestamp boundaries;
 - forecast bounds;
 - expected-value calculations;
 - policy abstention;
 - risk checks;
 - fill mechanics;
-- accounting identities;
-- settlement.
+- accounting and settlement.
 
-## 7.2 Property-based tests
+## Property-based and invariant tests
 
 Where practical:
 
-- valid deltas never create negative depth;
-- failed frame validation leaves state unchanged;
-- replay output is deterministic;
-- FOK fills are complete or zero;
-- cash and inventory accounting balances;
+- rejected events leave no partial mutation;
+- duplicate processing creates no duplicate state mutation or fill;
+- valid book changes never create negative depth;
+- replay is deterministic;
+- source lineage is never lost;
+- FOK is complete or zero;
+- cash and inventory balance;
 - probabilities remain bounded;
-- duplicate processing does not create duplicate state mutation or fills;
-- risk limits cannot be bypassed through order splitting.
+- risk limits cannot be bypassed by splitting actions.
 
-## 7.3 Integration tests
+## Integration tests
 
-- public-market discovery fixtures;
-- WebSocket snapshots and changes;
-- array frames;
+- current Gamma and CLOB fixture shapes;
+- multiple messages per frame;
 - disconnect and reconnect;
-- open-but-silent socket;
-- stale reference stream;
+- open-but-silent sockets;
+- old-generation callbacks;
+- stale and malformed reference events;
 - market rollover;
 - interrupted storage;
-- process restart;
+- catalog conversion and round trip;
+- two-process replay;
+- engine-versus-recorder book comparison;
 - settlement;
-- ambiguous order submission and reconciliation in the dormant live phase.
+- ambiguous authenticated submission only in Phase 9 fixtures.
 
-## 7.4 Golden fixtures
+## Golden fixtures
 
-Maintain immutable fixtures for:
+Maintain immutable versioned fixtures for:
 
-- valid real public capture;
+- valid public capture;
 - duplicate transport delivery;
-- same hash with changed size;
+- failed first occurrence and valid retransmission;
 - delta before snapshot;
-- crossed book;
+- CLOB resynchronization;
+- crossed and locked books;
 - malformed decimal;
-- stale stream;
-- unresolved gap;
+- stale, missing, or future-skewed reference timestamp;
+- open and closed gaps;
 - market rollover;
 - official resolution disagreement;
-- aggressive full fill;
-- aggressive partial fill;
+- aggressive full and partial fills;
 - FOK rejection;
-- maker-fill sensitivity.
+- passive-fill sensitivity.
 
-Golden fixtures must carry schema versions and checksums.
+Fixtures carry schema versions and checksums.
 
-## 7.5 Acceptance evidence
+# 11. Data and schema governance
 
-A phase is not complete because code exists. Its PR or release note must include:
-
-- exact commands;
-- exact test results;
-- fixture names and checksums;
-- smoke or long-run evidence where applicable;
-- known limitations;
-- confirmation of excluded capabilities.
-
-# 8. Data and schema governance
-
-## 8.1 Schema changes
-
-Any change to field meaning requires a new schema version. Adding an optional field may remain compatible only when old consumers have defined behavior for its absence.
+A field-meaning change requires a new schema version. An optional addition is compatible only when existing consumers have defined behavior for its absence.
 
 Every schema change requires:
 
@@ -1208,138 +1204,81 @@ Every schema change requires:
 - fixture updates;
 - reader compatibility tests;
 - documentation;
-- handoff note;
-- downstream impact list.
+- downstream impact list;
+- handoff note.
 
-## 8.2 Evidence lineage
+Derived records should retain:
 
-Derived records should eventually retain:
-
-- run ID;
-- market ID;
-- condition ID;
-- source frame ID;
-- source sequence;
-- replay sequence;
-- feature schema version;
-- model version;
+- run, market, condition, token, frame, and source sequence identity;
+- replay and normalized sequence;
+- dataset and feature versions;
+- model and calibration versions;
 - policy version;
-- fee version;
-- simulator version;
+- fee and simulator versions;
+- dependency versions;
 - code commit.
 
-## 8.3 Time semantics
+Use UTC for recorded wall time, monotonic clocks for elapsed local durations, exact source timestamps as provided, signed clock differences, and explicit market-relative time. Local sequence remains the canonical recorder receipt order.
 
-Use:
+# 12. Dependency policy
 
-- UTC wall time for recorded timestamps;
-- monotonic time for local elapsed durations;
-- source timestamps exactly as provided;
-- signed source-to-receive clock difference;
-- explicit event age;
-- explicit market-relative time.
+- Use only current CLOB V2-compatible interfaces.
+- Do not adopt archived CLOB V1 clients.
+- Pin exact SDK and engine versions and commit lock files.
+- Record licenses and distribution implications.
+- Isolate external types behind local interfaces.
+- Add upgrade contract tests.
+- Prefer official SDKs for authenticated protocol behavior.
+- Retain local reliability, raw-evidence, and verification controls even when using official clients.
+- Treat OpenMarket and similar projects as methodology and reusable-code references, not unquestioned production executors.
+- Treat NautilusTrader as the leading downstream candidate, subject to the Phase-2 proof.
+- Do not adopt projects whose central claim is guaranteed profit, whose order model ignores executable prices and fees, or whose credentials and safety boundaries are inadequate.
 
-Do not infer chronological causality solely from wall-clock equality. Local sequence remains the recorder's canonical receipt order.
+# 13. Security and safety boundaries
 
-# 9. Dependency policy
-
-## Preferred use
-
-- direct public WebSocket handling may remain appropriate for the focused recorder;
-- the official unified Polymarket SDK should be introduced only behind a gateway when authenticated execution work begins;
-- the official RTDS client may be evaluated, but it must remain behind a local reliability adapter;
-- OpenMarket may be used as a research and methodology reference, not copied as an assumed production executor;
-- NautilusTrader may be used as an independent paper/accounting benchmark, not as unquestioned ground truth.
-
-## Dependency requirements
-
-- pin exact versions;
-- commit the lockfile;
-- record licenses;
-- add upgrade contract tests;
-- isolate external types;
-- do not adopt archived CLOB V1 clients;
-- do not adopt repositories advertising guaranteed profit as core dependencies.
-
-# 10. Security and safety boundaries
-
-Before the live phase:
+Before Phase 9:
 
 - no private keys;
-- no API credentials;
+- no API credentials capable of trading;
 - no mutating Polymarket requests;
 - no authenticated user channel;
-- no order-signing dependency;
+- no order-signing dependency required by normal CI or research commands;
 - no CI secret capable of placing an order.
 
-The read-only source scan is a useful regression guard, not a formal proof of safety. Runtime architecture, dependency review, network policy, and tests must enforce the boundary as the system grows.
+The read-only source scan is a regression guard, not a complete proof. Runtime network boundaries, dependency review, isolated credentials, and explicit mode gates must enforce safety.
 
-# 11. Research validity checklist
+# 14. Research validity checklist
 
-No performance result should be promoted unless it answers all of the following:
+No performance result is promotable unless:
 
-- Was the evaluation chronological?
-- Was the final test period untouched during model and policy development?
-- Were features available at the decision timestamp?
-- Were contract prices executable bid/ask levels rather than midpoints?
-- Were depth, fees, slippage, latency, partial fills, and missed fills included?
-- Were maker queue assumptions labeled and stress-tested?
-- Were overlapping observations handled appropriately?
-- Were invalid, stale, or unresolved markets excluded through predefined rules?
-- Was calibration evaluated, not only accuracy or win rate?
-- Was P&L separated from forecast quality?
-- Did the result survive reasonable parameter and regime sensitivity checks?
-- Can every trade be reproduced from raw evidence?
+- evaluation is chronological;
+- the final test period was untouched;
+- every feature was available at decision time;
+- executable bids, asks, and depth were used;
+- fees, slippage, latency, partial fills, and missed fills were included;
+- maker assumptions were labeled and stressed;
+- invalid and incomplete captures were excluded by predefined rules;
+- calibration was evaluated separately from accuracy;
+- forecast quality was separated from P&L;
+- parameter and regime sensitivity were tested;
+- every simulated or live trade can be reproduced from source evidence;
+- engine and independent accounting agree.
 
-# 12. Suggested issue structure
+# 15. Immediate execution order
 
-Create one tracking issue per phase and one issue per work package.
+1. Close every remaining P0 review finding on `devin/recorder-schema-v2`.
+2. Run CI, build, and a retained verified public smoke workflow.
+3. Record and approve the recorder schema-v2 freeze commit.
+4. Merge the recorder correction PR without adding replay or authenticated scope.
+5. Start Phase-1 capture operations and the Phase-2 open-source platform spike from the freeze commit. They may proceed concurrently because the spike consumes but does not mutate recorder semantics.
+6. Do not build a generic custom replay, backtester, matching engine, portfolio ledger, or live order manager before the Phase-2 adoption decision.
+7. Productionize the selected adapter and replay architecture in Phase 3.
+8. Begin dataset, model, policy, and execution phases only from their respective frozen contracts.
 
-Suggested labels:
+# 16. Definition of project success
 
-```text
-phase:0 through phase:9
-area:recorder
-area:replay
-area:data
-area:model
-area:policy
-area:execution
-area:risk
-area:operations
-contract-change
-schema-migration
-blocked
-parallel-safe
-acceptance
-```
+The project is successful when it can make a defensible statement of this form:
 
-Each issue should include:
+> Given a verified versioned raw capture, the system can trace every normalized event to source evidence, deterministically reconstruct observable market and reference state, produce a timestamp-valid calibrated probability forecast, apply an explicit auditable policy, simulate or execute an order under documented assumptions and risk limits, and reconcile the resulting position and settlement.
 
-- objective;
-- dependencies;
-- allowed paths;
-- prohibited scope;
-- acceptance criteria;
-- test requirements;
-- phase gate impacted.
-
-# 13. Immediate execution order
-
-The next work should proceed in this order:
-
-1. P0-WP01 envelope identity and schema v2;
-2. launch P0-WP02, P0-WP03, P0-WP04, and P0-WP06 concurrently from the v2 contract branch or freeze commit;
-3. merge those corrections through small PRs;
-4. complete P0-WP05 integration and capture assessment;
-5. run the complete Phase 0 test matrix;
-6. begin P1 public compatibility and capture operations;
-7. do not start deterministic replay implementation until the Phase 0 schema and semantics are accepted.
-
-# 14. Definition of project success
-
-The project is successful when it can make a defensible statement of the following form:
-
-> Given a versioned raw capture, this system can deterministically reconstruct the observable market state, produce a timestamp-valid calibrated probability forecast, apply an explicit auditable policy, simulate or execute an order under documented assumptions and risk limits, and reconcile the resulting position and settlement.
-
-This definition does not require the resulting policy to be profitable. A negative result produced through reliable data, realistic execution, and reproducible analysis is still a valid research outcome.
+This definition does not require profitability. A negative result produced from reliable evidence, mature reused infrastructure, realistic execution, and reproducible analysis is a valid research outcome.
