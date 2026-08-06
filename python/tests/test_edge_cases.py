@@ -552,11 +552,12 @@ def test_deterministic_replay_across_processes(tmp_path: Path) -> None:
     a = json.loads(r1.stdout)["replay"]
     b = json.loads(r2.stdout)["replay"]
     keys = [
-        "inputStreamHash",
+        "sourceCorpusHash",
+        "normalizedEngineInputHash",
+        "strategyVisibleInputHash",
         "finalUpBookHash",
         "finalDownBookHash",
         "referenceStreamHash",
-        "strategyVisibleStreamHash",
         "orderIntentStreamHash",
     ]
     assert all(a[k] == b[k] for k in keys)

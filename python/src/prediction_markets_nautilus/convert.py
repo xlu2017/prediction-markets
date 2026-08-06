@@ -19,6 +19,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .hashes import hash_value
 from .models import (
     Level,
     LifecycleEvent,
@@ -1004,7 +1005,7 @@ def _write_audit_sidecar(cat_dir: Path, audit_rows: list[dict]) -> None:
 
 def _verify_run_directory(run_directory: str | Path, min_reference_observations: int = 5) -> None:
     """Invoke the authoritative TypeScript verifier; fail closed on any rejection."""
-    run_dir = Path(run_directory)
+    run_dir = Path(run_directory).resolve()
     repo_root = Path(__file__).resolve().parents[3]
     args = [
         "src/verify-run.ts",
@@ -1012,17 +1013,40 @@ def _verify_run_directory(run_directory: str | Path, min_reference_observations:
         str(min_reference_observations),
         str(run_dir),
     ]
-    not_found: list[str] = []
-    for base in (["pnpm", "exec", "tsx"], ["npx", "tsx"], ["tsx"]):
+    candidates: list[list[str]] = []
+    pnpm = shutil.which("pnpm")
+    if pnpm:
+        candidates.append([pnpm, "exec", "tsx"])
+    npx = shutil.which("npx")
+    if npx:
+        candidates.append([npx, "tsx"])
+    tsx = shutil.which("tsx")
+    if tsx:
+        candidates.append([tsx])
+    if not candidates:
+        raise RuntimeError("TypeScript verifier not available: no pnpm, npx, or tsx on PATH")
+    for base in candidates:
         try:
             subprocess.run([*base, *args], cwd=repo_root, check=True)
             return
         except FileNotFoundError:
-            not_found.append(base[0])
             continue
         except subprocess.CalledProcessError as e:
             raise ValueError(f"TypeScript verifier rejected run (exit {e.returncode}): {run_dir}") from e
-    raise RuntimeError(f"TypeScript verifier not available: tried {', '.join(not_found)}")
+    raise RuntimeError("TypeScript verifier not available: all candidate runners failed to start")
+
+
+def _source_corpus_hash(run_directory: str | Path) -> str:
+    """Hash the raw events.jsonl lines to prove the normalized corpus is complete."""
+    events_path = Path(run_directory) / "events.jsonl"
+    if not events_path.exists():
+        raise ValueError(f"events.jsonl not found in {events_path}")
+    lines = [
+        line
+        for line in events_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    return hash_value(lines)
 
 
 def convert_run(
@@ -1041,6 +1065,10 @@ def convert_run(
     run = load_run(run_directory)
     normalized = normalize_run(run)
     report = write_catalog(normalized, catalog_directory)
+    source_corpus_hash = _source_corpus_hash(run_directory)
+    (Path(catalog_directory) / "source-corpus-hash.json").write_text(
+        json.dumps({"sourceCorpusHash": source_corpus_hash}, indent=2), encoding="utf-8"
+    )
     # Expected final-book health sidecar for self-contained Phase 9 comparison.
     expected = {
         tid: {
@@ -1058,6 +1086,7 @@ def convert_run(
     (Path(catalog_directory) / "expected-final-books.json").write_text(
         json.dumps(expected, indent=2), encoding="utf-8"
     )
+    report["sourceCorpusHash"] = source_corpus_hash
     return report
 
 

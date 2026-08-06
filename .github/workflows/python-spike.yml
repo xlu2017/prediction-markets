@@ -58,8 +58,15 @@ jobs:
           a = json.load(open(".artifacts/replay-1.json", encoding="utf-8"))
           b = json.load(open(".artifacts/replay-2.json", encoding="utf-8"))
           ra, rb = a["replay"], b["replay"]
-          keys = ["inputStreamHash", "finalUpBookHash", "finalDownBookHash",
-                  "referenceStreamHash", "strategyVisibleStreamHash", "orderIntentStreamHash"]
+          keys = [
+              "sourceCorpusHash",
+              "normalizedEngineInputHash",
+              "strategyVisibleInputHash",
+              "finalUpBookHash",
+              "finalDownBookHash",
+              "referenceStreamHash",
+              "orderIntentStreamHash",
+          ]
           assert all(ra[k] == rb[k] for k in keys), "replay hashes differ across runs"
           assert ra["upBookAfterEachEvent"] == rb["upBookAfterEachEvent"]
           assert ra["downBookAfterEachEvent"] == rb["downBookAfterEachEvent"]

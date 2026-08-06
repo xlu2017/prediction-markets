@@ -66,13 +66,14 @@ class BookState:
 @dataclass
 class ReplayResult:
     run_id: str
-    input_stream_hash: str
+    source_corpus_hash: str
+    normalized_engine_input_hash: str
+    strategy_visible_input_hash: str
     up_book_after_each_event: list[str]
     down_book_after_each_event: list[str]
     final_up_book_hash: str
     final_down_book_hash: str
     reference_stream_hash: str
-    strategy_visible_stream_hash: str
     order_intent_stream_hash: str
     final_up_book: BookState
     final_down_book: BookState
@@ -83,13 +84,14 @@ class ReplayResult:
         return {
             "runId": self.run_id,
             "eventCount": self.event_count,
-            "inputStreamHash": self.input_stream_hash,
+            "sourceCorpusHash": self.source_corpus_hash,
+            "normalizedEngineInputHash": self.normalized_engine_input_hash,
+            "strategyVisibleInputHash": self.strategy_visible_input_hash,
             "upBookAfterEachEvent": self.up_book_after_each_event,
             "downBookAfterEachEvent": self.down_book_after_each_event,
             "finalUpBookHash": self.final_up_book_hash,
             "finalDownBookHash": self.final_down_book_hash,
             "referenceStreamHash": self.reference_stream_hash,
-            "strategyVisibleStreamHash": self.strategy_visible_stream_hash,
             "orderIntentStreamHash": self.order_intent_stream_hash,
             "finalUpBook": _book_to_dict(self.final_up_book),
             "finalDownBook": _book_to_dict(self.final_down_book),
@@ -163,7 +165,6 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
 
     up_after: list[str] = []
     down_after: list[str] = []
-    strategy_visible: list[dict] = []
     order_intents: list[dict] = []
     input_stream: list[dict] = []
 
@@ -180,15 +181,6 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
             up_after.append(h)
         else:
             down_after.append(h)
-        strategy_visible.append(
-            {
-                "sourceSequence": ev["seq"],
-                "childIndex": ev["child"],
-                "side": side_key,
-                "bestBid": state.best_bid,
-                "bestAsk": state.best_ask,
-            }
-        )
         # Trivial deterministic strategy: record an intent (never submit) when best bid < 0.50.
         # Use Decimal, not float, for the comparison.
         if state.best_bid is not None:
@@ -315,16 +307,22 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
         key=lambda x: (x.get("sourceSequence", 0), x.get("childIndex", 0), x.get("side", ""))
     )
 
+    # Content-complete input hashes.
+    source_corpus_hash = _read_source_corpus_hash(cat_dir)
+    engine_input_stream = [e for e in input_stream if e.get("side") != "AUDIT"]
+    strategy_input_stream = [e for e in input_stream if e.get("side") in {"UP", "DOWN", "REFERENCE"}]
+
     run_id = _read_run_id(cat_dir)
     return ReplayResult(
         run_id=run_id,
-        input_stream_hash=hash_value(input_stream),
+        source_corpus_hash=source_corpus_hash,
+        normalized_engine_input_hash=hash_value(engine_input_stream),
+        strategy_visible_input_hash=hash_value(strategy_input_stream),
         up_book_after_each_event=up_after,
         down_book_after_each_event=down_after,
         final_up_book_hash=hash_value(_book_to_dict(final_up)),
         final_down_book_hash=hash_value(_book_to_dict(final_down)),
         reference_stream_hash=hash_value(ref_records),
-        strategy_visible_stream_hash=hash_value(strategy_visible),
         order_intent_stream_hash=hash_value(order_intents),
         final_up_book=final_up,
         final_down_book=final_down,
@@ -420,6 +418,13 @@ def _read_run_id(cat_dir: Path) -> str:
     report_path = cat_dir / "conversion-report.json"
     if report_path.exists():
         return json.loads(report_path.read_text(encoding="utf-8")).get("sourceRunId", "")
+    return ""
+
+
+def _read_source_corpus_hash(cat_dir: Path) -> str:
+    path = cat_dir / "source-corpus-hash.json"
+    if path.exists():
+        return json.loads(path.read_text(encoding="utf-8")).get("sourceCorpusHash", "")
     return ""
 
 
