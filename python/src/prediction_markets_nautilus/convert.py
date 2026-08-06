@@ -11,6 +11,7 @@ from __future__ import annotations
 import dataclasses
 import json
 import shutil
+import subprocess
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
@@ -1001,9 +1002,41 @@ def _write_audit_sidecar(cat_dir: Path, audit_rows: list[dict]) -> None:
     pq.write_table(table, cat_dir / "audit.parquet")
 
 
-def convert_run(run_directory: str | Path, catalog_directory: str | Path) -> dict:
+def _verify_run_directory(run_directory: str | Path, min_reference_observations: int = 5) -> None:
+    """Invoke the authoritative TypeScript verifier; fail closed on any rejection."""
+    run_dir = Path(run_directory)
+    repo_root = Path(__file__).resolve().parents[3]
+    args = [
+        "src/verify-run.ts",
+        "--min-reference-observations",
+        str(min_reference_observations),
+        str(run_dir),
+    ]
+    not_found: list[str] = []
+    for base in (["pnpm", "exec", "tsx"], ["npx", "tsx"], ["tsx"]):
+        try:
+            subprocess.run([*base, *args], cwd=repo_root, check=True)
+            return
+        except FileNotFoundError:
+            not_found.append(base[0])
+            continue
+        except subprocess.CalledProcessError as e:
+            raise ValueError(f"TypeScript verifier rejected run (exit {e.returncode}): {run_dir}") from e
+    raise RuntimeError(f"TypeScript verifier not available: tried {', '.join(not_found)}")
+
+
+def convert_run(
+    run_directory: str | Path,
+    catalog_directory: str | Path,
+    *,
+    verify: bool = True,
+    min_reference_observations: int = 5,
+) -> dict:
     """End-to-end: load, validate, normalize, and write catalog. Returns the report."""
     from .reader import load_run
+
+    if verify:
+        _verify_run_directory(run_directory, min_reference_observations)
 
     run = load_run(run_directory)
     normalized = normalize_run(run)
@@ -1034,8 +1067,29 @@ def _main() -> int:
     parser = argparse.ArgumentParser(prog="prediction_markets_nautilus.convert")
     parser.add_argument("--run-directory", required=True)
     parser.add_argument("--catalog-directory", required=True)
+    parser.add_argument(
+        "--no-verify",
+        action="store_true",
+        help="skip the authoritative TypeScript verifier (not recommended for real recordings)",
+    )
+    parser.add_argument(
+        "--min-reference-observations",
+        type=int,
+        default=5,
+        help="minimum unique Chainlink observations required by the TypeScript verifier",
+    )
     args = parser.parse_args()
-    print(json.dumps(convert_run(args.run_directory, args.catalog_directory), indent=2))
+    print(
+        json.dumps(
+            convert_run(
+                args.run_directory,
+                args.catalog_directory,
+                verify=not args.no_verify,
+                min_reference_observations=args.min_reference_observations,
+            ),
+            indent=2,
+        )
+    )
     return 0
 
 

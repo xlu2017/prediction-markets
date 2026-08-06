@@ -17,6 +17,12 @@ jobs:
         working-directory: python
     steps:
       - uses: actions/checkout@v4
+      - name: Install pnpm and dependencies
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - run: npm install -g pnpm@10.17.1
+      - run: pnpm install --frozen-lockfile
       - name: Install uv
         uses: astral-sh/setup-uv@v6
         with:
@@ -39,7 +45,8 @@ jobs:
         run: |
           uv run python -m prediction_markets_nautilus.convert \
             --run-directory ../fixtures/sample-run \
-            --catalog-directory .artifacts/nautilus-catalog
+            --catalog-directory .artifacts/nautilus-catalog \
+            --min-reference-observations 1
       - name: Two independent deterministic replays with hash comparison
         run: |
           uv run python -m prediction_markets_nautilus.replay \

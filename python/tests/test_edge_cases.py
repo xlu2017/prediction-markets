@@ -216,7 +216,7 @@ def test_snapshot_followed_by_deltas(tmp_path: Path) -> None:
     assert normalized.deltas[0].side == "BUY"
     assert normalized.deltas[1].size == "0"  # clear level
     cat_dir = tmp_path / "catalog"
-    convert_run(tmp_path, cat_dir)
+    convert_run(tmp_path, cat_dir, verify=False)
     result = replay_catalog(cat_dir)
     # After delta: best bid moved to .49; ask .52 cleared.
     assert result.final_up_book.best_bid == "0.49"
@@ -320,7 +320,7 @@ def test_locked_book(tmp_path: Path) -> None:
     health = F.base_health(books=books)
     F.write_run(tmp_path, manifest, health, events, market=F.base_market())
     cat_dir = tmp_path / "catalog"
-    convert_run(tmp_path, cat_dir)
+    convert_run(tmp_path, cat_dir, verify=False)
     result = replay_catalog(cat_dir)
     assert result.final_up_book.integrity() == "LOCKED"
 
@@ -392,7 +392,7 @@ def test_exact_decimal_preserved(tmp_path: Path) -> None:
     normalized = normalize_run(run)
     assert normalized.references[0].value == "67234.5000000000000001"
     cat_dir = tmp_path / "catalog"
-    convert_run(tmp_path, cat_dir)
+    convert_run(tmp_path, cat_dir, verify=False)
     # The exact decimal survives the catalog round trip.
     from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
@@ -426,7 +426,7 @@ def test_empty_book_side(tmp_path: Path) -> None:
     health = F.base_health(books=books)
     F.write_run(tmp_path, manifest, health, events, market=F.base_market())
     cat_dir = tmp_path / "catalog"
-    convert_run(tmp_path, cat_dir)
+    convert_run(tmp_path, cat_dir, verify=False)
     result = replay_catalog(cat_dir)
     assert result.final_up_book.best_ask is None
     assert result.final_up_book.ask_depth_count == 0
@@ -484,7 +484,7 @@ def test_unsupported_clob_event(tmp_path: Path) -> None:
     normalized = normalize_run(run)
     assert any(a.kind == "UNSUPPORTED_SOURCE_EVENT" for a in normalized.audit)
     cat_dir = tmp_path / "catalog"
-    report = convert_run(tmp_path, cat_dir)
+    report = convert_run(tmp_path, cat_dir, verify=False)
     assert report["ignoredEventCount"] == 1
     assert "some_future_event" in report["unsupportedEventTypes"]
 
@@ -533,7 +533,7 @@ def test_multiple_messages_one_frame(tmp_path: Path) -> None:
 
 def test_deterministic_replay_across_processes(tmp_path: Path) -> None:
     cat_dir = tmp_path / "catalog"
-    convert_run(FIXTURE_RUN, cat_dir)
+    convert_run(FIXTURE_RUN, cat_dir, verify=False)
     py = sys.executable
     r1 = subprocess.run(
         [py, "-m", "prediction_markets_nautilus.replay", "--catalog-directory", str(cat_dir)],
@@ -569,7 +569,7 @@ def test_deterministic_replay_across_processes(tmp_path: Path) -> None:
 
 def test_catalog_round_trip(tmp_path: Path) -> None:
     cat_dir = tmp_path / "catalog"
-    report = convert_run(FIXTURE_RUN, cat_dir)
+    report = convert_run(FIXTURE_RUN, cat_dir, verify=False)
     assert report["convertedSnapshotCount"] == 2
     assert report["convertedReferenceCount"] == 1
     assert (cat_dir / "lineage.parquet").exists()
@@ -600,7 +600,7 @@ def test_source_sequence_traceability(tmp_path: Path) -> None:
     # Lineage sidecar has one row per actual catalog row (not per normalized record).
     # Snapshots expand to CLEAR + N ADDs, each with its own childIndex.
     cat_dir = tmp_path / "catalog"
-    convert_run(FIXTURE_RUN, cat_dir)
+    convert_run(FIXTURE_RUN, cat_dir, verify=False)
     import pyarrow.parquet as pq
 
     rows = pq.read_table(cat_dir / "lineage.parquet").to_pylist()
@@ -616,7 +616,7 @@ def test_source_sequence_traceability(tmp_path: Path) -> None:
 
 def test_final_book_comparison_matches_recorder(tmp_path: Path) -> None:
     cat_dir = tmp_path / "catalog"
-    convert_run(FIXTURE_RUN, cat_dir)
+    convert_run(FIXTURE_RUN, cat_dir, verify=False)
     result = replay_catalog(cat_dir)
     comp = compare_final_books(result, cat_dir)
     assert comp["allMatch"] is True
@@ -631,7 +631,7 @@ def test_final_book_comparison_matches_recorder(tmp_path: Path) -> None:
 
 def test_reference_prices_independently_queryable(tmp_path: Path) -> None:
     cat_dir = tmp_path / "catalog"
-    convert_run(FIXTURE_RUN, cat_dir)
+    convert_run(FIXTURE_RUN, cat_dir, verify=False)
     from nautilus_trader.persistence.catalog import ParquetDataCatalog
 
     from prediction_markets_nautilus.models import ReferencePriceUpdate
@@ -720,7 +720,7 @@ def test_realistic_fixture_same_time_conflict(tmp_path: Path) -> None:
     """Two snapshots at the same source timestamp are ordered by (sourceSequence, childIndex)."""
     F.write_realistic_run(tmp_path)
     cat_dir = tmp_path / "catalog"
-    convert_run(tmp_path, cat_dir)
+    convert_run(tmp_path, cat_dir, verify=False)
     result = replay_catalog(cat_dir)
     # Both books should be reconstructed with the final snapshot values.
     assert result.final_up_book.best_bid == "0.50"
@@ -735,7 +735,7 @@ def test_realistic_fixture_lineage_one_row_per_catalog_row(tmp_path: Path) -> No
 
     F.write_realistic_run(tmp_path)
     cat_dir = tmp_path / "catalog"
-    convert_run(tmp_path, cat_dir)
+    convert_run(tmp_path, cat_dir, verify=False)
     rows = pq.read_table(cat_dir / "lineage.parquet").to_pylist()
     # 2 instruments + 4 snapshots * 3 rows each (CLEAR + 1 bid + 1 ask) + 3 deltas + 1 trade
     # + 1 reference + 2 lifecycle = 2 + 12 + 3 + 1 + 1 + 2 = 21
@@ -760,7 +760,7 @@ def test_realistic_fixture_replay_determinism(tmp_path: Path) -> None:
     """Replay is deterministic across two runs of the realistic fixture."""
     F.write_realistic_run(tmp_path)
     cat_dir = tmp_path / "catalog"
-    convert_run(tmp_path, cat_dir)
+    convert_run(tmp_path, cat_dir, verify=False)
     r1 = replay_catalog(cat_dir)
     r2 = replay_catalog(cat_dir)
     assert r1.final_up_book_hash == r2.final_up_book_hash
@@ -778,7 +778,7 @@ def test_backtest_node_proof(tmp_path: Path) -> None:
 
     F.write_sample_run(tmp_path)
     cat_dir = tmp_path / "catalog"
-    convert_run(tmp_path, cat_dir)
+    convert_run(tmp_path, cat_dir, verify=False)
     result = run_backtest_proof(cat_dir)
     assert result.ran, f"BacktestNode did not run: {result.error}"
     assert result.book_events_received > 0, "Strategy received no book events"
@@ -807,7 +807,7 @@ def test_backtest_node_recorder_order_with_regressing_timestamps(tmp_path: Path)
 
     F.write_regressing_timestamp_run(tmp_path)
     cat_dir = tmp_path / "catalog"
-    convert_run(tmp_path, cat_dir)
+    convert_run(tmp_path, cat_dir, verify=False)
     result = run_backtest_proof(cat_dir)
     assert result.ran, f"BacktestNode did not run: {result.error}"
     assert result.book_events_received > 0, "Strategy received no book events"
@@ -827,7 +827,7 @@ def test_regressing_timestamp_fixture_replay(tmp_path: Path) -> None:
     """Replay of regressing-timestamp fixture preserves recorder order."""
     F.write_regressing_timestamp_run(tmp_path)
     cat_dir = tmp_path / "catalog"
-    convert_run(tmp_path, cat_dir)
+    convert_run(tmp_path, cat_dir, verify=False)
     result = replay_catalog(cat_dir)
     # UP book should reflect the delta at seq 4 (bid moved to .49).
     assert result.final_up_book.best_bid == "0.49"
