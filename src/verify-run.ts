@@ -579,6 +579,8 @@ export function replayClobState(
     "EMPTY_FRAME",
     "IGNORED_FOREIGN_MARKET",
     "MALFORMED_EVENT",
+    "PONG",
+    "PING",
   ]);
 
   for (const event of events) {
