@@ -176,9 +176,10 @@ export class RecorderEventProcessor {
     private readonly health: HealthTracker,
     private readonly logger: Logger,
     private readonly now: () => number = Date.now,
-    private readonly onValidData?: (frame: FeedFrame) => boolean,
+    private readonly checkGeneration?: (frame: FeedFrame) => boolean,
     private readonly onFatalError?: () => void,
     private readonly onClobGap?: () => void,
+    private readonly commitValidData?: (frame: FeedFrame) => void,
   ) {
     this.sequencer = new EventSequencer(runId);
   }
@@ -421,13 +422,13 @@ export class RecorderEventProcessor {
     const processedAt = this.now();
     let observedTokens: string[] = [];
     let dedupeState: DedupeState;
-    let accepted = true;
+    let generationAccepted = true;
 
     if (isDuplicate) {
       dedupeState = "DUPLICATE_APPLIED";
     } else {
-      accepted = this.onValidData?.(frame) ?? true;
-      if (!accepted) {
+      generationAccepted = this.checkGeneration?.(frame) ?? true;
+      if (!generationAccepted) {
         dedupeState = "RECEIVED_NOT_APPLIED";
       } else {
         observedTokens = this.books.apply(event, processedAt, frame.connectionGeneration);
@@ -458,7 +459,7 @@ export class RecorderEventProcessor {
       duplicateOfSequence: dedupeResult.duplicateOfSequence,
       dedupeReason: isDuplicate
         ? "matching connection generation, frame hash, message index, message hash, and source timestamp"
-        : accepted
+        : generationAccepted
           ? null
           : "frame from inactive connection generation",
       payload: event,
@@ -467,8 +468,10 @@ export class RecorderEventProcessor {
     });
     await this.store.append(envelope);
     this.health.observe(envelope, tokens);
-    if (isDuplicate) this.health.duplicateEvent();
-    else if (dedupeState === "UNIQUE_APPLIED") {
+    if (isDuplicate) {
+      this.health.duplicateEvent();
+    } else if (dedupeState === "UNIQUE_APPLIED") {
+      this.commitValidData?.(frame);
       if (
         eventType === "book" &&
         this.clobResyncPending &&
@@ -550,10 +553,13 @@ export class RecorderEventProcessor {
     });
     await this.store.append(envelope);
     this.health.observe(envelope);
-    if (isDuplicate) this.health.duplicateEvent();
-    else if (isBtcPrice) {
-      const refAccepted = this.onValidData?.(frame) ?? true;
-      if (!refAccepted) {
+    if (isDuplicate) {
+      this.health.duplicateEvent();
+    } else if (isBtcPrice) {
+      const refAccepted = this.checkGeneration?.(frame) ?? true;
+      if (refAccepted) {
+        this.commitValidData?.(frame);
+      } else {
         this.logger.warn(
           "Reference frame from inactive generation, not refreshing stale detector",
           {

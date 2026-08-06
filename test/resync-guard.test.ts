@@ -62,6 +62,7 @@ describe("resync guard clears only on book events", () => {
       acceptAll,
       noop,
       onClobGap,
+      noop,
     );
 
     // Apply initial book snapshots so books are SYNCHRONIZED
@@ -170,6 +171,7 @@ describe("resync guard clears only on book events", () => {
       acceptAll,
       noop,
       onClobGap,
+      noop,
     );
 
     // Apply initial book snapshots at generation 1
@@ -268,6 +270,7 @@ describe("resync guard clears only on book events", () => {
       acceptAll,
       noop,
       onClobGap,
+      noop,
     );
 
     // Apply initial book snapshots at generation 1
@@ -369,6 +372,7 @@ describe("resync guard clears only on book events", () => {
       onValidData,
       noop,
       onClobGap,
+      noop,
     );
 
     // Apply initial book snapshots at generation 1
@@ -500,6 +504,7 @@ describe("resync guard clears only on book events", () => {
       onValidData,
       noop,
       onClobGap,
+      noop,
     );
 
     // Apply initial book snapshots at generation 1

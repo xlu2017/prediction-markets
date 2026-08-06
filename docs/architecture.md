@@ -137,12 +137,13 @@ failure, preventing `COMPLETE` status even if the run later resynchronizes. This
 missed events cannot silently become `COMPLETE` after reconnecting.
 
 Staleness checking uses feed-specific thresholds: `clobStaleAfterMs` for the CLOB feed and
-`referenceStaleAfterMs` for the RTDS feed. Freshness is refreshed only by `notifyValidDataMessage`,
+`referenceStaleAfterMs` for the RTDS feed. Freshness is refreshed only by `commitValidDataMessage`,
 which is called after successful processing, not by raw WebSocket message arrival. This prevents
-non-data frames (e.g., PING/PONG) from masking a silent data stream. `notifyValidDataMessage`
-returns a boolean indicating whether the generation was still active; the recorder only updates its
-current CLOB generation when it returns `true`, preventing stale callbacks from overwriting the
-active generation.
+non-data frames (e.g., PING/PONG) from masking a silent data stream. The active-generation check
+(`isCurrentGeneration`) and pre-gap check (`isPreGapObservation`) run before book mutation; the
+commit (`commitValidDataMessage`) runs only after book validation, mutation, envelope persistence,
+and dedupe registration succeed. The recorder only updates its current CLOB generation inside the
+commit callback, preventing stale callbacks from overwriting the active generation.
 
 Reference (Chainlink) freshness requires both a recent receipt time and a recent canonical source
 timestamp. `lastReferenceReceivedAt` tracks when the last non-duplicate observation was received,
@@ -171,11 +172,13 @@ connection generation is accepted by the active-generation check. `price_change`
 clear the resync guard, and late books from an inactive generation are rejected before mutating the
 live order book (marked `RECEIVED_NOT_APPLIED` with a stale-generation reason).
 
-The active-generation check is performed by calling `notifyValidDataMessage` before book mutation.
-If the feed has advanced to a newer generation, or if the frame's `receivedAt` precedes the current
-gap start time (`gapStartedAt`), the call returns `false` without refreshing the stale detector or
-emitting `DATA_GAP_ENDED`. This prevents pre-gap observations from retroactively closing a gap that
-started after the frame was received.
+The active-generation check is performed by calling `isCurrentGeneration` and `isPreGapObservation`
+before book mutation. If the feed has advanced to a newer generation, or if the frame's `receivedAt`
+precedes the current gap start time (`gapStartedAt`), the frame is rejected without refreshing the
+stale detector or emitting `DATA_GAP_ENDED`. The `commitValidDataMessage` call runs only after book
+validation, mutation, envelope persistence, and dedupe registration succeed, ensuring that a failed
+`books.apply()` cannot close a gap or refresh staleness. This prevents pre-gap observations from
+retroactively closing a gap that started after the frame was received.
 
 Frames that are whitespace-only or belong to a different market condition are recorded as
 `EMPTY_FRAME` and `IGNORED_FOREIGN_MARKET` events respectively, preserving their exact wire content

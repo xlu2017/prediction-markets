@@ -47,6 +47,7 @@ describe("array slicing with primitive elements", () => {
       acceptAll,
       noop,
       noop,
+      noop,
     );
 
     const raw = JSON.stringify([

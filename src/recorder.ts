@@ -185,14 +185,20 @@ export async function runRecorder(
   const fatalController = new AbortController();
   const feedsBySource = new Map<string, ManagedWebSocket>();
   let currentClobGeneration: number | null = null;
-  const onValidData = (frame: FeedFrame): boolean => {
+  const checkGeneration = (frame: FeedFrame): boolean => {
     const feed = feedsBySource.get(frame.source);
     if (feed === undefined) return false;
-    const accepted = feed.notifyValidDataMessage(frame.receivedAt, frame.connectionGeneration);
-    if (accepted && frame.source === "POLYMARKET_CLOB") {
+    if (!feed.isCurrentGeneration(frame.connectionGeneration)) return false;
+    if (feed.isPreGapObservation(frame.receivedAt)) return false;
+    return true;
+  };
+  const commitValidData = (frame: FeedFrame): void => {
+    const feed = feedsBySource.get(frame.source);
+    if (feed === undefined) return;
+    feed.commitValidDataMessage(frame.receivedAt, frame.connectionGeneration);
+    if (frame.source === "POLYMARKET_CLOB") {
       currentClobGeneration = frame.connectionGeneration;
     }
-    return accepted;
   };
   const onClobGap = (): void => {
     currentClobGeneration = null;
@@ -209,9 +215,10 @@ export async function runRecorder(
     health,
     logger,
     now,
-    onValidData,
+    checkGeneration,
     onFatalError,
     onClobGap,
+    commitValidData,
   );
   const feeds = createFeeds({
     market,

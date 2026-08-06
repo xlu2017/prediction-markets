@@ -111,11 +111,15 @@ export class ManagedWebSocket {
     await this.closePromise;
   }
 
-  public notifyValidDataMessage(receivedAt: number, connectionGeneration: number): boolean {
-    if (connectionGeneration !== this.generation) return false;
-    if (this.gapStartedAt !== null && !this.gapEnded && receivedAt < this.gapStartedAt) {
-      return false;
-    }
+  public isCurrentGeneration(connectionGeneration: number): boolean {
+    return connectionGeneration === this.generation;
+  }
+
+  public isPreGapObservation(receivedAt: number): boolean {
+    return this.gapStartedAt !== null && !this.gapEnded && receivedAt < this.gapStartedAt;
+  }
+
+  public commitValidDataMessage(receivedAt: number, connectionGeneration: number): void {
     this.staleDetector.observe(receivedAt);
     if (this.gapStartedAt !== null && !this.gapEnded) {
       this.emitLifecycle("DATA_GAP_ENDED", connectionGeneration, {
@@ -125,7 +129,6 @@ export class ManagedWebSocket {
       this.gapStartedAt = null;
       this.gapEnded = true;
     }
-    return true;
   }
 
   private connect(): void {

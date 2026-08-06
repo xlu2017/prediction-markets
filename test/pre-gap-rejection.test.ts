@@ -62,17 +62,15 @@ describe("pre-gap observation rejection", () => {
 
     feed.start();
 
-    // Socket opens at T1
     const T1 = FIXED_NOW;
     currentTime = T1;
     socket.readyState = 1;
     socket.emit("open");
 
-    // Accept a valid frame at T1
-    const accepted1 = feed.notifyValidDataMessage(T1, 1);
-    expect(accepted1).toBe(true);
+    expect(feed.isCurrentGeneration(1)).toBe(true);
+    expect(feed.isPreGapObservation(T1)).toBe(false);
+    feed.commitValidDataMessage(T1, 1);
 
-    // Socket closes at T2 > T1, opening a gap
     const T2 = FIXED_NOW + 5_000;
     currentTime = T2;
     socket.emit("close", 1000, Buffer.from(""));
@@ -80,20 +78,14 @@ describe("pre-gap observation rejection", () => {
     const gapStarted = lifecycles.find((e) => e.eventType === "DATA_GAP_STARTED");
     expect(gapStarted).toBeDefined();
 
-    // A frame received at T1 (before gap at T2) is processed after the gap opens.
-    // notifyValidDataMessage should return false because receivedAt < gapStartedAt.
-    const accepted2 = feed.notifyValidDataMessage(T1, 1);
-    expect(accepted2).toBe(false);
+    expect(feed.isCurrentGeneration(1)).toBe(true);
+    expect(feed.isPreGapObservation(T1)).toBe(true);
 
-    // No DATA_GAP_ENDED should have been emitted
+    // Processor must NOT call commitValidDataMessage when isPreGapObservation returns true.
+    // Simulate the correct processor behavior: skip commit for pre-gap observations.
+    // No DATA_GAP_ENDED should have been emitted.
     const gapEnded = lifecycles.filter((e) => e.eventType === "DATA_GAP_ENDED");
     expect(gapEnded.length).toBe(0);
-
-    // The gap should still be open (no DATA_GAP_ENDED)
-    const gapEndedAfter = lifecycles.filter(
-      (e) => e.eventType === "DATA_GAP_ENDED" && e.receivedAt > T2,
-    );
-    expect(gapEndedAfter.length).toBe(0);
 
     await feed.stop();
   });
@@ -118,20 +110,47 @@ describe("pre-gap observation rejection", () => {
     socket.readyState = 1;
     socket.emit("open");
 
-    const accepted1 = feed.notifyValidDataMessage(T1, 1);
-    expect(accepted1).toBe(true);
+    expect(feed.isCurrentGeneration(1)).toBe(true);
+    expect(feed.isPreGapObservation(T1)).toBe(false);
+    feed.commitValidDataMessage(T1, 1);
 
     const T2 = FIXED_NOW + 5_000;
     currentTime = T2;
     socket.emit("close", 1000, Buffer.from(""));
 
-    // A frame received at T3 > T2 should be accepted and close the gap
     const T3 = FIXED_NOW + 6_000;
-    const accepted2 = feed.notifyValidDataMessage(T3, 1);
-    expect(accepted2).toBe(true);
+    expect(feed.isCurrentGeneration(1)).toBe(true);
+    expect(feed.isPreGapObservation(T3)).toBe(false);
+    feed.commitValidDataMessage(T3, 1);
 
     const gapEnded = lifecycles.filter((e) => e.eventType === "DATA_GAP_ENDED");
     expect(gapEnded.length).toBe(1);
+
+    await feed.stop();
+  });
+
+  it("rejects frames from a stale generation", async () => {
+    let currentTime = FIXED_NOW;
+    const now = () => currentTime;
+    const frames: FeedFrame[] = [];
+    const lifecycles: FeedLifecycle[] = [];
+    const socket = new MockSocket();
+    const feed = createTestFeed(
+      (frame) => frames.push(frame),
+      (event) => lifecycles.push(event),
+      now,
+      socket,
+    );
+
+    feed.start();
+
+    const T1 = FIXED_NOW;
+    currentTime = T1;
+    socket.readyState = 1;
+    socket.emit("open");
+
+    expect(feed.isCurrentGeneration(1)).toBe(true);
+    expect(feed.isCurrentGeneration(2)).toBe(false);
 
     await feed.stop();
   });
