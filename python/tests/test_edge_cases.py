@@ -217,7 +217,7 @@ def test_snapshot_followed_by_deltas(tmp_path: Path) -> None:
     assert normalized.deltas[1].size == "0"  # clear level
     cat_dir = tmp_path / "catalog"
     convert_run(tmp_path, cat_dir, verify=False)
-    result = replay_catalog(cat_dir)
+    result = replay_catalog(cat_dir, allow_unverified=True)
     # After delta: best bid moved to .49; ask .52 cleared.
     assert result.final_up_book.best_bid == "0.49"
     assert result.final_up_book.best_ask is None
@@ -321,7 +321,7 @@ def test_locked_book(tmp_path: Path) -> None:
     F.write_run(tmp_path, manifest, health, events, market=F.base_market())
     cat_dir = tmp_path / "catalog"
     convert_run(tmp_path, cat_dir, verify=False)
-    result = replay_catalog(cat_dir)
+    result = replay_catalog(cat_dir, allow_unverified=True)
     assert result.final_up_book.integrity() == "LOCKED"
 
 
@@ -427,7 +427,7 @@ def test_empty_book_side(tmp_path: Path) -> None:
     F.write_run(tmp_path, manifest, health, events, market=F.base_market())
     cat_dir = tmp_path / "catalog"
     convert_run(tmp_path, cat_dir, verify=False)
-    result = replay_catalog(cat_dir)
+    result = replay_catalog(cat_dir, allow_unverified=True)
     assert result.final_up_book.best_ask is None
     assert result.final_up_book.ask_depth_count == 0
 
@@ -536,14 +536,28 @@ def test_deterministic_replay_across_processes(tmp_path: Path) -> None:
     convert_run(FIXTURE_RUN, cat_dir, verify=False)
     py = sys.executable
     r1 = subprocess.run(
-        [py, "-m", "prediction_markets_nautilus.replay", "--catalog-directory", str(cat_dir)],
+        [
+            py,
+            "-m",
+            "prediction_markets_nautilus.replay",
+            "--catalog-directory",
+            str(cat_dir),
+            "--allow-unverified",
+        ],
         capture_output=True,
         text=True,
         env={**__import__("os").environ, **ENV},
         check=True,
     )
     r2 = subprocess.run(
-        [py, "-m", "prediction_markets_nautilus.replay", "--catalog-directory", str(cat_dir)],
+        [
+            py,
+            "-m",
+            "prediction_markets_nautilus.replay",
+            "--catalog-directory",
+            str(cat_dir),
+            "--allow-unverified",
+        ],
         capture_output=True,
         text=True,
         env={**__import__("os").environ, **ENV},
@@ -575,7 +589,7 @@ def test_catalog_round_trip(tmp_path: Path) -> None:
     assert report["convertedReferenceCount"] == 1
     assert (cat_dir / "lineage.parquet").exists()
     assert (cat_dir / "expected-final-books.json").exists()
-    result = replay_catalog(cat_dir)
+    result = replay_catalog(cat_dir, allow_unverified=True)
     assert result.final_up_book.best_bid == "0.48"
     assert result.final_down_book.best_bid == "0.47"
 
@@ -618,7 +632,7 @@ def test_source_sequence_traceability(tmp_path: Path) -> None:
 def test_final_book_comparison_matches_recorder(tmp_path: Path) -> None:
     cat_dir = tmp_path / "catalog"
     convert_run(FIXTURE_RUN, cat_dir, verify=False)
-    result = replay_catalog(cat_dir)
+    result = replay_catalog(cat_dir, allow_unverified=True)
     comp = compare_final_books(result, cat_dir)
     assert comp["allMatch"] is True
     for c in comp["comparisons"]:
@@ -722,7 +736,7 @@ def test_realistic_fixture_same_time_conflict(tmp_path: Path) -> None:
     F.write_realistic_run(tmp_path)
     cat_dir = tmp_path / "catalog"
     convert_run(tmp_path, cat_dir, verify=False)
-    result = replay_catalog(cat_dir)
+    result = replay_catalog(cat_dir, allow_unverified=True)
     # Both books should be reconstructed with the final snapshot values.
     assert result.final_up_book.best_bid == "0.50"
     assert result.final_up_book.best_ask == "0.51"
@@ -762,8 +776,8 @@ def test_realistic_fixture_replay_determinism(tmp_path: Path) -> None:
     F.write_realistic_run(tmp_path)
     cat_dir = tmp_path / "catalog"
     convert_run(tmp_path, cat_dir, verify=False)
-    r1 = replay_catalog(cat_dir)
-    r2 = replay_catalog(cat_dir)
+    r1 = replay_catalog(cat_dir, allow_unverified=True)
+    r2 = replay_catalog(cat_dir, allow_unverified=True)
     assert r1.final_up_book_hash == r2.final_up_book_hash
     assert r1.final_down_book_hash == r2.final_down_book_hash
     assert r1.up_book_after_each_event == r2.up_book_after_each_event
@@ -829,7 +843,7 @@ def test_regressing_timestamp_fixture_replay(tmp_path: Path) -> None:
     F.write_regressing_timestamp_run(tmp_path)
     cat_dir = tmp_path / "catalog"
     convert_run(tmp_path, cat_dir, verify=False)
-    result = replay_catalog(cat_dir)
+    result = replay_catalog(cat_dir, allow_unverified=True)
     # UP book should reflect the delta at seq 4 (bid moved to .49).
     assert result.final_up_book.best_bid == "0.49"
     assert result.final_up_book.best_ask == "0.52"

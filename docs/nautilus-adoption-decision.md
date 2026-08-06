@@ -143,7 +143,7 @@ revision but require further validation before a final adoption decision:
 10. **Estimated maintenance burden of the adapter?** Low-to-moderate. The adapter is a thin,
     well-bounded converter plus two custom data types and a deterministic replay harness. The
     schema-v2 contract is stable (versioned). The main ongoing cost is re-validating against new
-    Nautilus releases and re-running the 33 edge-case tests. No trading/execution code is maintained
+    Nautilus releases and re-running the 47 edge-case tests. No trading/execution code is maintained
     by the project — that is Nautilus's responsibility.
 
 11. **Is the current Nautilus Polymarket adapter reusable directly?** Not for replay. It is reusable
@@ -198,8 +198,9 @@ the authoritative TypeScript verifier before conversion, has been rebased onto t
 contract, and computes content-complete input hashes (`sourceCorpusHash`,
 `normalizedEngineInputHash`, `strategyVisibleInputHash`) backed by mutation tests.
 
-The only remaining blocker before a final adoption decision is validation against a real
-(non-synthetic) verified schema-v2 recording end-to-end.
+The primary remaining blocker before a final adoption decision is validation against a real
+(non-synthetic) verified schema-v2 recording end-to-end; performance testing with larger event
+streams is also listed as remaining work.
 
 Keep the TypeScript recorder as the authoritative lossless audit layer. Continue the Nautilus
 adapter work after one real recording passes conversion, replay, and BacktestNode acceptance.

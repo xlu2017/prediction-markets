@@ -20,6 +20,7 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
+from .hashes import hash_value
 from .models import (
     Level,
     LifecycleEvent,
@@ -35,6 +36,7 @@ from .models import (
     ReferencePriceUpdate,
 )
 from .reader import RunDirectory
+from .replay import _build_input_stream, _catalog_integrity_fields, _catalog_read
 
 POLYMARKET_VENUE = "POLYMARKET"
 
@@ -1038,13 +1040,40 @@ def _verify_run_directory(run_directory: str | Path, min_reference_observations:
     raise RuntimeError("TypeScript verifier not available: all candidate runners failed to start")
 
 
-def _source_corpus_hash(run_directory: str | Path) -> tuple[str, int]:
-    """SHA-256 hex digest of the raw events.jsonl bytes and the raw line count."""
-    events_path = Path(run_directory) / "events.jsonl"
+def _sha256_file(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _source_bundle_hashes(run_directory: str | Path) -> dict[str, Any]:
+    """Compute the source-corpus bundle hash and per-file digests."""
+    run_dir = Path(run_directory)
+    events_path = run_dir / "events.jsonl"
     if not events_path.exists():
         raise ValueError(f"events.jsonl not found in {events_path}")
     raw = events_path.read_bytes()
-    return hashlib.sha256(raw).hexdigest(), len(raw.splitlines())
+    source_events_hash = hashlib.sha256(raw).hexdigest()
+    source_corpus_line_count = len(raw.splitlines())
+
+    bundle_files: dict[str, str] = {
+        "events.jsonl": source_events_hash,
+        "manifest.json": _sha256_file(run_dir / "manifest.json"),
+        "health.json": _sha256_file(run_dir / "health.json"),
+    }
+    market_path = run_dir / "market.json"
+    market_hash = ""
+    if market_path.exists():
+        market_hash = _sha256_file(market_path)
+        bundle_files["market.json"] = market_hash
+    source_corpus_hash = hash_value(bundle_files)
+
+    return {
+        "sourceCorpusHash": source_corpus_hash,
+        "sourceEventsHash": source_events_hash,
+        "sourceCorpusLineCount": source_corpus_line_count,
+        "manifestHash": bundle_files["manifest.json"],
+        "healthHash": bundle_files["health.json"],
+        "marketHash": market_hash,
+    }
 
 
 def convert_run(
@@ -1063,27 +1092,57 @@ def convert_run(
     run = load_run(run_directory)
     normalized = normalize_run(run)
     report = write_catalog(normalized, catalog_directory)
-    source_corpus_hash, source_line_count = _source_corpus_hash(run_directory)
+    bundle = _source_bundle_hashes(run_directory)
     verifier_parameters = {
         "minReferenceObservations": min_reference_observations,
         "verify": verify,
     }
-    (Path(catalog_directory) / "source-corpus-hash.json").write_text(
+
+    cat_dir = Path(catalog_directory)
+    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+
+    cat = ParquetDataCatalog(str(cat_dir))
+    instruments, up_instr, down_instr, up_deltas, down_deltas = _catalog_read(cat)
+    input_stream = _build_input_stream(up_deltas, down_deltas, up_instr, down_instr, cat, cat_dir)
+    integrity_fields = _catalog_integrity_fields(
+        input_stream, instruments, bundle["sourceCorpusLineCount"]
+    )
+    integrity_manifest = {
+        "version": "1",
+        "runId": run.run_id,
+        "schemaVersion": 2,
+        "recorderVersion": run.manifest.get("recorderVersion", ""),
+        "gitCommit": run.manifest.get("gitCommit", "") or "",
+        "canonicalizationVersion": "1",
+        "verifierParameters": verifier_parameters,
+        "sourceCorpusHash": bundle["sourceCorpusHash"],
+        "sourceEventsHash": bundle["sourceEventsHash"],
+        "manifestHash": bundle["manifestHash"],
+        "healthHash": bundle["healthHash"],
+        "marketHash": bundle["marketHash"],
+        **integrity_fields,
+    }
+    (cat_dir / "integrity-manifest.json").write_text(
+        json.dumps(integrity_manifest, indent=2), encoding="utf-8"
+    )
+    (cat_dir / "source-corpus-hash.json").write_text(
         json.dumps(
             {
-                "sourceCorpusHash": source_corpus_hash,
-                "sourceCorpusLineCount": source_line_count,
+                "sourceCorpusHash": bundle["sourceCorpusHash"],
+                "sourceEventsHash": bundle["sourceEventsHash"],
+                "sourceCorpusLineCount": bundle["sourceCorpusLineCount"],
                 "verifierParameters": verifier_parameters,
             },
             indent=2,
         ),
         encoding="utf-8",
     )
-    report["sourceCorpusHash"] = source_corpus_hash
+
+    report["sourceCorpusHash"] = bundle["sourceCorpusHash"]
+    report["sourceEventsHash"] = bundle["sourceEventsHash"]
+    report["integrityManifest"] = str(cat_dir / "integrity-manifest.json")
     report["verifierParameters"] = verifier_parameters
-    (Path(catalog_directory) / "conversion-report.json").write_text(
-        json.dumps(report, indent=2), encoding="utf-8"
-    )
+    (cat_dir / "conversion-report.json").write_text(json.dumps(report, indent=2), encoding="utf-8")
     # Expected final-book health sidecar for self-contained Phase 9 comparison.
     expected = {
         tid: {
@@ -1098,10 +1157,9 @@ def convert_run(
         }
         for tid, book in run.health.get("finalBookHealth", {}).items()
     }
-    (Path(catalog_directory) / "expected-final-books.json").write_text(
+    (cat_dir / "expected-final-books.json").write_text(
         json.dumps(expected, indent=2), encoding="utf-8"
     )
-    report["sourceCorpusHash"] = source_corpus_hash
     return report
 
 

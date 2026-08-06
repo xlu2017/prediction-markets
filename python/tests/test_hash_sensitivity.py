@@ -6,6 +6,8 @@ import copy
 import json
 from pathlib import Path
 
+import pyarrow as pa
+import pyarrow.parquet as pq
 import pytest
 
 from prediction_markets_nautilus.convert import convert_run
@@ -21,7 +23,7 @@ def _synthetic_hashes(events: list[dict], tmp_path: Path, **health_overrides) ->
     manifest = F.base_manifest(m, finalEventCount=len(events))
     F.write_run(run_dir, manifest, F.base_health(**health_overrides), events, market=m)
     convert_run(run_dir, cat_dir, verify=False, min_reference_observations=1)
-    return replay_catalog(cat_dir).to_dict()
+    return replay_catalog(cat_dir, allow_unverified=True).to_dict()
 
 
 def _health_with_bid(bid: str, ask: str | None = None) -> dict:
@@ -163,18 +165,17 @@ def test_hash_sensitivity_trade_alters_engine_only(tmp_path: Path) -> None:
 def test_hash_sensitivity_trade_side_alters_engine_only(tmp_path: Path) -> None:
     """Changing a trade aggressor side alters the engine hash, not strategy."""
     base = F.sample_events()
-    modified = copy.deepcopy(base)
-    modified.append(F.trade_event(5, "111111", ".49", "10", "BUY", 1785909720120))
-    h_base = _synthetic_hashes(base, tmp_path)
-    modified2 = copy.deepcopy(base)
-    modified2.append(F.trade_event(5, "111111", ".49", "10", "SELL", 1785909720120))
-    h_mod = _synthetic_hashes(
-        modified2,
-        tmp_path / "mod2",
-        totalEventsReceived=5,
-        eventCountsBySource=TRADE_SOURCE_COUNTS,
-        eventCountsByType=TRADE_TYPE_COUNTS,
-    )
+    buy = copy.deepcopy(base)
+    buy.append(F.trade_event(5, "111111", ".49", "10", "BUY", 1785909720120))
+    sell = copy.deepcopy(base)
+    sell.append(F.trade_event(5, "111111", ".49", "10", "SELL", 1785909720120))
+    health = {
+        "totalEventsReceived": 5,
+        "eventCountsBySource": TRADE_SOURCE_COUNTS,
+        "eventCountsByType": TRADE_TYPE_COUNTS,
+    }
+    h_base = _synthetic_hashes(buy, tmp_path, **health)
+    h_mod = _synthetic_hashes(sell, tmp_path / "mod", **health)
     assert h_mod["sourceCorpusHash"] != h_base["sourceCorpusHash"]
     assert h_mod["normalizedEngineInputHash"] != h_base["normalizedEngineInputHash"]
     assert h_mod["strategyVisibleInputHash"] == h_base["strategyVisibleInputHash"]
@@ -236,7 +237,7 @@ def test_replay_fails_closed_when_source_corpus_hash_missing(tmp_path: Path) -> 
     convert_run(run_dir, cat_dir, verify=False, min_reference_observations=1)
     (cat_dir / "source-corpus-hash.json").unlink()
     with pytest.raises(ValueError, match="source-corpus-hash.json missing"):
-        replay_catalog(cat_dir)
+        replay_catalog(cat_dir, allow_unverified=True)
 
 
 def test_replay_rejects_malformed_source_corpus_hash(tmp_path: Path) -> None:
@@ -252,4 +253,46 @@ def test_replay_rejects_malformed_source_corpus_hash(tmp_path: Path) -> None:
         json.dumps({"sourceCorpusHash": "deadbeef"}), encoding="utf-8"
     )
     with pytest.raises(ValueError, match="invalid sourceCorpusHash"):
-        replay_catalog(cat_dir)
+        replay_catalog(cat_dir, allow_unverified=True)
+
+
+def test_replay_rejects_missing_integrity_manifest(tmp_path: Path) -> None:
+    """Replay must raise when the integrity manifest is missing."""
+    base = F.sample_events()
+    run_dir = tmp_path / "run"
+    cat_dir = tmp_path / "catalog"
+    m = F.base_market()
+    manifest = F.base_manifest(m, finalEventCount=4)
+    F.write_run(run_dir, manifest, F.base_health(), base, market=m)
+    convert_run(run_dir, cat_dir, verify=False, min_reference_observations=1)
+    (cat_dir / "integrity-manifest.json").unlink()
+    with pytest.raises(ValueError, match="integrity-manifest.json missing"):
+        replay_catalog(cat_dir, allow_unverified=True)
+
+
+def test_replay_rejects_tampered_catalog(tmp_path: Path) -> None:
+    """Replay must raise when the catalog data has been tampered with."""
+    base = F.sample_events()
+    run_dir = tmp_path / "run"
+    cat_dir = tmp_path / "catalog"
+    m = F.base_market()
+    manifest = F.base_manifest(m, finalEventCount=4)
+    F.write_run(run_dir, manifest, F.base_health(), base, market=m)
+    convert_run(run_dir, cat_dir, verify=False, min_reference_observations=1)
+
+    up_path = next(
+        p
+        for p in cat_dir.rglob("*.parquet")
+        if "111111" in str(p) and "order_book_deltas" in str(p)
+    )
+    table = pq.read_table(up_path)
+    rows = table.to_pydict()
+    for i, side in enumerate(rows["side"]):
+        if side == 1:
+            rows["side"][i] = 2
+            break
+    new_table = pa.Table.from_pydict(rows, schema=table.schema)
+    pq.write_table(new_table, up_path)
+
+    with pytest.raises(ValueError, match="integrity mismatch"):
+        replay_catalog(cat_dir, allow_unverified=True)

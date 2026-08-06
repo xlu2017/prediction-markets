@@ -17,6 +17,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
+from .backtest import REPLAY_CONFIG
 from .hashes import hash_value
 from .models import LifecycleEvent, ReferencePriceUpdate
 
@@ -25,6 +26,8 @@ _MS_TO_NS = 1_000_000
 
 @dataclass
 class BookState:
+    """Reconstructed book state for one instrument at a point in time."""
+
     instrument_id: str
     best_bid: str | None
     best_ask: str | None
@@ -66,6 +69,8 @@ class BookState:
 
 @dataclass
 class ReplayResult:
+    """Result of replaying a converted catalog."""
+
     run_id: str
     source_corpus_hash: str
     normalized_engine_input_hash: str
@@ -114,17 +119,155 @@ def _book_to_dict(b: BookState) -> dict:
     }
 
 
-def _load_lineage(catalog_dir: Path) -> list[dict]:
-    lineage_path = catalog_dir / "lineage.parquet"
-    if not lineage_path.exists():
-        return []
-    import pyarrow.parquet as pq
+def _catalog_read(cat) -> tuple[list, Any, Any | None, list, list]:
+    """Read instruments and order-book deltas from a catalog."""
+    instruments = cat.instruments()
+    if not instruments:
+        raise ValueError("no instruments in catalog")
+    up_instr = next((i for i in instruments if i.outcome == "UP"), instruments[0])
+    down_instr = next((i for i in instruments if i.outcome == "DOWN"), None)
+    up_deltas = _read_deltas(cat, up_instr.id)
+    down_deltas = _read_deltas(cat, down_instr.id) if down_instr else []
+    return instruments, up_instr, down_instr, up_deltas, down_deltas
 
-    return pq.read_table(lineage_path).to_pylist()
+
+def _build_input_stream(
+    up_deltas: list, down_deltas: list, up_instr, down_instr, cat, cat_dir: Path
+) -> list[dict]:
+    """Build the canonical input stream used for both engine and strategy hashes."""
+    events: list[dict] = []
+    for d in up_deltas:
+        seq = d.sequence // 1_000_000
+        child = d.sequence % 1_000_000
+        events.append({"seq": seq, "child": child, "side": "UP", "delta": d})
+    for d in down_deltas:
+        seq = d.sequence // 1_000_000
+        child = d.sequence % 1_000_000
+        events.append({"seq": seq, "child": child, "side": "DOWN", "delta": d})
+    events.sort(key=lambda e: (e["seq"], e["child"], e["side"]))
+
+    input_stream: list[dict] = []
+    for ev in events:
+        d = ev["delta"]
+        input_stream.append(
+            {
+                **_to_dict(d),
+                "sourceSequence": ev["seq"],
+                "childIndex": ev["child"],
+                "side": ev["side"],
+            }
+        )
+
+    refs = cat.custom_data(cls=ReferencePriceUpdate)
+    for cd in refs:
+        r = cd.data
+        input_stream.append({**r.to_dict(), "side": "REFERENCE"})
+
+    trade_ticks = cat.trade_ticks()
+    for tt in trade_ticks:
+        tid_str = str(tt.trade_id)
+        parts = tid_str.rsplit("-", 2)
+        tt_seq = int(parts[-2]) if len(parts) == 3 else 0
+        tt_child = int(parts[-1]) if len(parts) == 3 else 0
+        tr = _to_dict(tt)
+        tr["aggressorSide"] = tr.pop("side", "")
+        tr["sourceSequence"] = tt_seq
+        tr["childIndex"] = tt_child
+        tr["side"] = "TRADE"
+        input_stream.append(tr)
+
+    lifecycle = cat.custom_data(cls=LifecycleEvent)
+    for cd in lifecycle:
+        le = cd.data
+        input_stream.append({**le.to_dict(), "side": "LIFECYCLE"})
+
+    audit_path = cat_dir / "audit.parquet"
+    if audit_path.exists():
+        import pyarrow.parquet as pq
+
+        audit_table = pq.read_table(audit_path)
+        for row in audit_table.to_pylist():
+            input_stream.append({**row, "side": "AUDIT"})
+
+    input_stream.sort(
+        key=lambda x: (x.get("sourceSequence", 0), x.get("childIndex", 0), x.get("side", ""))
+    )
+    return input_stream
 
 
-def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
-    """Replay a converted catalog deterministically and return hashes + final book state.
+def _catalog_integrity_fields(
+    input_stream: list[dict], instruments: list, source_line_count: int
+) -> dict:
+    """Compute the catalog-level integrity hashes and record counts."""
+    instrument_records = [type(instr).to_dict(instr) for instr in instruments]
+    instrument_records.sort(key=lambda d: d.get("id", ""))
+    instrument_catalog_hash = hash_value(instrument_records)
+
+    engine_input_stream = [e for e in input_stream if e.get("side") != "AUDIT"]
+    strategy_input_stream = [
+        e for e in input_stream if e.get("side") in {"UP", "DOWN", "REFERENCE"}
+    ]
+    normalized_engine_input_hash = hash_value(
+        [engine_input_stream, instrument_records, REPLAY_CONFIG]
+    )
+    strategy_visible_input_hash = hash_value(strategy_input_stream)
+
+    return {
+        "instrumentCatalogHash": instrument_catalog_hash,
+        "normalizedEngineInputHash": normalized_engine_input_hash,
+        "strategyVisibleInputHash": strategy_visible_input_hash,
+        "recordCounts": {
+            "sourceCorpusLineCount": source_line_count,
+            "instrumentCount": len(instruments),
+            "engineInputCount": len(engine_input_stream),
+            "strategyVisibleInputCount": len(strategy_input_stream),
+        },
+    }
+
+
+def _read_integrity_manifest(cat_dir: Path) -> dict:
+    path = cat_dir / "integrity-manifest.json"
+    if not path.exists():
+        raise ValueError(f"integrity-manifest.json missing in {cat_dir}")
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _read_source_corpus_hash(cat_dir: Path) -> tuple[str, str, int, dict]:
+    """Read and validate the persisted source-corpus integrity artifact."""
+    path = cat_dir / "source-corpus-hash.json"
+    if not path.exists():
+        raise ValueError(f"source-corpus-hash.json missing in {cat_dir}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+
+    def _require_hex(name: str, value: Any) -> str:
+        if not isinstance(value, str) or len(value) != 64:
+            raise ValueError(f"invalid {name} in {path}")
+        if any(c not in "0123456789abcdef" for c in value):
+            raise ValueError(f"invalid {name} in {path}")
+        return value
+
+    source_corpus_hash = _require_hex("sourceCorpusHash", data.get("sourceCorpusHash"))
+    source_events_hash = _require_hex("sourceEventsHash", data.get("sourceEventsHash"))
+    line_count = data.get("sourceCorpusLineCount", 0)
+    if not isinstance(line_count, int) or line_count < 0:
+        raise ValueError(f"invalid sourceCorpusLineCount in {path}")
+    return source_corpus_hash, source_events_hash, line_count, data.get("verifierParameters", {})
+
+
+def _read_conversion_report(cat_dir: Path) -> dict:
+    path = cat_dir / "conversion-report.json"
+    if not path.exists():
+        raise ValueError(f"conversion-report.json missing in {cat_dir}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if "sourceRunId" not in data:
+        raise ValueError("sourceRunId missing in conversion-report.json")
+    return data
+
+
+def replay_catalog(
+    catalog_directory: str | Path, *, allow_unverified: bool = False
+) -> ReplayResult:
+    """Replay a converted catalog deterministically and verify its integrity manifest.
 
     Events are ordered by ``(sourceSequence, childIndex)`` to preserve the recorder's
     canonical receipt order, not source timestamps which may be delayed, equal, or
@@ -137,39 +280,26 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
     cat_dir = Path(catalog_directory)
     cat = ParquetDataCatalog(str(cat_dir))
 
-    instruments = cat.instruments()
-    if not instruments:
-        raise ValueError("no instruments in catalog")
-    up_instr = next((i for i in instruments if i.outcome == "UP"), instruments[0])
-    down_instr = next((i for i in instruments if i.outcome == "DOWN"), None)
+    instruments, up_instr, down_instr, up_deltas, down_deltas = _catalog_read(cat)
 
     up_book = OrderBook(up_instr.id, book_type=BookType.L2_MBP)
     down_book = OrderBook(down_instr.id, book_type=BookType.L2_MBP) if down_instr else None
 
-    # Read all order-book deltas, then order by (sourceSequence, childIndex) embedded
-    # in the delta's `sequence` field (sourceSequence * 1000 + childIndex).
-    up_deltas = _read_deltas(cat, up_instr.id)
-    down_deltas = _read_deltas(cat, down_instr.id) if down_instr else []
-
-    # Merge into a single event stream ordered by the embedded sequence key.
+    # Deterministic sort by recorder sequence, then child index, then side as tiebreaker.
     events: list[dict] = []
     for d in up_deltas:
-        seq_key = d.sequence
-        seq = seq_key // 1_000_000
-        child = seq_key % 1_000_000
+        seq = d.sequence // 1_000_000
+        child = d.sequence % 1_000_000
         events.append({"seq": seq, "child": child, "side": "UP", "delta": d})
     for d in down_deltas:
-        seq_key = d.sequence
-        seq = seq_key // 1_000_000
-        child = seq_key % 1_000_000
+        seq = d.sequence // 1_000_000
+        child = d.sequence % 1_000_000
         events.append({"seq": seq, "child": child, "side": "DOWN", "delta": d})
-    # Deterministic sort by recorder sequence, then child index, then side as tiebreaker.
     events.sort(key=lambda e: (e["seq"], e["child"], e["side"]))
 
     up_after: list[str] = []
     down_after: list[str] = []
     order_intents: list[dict] = []
-    input_stream: list[dict] = []
 
     for ev in events:
         delta = ev["delta"]
@@ -184,8 +314,6 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
             up_after.append(h)
         else:
             down_after.append(h)
-        # Trivial deterministic strategy: record an intent (never submit) when best bid < 0.50.
-        # Use Decimal, not float, for the comparison.
         if state.best_bid is not None:
             from decimal import Decimal
 
@@ -200,14 +328,6 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
                         "action": "INTENT_ONLY_NO_ORDER",
                     }
                 )
-        input_stream.append(
-            {
-                **_to_dict(delta),
-                "sourceSequence": ev["seq"],
-                "childIndex": ev["child"],
-                "side": side_key,
-            }
-        )
 
     final_up = BookState.from_book(up_book)
     final_down = (
@@ -223,86 +343,48 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
         )
     )
 
-    # Reference-price stream from custom data — ordered by (sourceSequence, childIndex).
     refs = cat.custom_data(cls=ReferencePriceUpdate)
     ref_records = []
     for cd in refs:
         r = cd.data
         ref_records.append(r.to_dict())
-        # Include references in the canonical input stream with all fields.
-        input_stream.append({**r.to_dict(), "side": "REFERENCE"})
     ref_records.sort(key=lambda x: (x["sourceSequence"], x["childIndex"]))
 
-    # Trade ticks — ordered by (sourceSequence, childIndex) and included in input stream.
-    trade_ticks = cat.trade_ticks()
-    for tt in trade_ticks:
-        # TradeId format: runId-sourceSequence-childIndex
-        tid_str = str(tt.trade_id)
-        parts = tid_str.rsplit("-", 2)
-        tt_seq = int(parts[-2]) if len(parts) == 3 else 0
-        tt_child = int(parts[-1]) if len(parts) == 3 else 0
-        tr = _to_dict(tt)
-        tr["aggressorSide"] = tr.pop("side", "")
-        tr["sourceSequence"] = tt_seq
-        tr["childIndex"] = tt_child
-        tr["side"] = "TRADE"
-        input_stream.append(tr)
+    input_stream = _build_input_stream(up_deltas, down_deltas, up_instr, down_instr, cat, cat_dir)
 
-    # Lifecycle events (audit/catalog sidecar) — include sourceSequence, childIndex,
-    # and the full typed payload (feed name, close code, gap duration, etc.).
-    lifecycle = cat.custom_data(cls=LifecycleEvent)
-    for cd in lifecycle:
-        le = cd.data
-        input_stream.append({**le.to_dict(), "side": "LIFECYCLE"})
-
-    # Audit events (duplicates, empty frames, unsupported events) — included in the
-    # canonical input hash so the hash covers the complete source stream, not just
-    # the events fed to the trading engine.
-    audit_path = cat_dir / "audit.parquet"
-    if audit_path.exists():
-        import pyarrow.parquet as pq
-
-        audit_table = pq.read_table(audit_path)
-        for row in audit_table.to_pylist():
-            input_stream.append({**row, "side": "AUDIT"})
-
-    # Canonical sort by (sourceSequence, childIndex, side) — includes ALL event types.
-    input_stream.sort(
-        key=lambda x: (x.get("sourceSequence", 0), x.get("childIndex", 0), x.get("side", ""))
+    source_corpus_hash, source_events_hash, source_line_count, verifier_parameters = (
+        _read_source_corpus_hash(cat_dir)
     )
+    integrity_manifest = _read_integrity_manifest(cat_dir)
+    conversion_report = _read_conversion_report(cat_dir)
 
-    # Content-complete input hashes.
-    source_corpus_hash, source_line_count, verifier_parameters = _read_source_corpus_hash(cat_dir)
-    engine_input_stream = [e for e in input_stream if e.get("side") != "AUDIT"]
-    strategy_input_stream = [
-        e for e in input_stream if e.get("side") in {"UP", "DOWN", "REFERENCE"}
-    ]
+    if not integrity_manifest.get("verifierParameters", {}).get("verify") and not allow_unverified:
+        raise ValueError("catalog was converted with verification disabled")
 
-    run_id = _read_run_id(cat_dir)
-    normalized_engine_input_hash = hash_value(engine_input_stream)
-    strategy_visible_input_hash = hash_value(strategy_input_stream)
-    integrity_manifest = {
-        "version": "1",
-        "runId": run_id,
-        "canonicalizationVersion": "1",
-        "sourceCorpusHash": source_corpus_hash,
-        "normalizedEngineInputHash": normalized_engine_input_hash,
-        "strategyVisibleInputHash": strategy_visible_input_hash,
-        "recordCounts": {
-            "sourceCorpusLineCount": source_line_count,
-            "engineInputCount": len(engine_input_stream),
-            "strategyVisibleInputCount": len(strategy_input_stream),
-        },
-        "verifierParameters": verifier_parameters,
-    }
-    (cat_dir / "integrity-manifest.json").write_text(
-        json.dumps(integrity_manifest, indent=2), encoding="utf-8"
-    )
+    if integrity_manifest.get("runId") != conversion_report.get("sourceRunId"):
+        raise ValueError(
+            f"runId mismatch: integrity manifest {integrity_manifest.get('runId')!r} "
+            f"vs conversion report {conversion_report.get('sourceRunId')!r}"
+        )
+
+    if integrity_manifest.get("sourceCorpusHash") != source_corpus_hash:
+        raise ValueError("source corpus hash mismatch")
+    if integrity_manifest.get("sourceEventsHash") != source_events_hash:
+        raise ValueError("source events hash mismatch")
+    if integrity_manifest.get("verifierParameters") != verifier_parameters:
+        raise ValueError("verifier parameters mismatch")
+
+    catalog_fields = _catalog_integrity_fields(input_stream, instruments, source_line_count)
+    for key, expected in catalog_fields.items():
+        stored = integrity_manifest.get(key)
+        if stored != expected:
+            raise ValueError(f"integrity mismatch for {key}: expected {expected!r}, got {stored!r}")
+
     return ReplayResult(
-        run_id=run_id,
+        run_id=integrity_manifest.get("runId", conversion_report.get("sourceRunId", "")),
         source_corpus_hash=source_corpus_hash,
-        normalized_engine_input_hash=normalized_engine_input_hash,
-        strategy_visible_input_hash=strategy_visible_input_hash,
+        normalized_engine_input_hash=catalog_fields["normalizedEngineInputHash"],
+        strategy_visible_input_hash=catalog_fields["strategyVisibleInputHash"],
         up_book_after_each_event=up_after,
         down_book_after_each_event=down_after,
         final_up_book_hash=hash_value(_book_to_dict(final_up)),
@@ -328,8 +410,6 @@ def _read_deltas(cat, instrument_id) -> list:
     # The catalog's instrument_id filter is unreliable in this version, so filter manually.
     raw = cat.order_book_deltas()
     flat = [d for d in raw if d.instrument_id == instrument_id]
-    # Sort by ts_event, then action rank (CLEAR before ADDs within a snapshot).
-    # Final ordering by (sourceSequence, childIndex) is done by the caller.
     flat.sort(
         key=lambda d: (
             d.ts_event,
@@ -340,58 +420,6 @@ def _read_deltas(cat, instrument_id) -> list:
         )
     )
     return flat
-
-
-def _match_deltas_to_lineage(
-    up_deltas: list, down_deltas: list, lineage: list[dict], up_instr, down_instr
-) -> list[tuple]:
-    """Match catalog delta rows to lineage rows by (tokenId, ts_event, actionRank, order).
-
-    Both the delta lists and the lineage rows are sorted deterministically, so we can
-    match them in order within each (tokenId, ts_event) group.
-    Returns a list of (delta, sourceSequence, childIndex, sideKey) tuples.
-    """
-    # Group lineage rows by tokenId, sorted by (sourceSequence, childIndex).
-    from collections import defaultdict
-
-    lin_by_token: dict[str, list[dict]] = defaultdict(list)
-    for row in lineage:
-        tid = row.get("tokenId")
-        if tid:
-            lin_by_token[tid].append(row)
-    for tid in lin_by_token:
-        lin_by_token[tid].sort(key=lambda r: (r.get("sourceSequence", 0), r.get("childIndex", 0)))
-
-    # Filter lineage to only delta rows (recordType starts with "OrderBookDelta").
-    lin_delta_by_token: dict[str, list[dict]] = defaultdict(list)
-    for tid, rows in lin_by_token.items():
-        lin_delta_by_token[tid] = [
-            r for r in rows if r.get("recordType", "").startswith("OrderBookDelta")
-        ]
-
-    up_token = up_instr.raw_symbol.value
-    down_token = down_instr.raw_symbol.value if down_instr else None
-
-    result: list[tuple] = []
-    for deltas, token, side_key in [
-        (up_deltas, up_token, "UP"),
-        (down_deltas, down_token, "DOWN"),
-    ]:
-        if not deltas or not token:
-            continue
-        lin_rows = lin_delta_by_token.get(token, [])
-        # Match by position within the sorted group â€” both are sorted by (ts_event, action_rank).
-        # This works because the converter writes deltas and lineage in the same order.
-        for i, d in enumerate(deltas):
-            if i < len(lin_rows):
-                row = lin_rows[i]
-                seq = row.get("sourceSequence", 0)
-                child = row.get("childIndex", 0)
-            else:
-                seq = 0
-                child = i
-            result.append((d, seq, child, side_key))
-    return result
 
 
 def _as_deltas(delta):
@@ -410,30 +438,24 @@ def _to_dict(obj: Any) -> dict:
     return dict(obj)
 
 
-def _read_run_id(cat_dir: Path) -> str:
-    report_path = cat_dir / "conversion-report.json"
-    if report_path.exists():
-        return json.loads(report_path.read_text(encoding="utf-8")).get("sourceRunId", "")
-    return ""
+def _instrument_token_map(cat_dir: Path) -> dict[str, str]:
+    from nautilus_trader.persistence.catalog import ParquetDataCatalog
+
+    cat = ParquetDataCatalog(str(cat_dir))
+    out: dict[str, str] = {}
+    for instr in cat.instruments():
+        out[instr.outcome] = instr.raw_symbol.value
+    return out
 
 
-def _read_source_corpus_hash(cat_dir: Path) -> tuple[str, int, dict]:
-    """Read and validate the persisted source-corpus integrity artifact.
+def _decimal_eq(a: str | None, b: str | None) -> bool:
+    if a is None and b is None:
+        return True
+    if a is None or b is None:
+        return False
+    from decimal import Decimal
 
-    Returns the verified hash, the raw line count, and the verifier parameters.
-    Raises ValueError if the artifact is missing or malformed.
-    """
-    path = cat_dir / "source-corpus-hash.json"
-    if not path.exists():
-        raise ValueError(f"source-corpus-hash.json missing in {cat_dir}")
-    data = json.loads(path.read_text(encoding="utf-8"))
-    h = data.get("sourceCorpusHash", "")
-    if not isinstance(h, str) or len(h) != 64 or any(c not in "0123456789abcdef" for c in h):
-        raise ValueError(f"invalid sourceCorpusHash in {path}")
-    line_count = data.get("sourceCorpusLineCount", 0)
-    if not isinstance(line_count, int) or line_count < 0:
-        raise ValueError(f"invalid sourceCorpusLineCount in {path}")
-    return h, line_count, data.get("verifierParameters", {})
+    return Decimal(a) == Decimal(b)
 
 
 def compare_final_books(result: ReplayResult, catalog_directory: str | Path) -> dict:
@@ -444,7 +466,6 @@ def compare_final_books(result: ReplayResult, catalog_directory: str | Path) -> 
         json.loads(expected_path.read_text(encoding="utf-8")) if expected_path.exists() else {}
     )
 
-    # Map expected by tokenId; map reconstructed by token id embedded in instrument id.
     instrs = _instrument_token_map(cat_dir)
     comparisons = []
     for outcome, book in (("UP", result.final_up_book), ("DOWN", result.final_down_book)):
@@ -452,7 +473,6 @@ def compare_final_books(result: ReplayResult, catalog_directory: str | Path) -> 
         exp = expected.get(token_id, {}) if token_id else {}
         recon_bid = book.best_bid
         recon_ask = book.best_ask
-        # Normalize decimal lexemes for comparison (strip leading ".")
         comparisons.append(
             {
                 "outcome": outcome,
@@ -485,29 +505,14 @@ def compare_final_books(result: ReplayResult, catalog_directory: str | Path) -> 
     return {"allMatch": all_match, "comparisons": comparisons}
 
 
-def _instrument_token_map(cat_dir: Path) -> dict[str, str]:
-    from nautilus_trader.persistence.catalog import ParquetDataCatalog
-
-    cat = ParquetDataCatalog(str(cat_dir))
-    out: dict[str, str] = {}
-    for instr in cat.instruments():
-        out[instr.outcome] = instr.raw_symbol.value
-    return out
-
-
-def _decimal_eq(a: str | None, b: str | None) -> bool:
-    if a is None and b is None:
-        return True
-    if a is None or b is None:
-        return False
-    from decimal import Decimal
-
-    return Decimal(a) == Decimal(b)
-
-
-def run_replay(catalog_directory: str | Path, output: str | Path | None = None) -> dict:
+def run_replay(
+    catalog_directory: str | Path,
+    output: str | Path | None = None,
+    *,
+    allow_unverified: bool = False,
+) -> dict:
     """Replay, compare final books, and write a replay report. Returns the combined report."""
-    result = replay_catalog(catalog_directory)
+    result = replay_catalog(catalog_directory, allow_unverified=allow_unverified)
     comparison = compare_final_books(result, catalog_directory)
     report = {"replay": result.to_dict(), "finalBookComparison": comparison}
     if output is not None:
@@ -521,8 +526,22 @@ def _main() -> int:
     parser = argparse.ArgumentParser(prog="prediction_markets_nautilus.replay")
     parser.add_argument("--catalog-directory", required=True)
     parser.add_argument("--output", default=None)
+    parser.add_argument(
+        "--allow-unverified",
+        action="store_true",
+        help="allow replay of a catalog converted with the TypeScript verifier disabled",
+    )
     args = parser.parse_args()
-    print(json.dumps(run_replay(args.catalog_directory, args.output), indent=2))
+    print(
+        json.dumps(
+            run_replay(
+                args.catalog_directory,
+                args.output,
+                allow_unverified=args.allow_unverified,
+            ),
+            indent=2,
+        )
+    )
     return 0
 
 

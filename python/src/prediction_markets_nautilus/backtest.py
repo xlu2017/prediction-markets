@@ -31,6 +31,28 @@ from .models import ReferencePriceUpdate
 
 _MS_TO_NS = 1_000_000
 
+# Canonical replay configuration included in the engine-input hash.
+REPLAY_CONFIG: dict = {
+    "venue": {
+        "name": "POLYMARKET",
+        "oms_type": "NETTING",
+        "account_type": "CASH",
+        "book_type": "L2_MBP",
+        "starting_balances": ["1_000_000 pUSD"],
+    },
+    "strategy": {
+        "strategy_path": "prediction_markets_nautilus.backtest:ProofStrategy",
+        "config_path": "prediction_markets_nautilus.backtest:ProofStrategyConfig",
+    },
+    "engine": {"run_analysis": False},
+    "data_classes": [
+        "nautilus_trader.model.data:OrderBookDelta",
+        "nautilus_trader.model.data:OrderBookDelta",
+        "prediction_markets_nautilus.models:ReferencePriceUpdate",
+    ],
+    "client_id": "CHAINLINK",
+}
+
 
 @dataclass
 class BacktestProofResult:

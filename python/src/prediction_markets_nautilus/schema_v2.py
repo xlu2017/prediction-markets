@@ -191,6 +191,8 @@ def validate_manifest(raw: Any) -> dict:
         "market": market,
         "clobStaleAfterMs": raw.get("clobStaleAfterMs"),
         "referenceStaleAfterMs": raw.get("referenceStaleAfterMs"),
+        "recorderVersion": raw.get("recorderVersion", ""),
+        "gitCommit": raw.get("gitCommit") or "",
     }
 
 
