@@ -20,8 +20,16 @@ CONTRACT_VERSION = 1
 
 @dataclass(frozen=True)
 class Lineage:
+    """Source-envelope lineage for one normalized record.
+
+    ``sourceSequence`` is the schema-v2 envelope sequence (canonical recorder order).
+    ``childIndex`` disambiguates multiple catalog rows expanded from one envelope
+    (e.g. one snapshot becomes CLEAR + N ADDs, each with a distinct childIndex).
+    Replay must order by ``(sourceSequence, childIndex)`` to preserve recorder order.
+    """
+
     runId: str
-    sequence: int
+    sequence: int  # alias for sourceSequence, kept for backward compat
     frameId: str | None
     messageIndex: int | None
     messageCount: int | None
@@ -33,11 +41,17 @@ class Lineage:
     sourceTimestamp: int | None
     receivedAt: int
     processedAt: int
+    childIndex: int = 0  # disambiguates expanded rows from one envelope
+
+    @property
+    def sourceSequence(self) -> int:
+        return self.sequence
 
     def to_dict(self) -> dict:
         return {
             "runId": self.runId,
-            "sequence": self.sequence,
+            "sourceSequence": self.sourceSequence,
+            "childIndex": self.childIndex,
             "frameId": self.frameId,
             "messageIndex": self.messageIndex,
             "messageCount": self.messageCount,

@@ -52,8 +52,10 @@ class BookState:
     def integrity(self) -> str:
         if self.best_bid is None or self.best_ask is None:
             return "NORMAL"
-        b = float(self.best_bid)
-        a = float(self.best_ask)
+        from decimal import Decimal
+
+        b = Decimal(self.best_bid)
+        a = Decimal(self.best_ask)
         if b > a:
             return "CROSSED"
         if b == a:
@@ -117,7 +119,12 @@ def _load_lineage(catalog_dir: Path) -> list[dict]:
 
 
 def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
-    """Replay a converted catalog deterministically and return hashes + final book state."""
+    """Replay a converted catalog deterministically and return hashes + final book state.
+
+    Events are ordered by ``(sourceSequence, childIndex)`` to preserve the recorder's
+    canonical receipt order, not source timestamps which may be delayed, equal, or
+    out of order.
+    """
     from nautilus_trader.model.book import OrderBook
     from nautilus_trader.model.enums import BookType
     from nautilus_trader.persistence.catalog import ParquetDataCatalog
@@ -128,25 +135,31 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
     instruments = cat.instruments()
     if not instruments:
         raise ValueError("no instruments in catalog")
-    # Identify Up and Down by outcome attribute.
     up_instr = next((i for i in instruments if i.outcome == "UP"), instruments[0])
     down_instr = next((i for i in instruments if i.outcome == "DOWN"), None)
 
     up_book = OrderBook(up_instr.id, book_type=BookType.L2_MBP)
     down_book = OrderBook(down_instr.id, book_type=BookType.L2_MBP) if down_instr else None
 
-    # Read all order-book deltas grouped by instrument, sorted deterministically.
+    # Read all order-book deltas, then order by (sourceSequence, childIndex) embedded
+    # in the delta's `sequence` field (sourceSequence * 1000 + childIndex).
     up_deltas = _read_deltas(cat, up_instr.id)
     down_deltas = _read_deltas(cat, down_instr.id) if down_instr else []
 
-    # Merge into a single deterministic event stream ordered by ts_event, then ts_init,
-    # then instrument outcome, then side, then price.
+    # Merge into a single event stream ordered by the embedded sequence key.
     events: list[dict] = []
     for d in up_deltas:
-        events.append({"ts": d.ts_event, "tsi": d.ts_init, "side": "UP", "delta": d})
+        seq_key = d.sequence
+        seq = seq_key // 1000
+        child = seq_key % 1000
+        events.append({"seq": seq, "child": child, "side": "UP", "delta": d})
     for d in down_deltas:
-        events.append({"ts": d.ts_event, "tsi": d.ts_init, "side": "DOWN", "delta": d})
-    events.sort(key=lambda e: (e["ts"], e["tsi"], e["side"]))
+        seq_key = d.sequence
+        seq = seq_key // 1000
+        child = seq_key % 1000
+        events.append({"seq": seq, "child": child, "side": "DOWN", "delta": d})
+    # Deterministic sort by recorder sequence, then child index, then side as tiebreaker.
+    events.sort(key=lambda e: (e["seq"], e["child"], e["side"]))
 
     up_after: list[str] = []
     down_after: list[str] = []
@@ -167,27 +180,39 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
             up_after.append(h)
         else:
             down_after.append(h)
-        # Strategy-visible event stream: deterministic snapshot of best bid/ask per event.
         strategy_visible.append(
             {
+                "sourceSequence": ev["seq"],
+                "childIndex": ev["child"],
                 "side": side_key,
-                "ts": ev["ts"],
                 "bestBid": state.best_bid,
                 "bestAsk": state.best_ask,
             }
         )
         # Trivial deterministic strategy: record an intent (never submit) when best bid < 0.50.
-        if state.best_bid is not None and float(state.best_bid) < 0.50:
-            order_intents.append(
-                {
-                    "side": side_key,
-                    "ts": ev["ts"],
-                    "predicate": "bestBid<0.50",
-                    "bestBid": state.best_bid,
-                    "action": "INTENT_ONLY_NO_ORDER",
-                }
-            )
-        input_stream.append({"side": side_key, "ts": ev["ts"], "action": str(delta.action)})
+        # Use Decimal, not float, for the comparison.
+        if state.best_bid is not None:
+            from decimal import Decimal
+
+            if Decimal(state.best_bid) < Decimal("0.50"):
+                order_intents.append(
+                    {
+                        "sourceSequence": ev["seq"],
+                        "childIndex": ev["child"],
+                        "side": side_key,
+                        "predicate": "bestBid<0.50",
+                        "bestBid": state.best_bid,
+                        "action": "INTENT_ONLY_NO_ORDER",
+                    }
+                )
+        input_stream.append(
+            {
+                "sourceSequence": ev["seq"],
+                "childIndex": ev["child"],
+                "side": side_key,
+                "action": str(delta.action),
+            }
+        )
 
     final_up = BookState.from_book(up_book)
     final_down = (
@@ -227,7 +252,9 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
         le = cd.data
         input_stream.append({"side": "LIFECYCLE", "ts": le.ts_event, "kind": le.kind})
 
-    input_stream.sort(key=lambda x: (x["ts"], x.get("side", "")))
+    input_stream.sort(
+        key=lambda x: (x.get("sourceSequence", 0), x.get("childIndex", 0), x.get("side", ""))
+    )
 
     run_id = _read_run_id(cat_dir)
     return ReplayResult(
@@ -250,21 +277,78 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
 _ACTION_RANK = {"CLEAR": 0, "ADD": 1, "UPDATE": 2, "DELETE": 3}
 
 
+def _action_name(delta) -> str:
+    return delta.action.name if hasattr(delta.action, "name") else str(delta.action)
+
+
 def _read_deltas(cat, instrument_id) -> list:
     # The catalog's instrument_id filter is unreliable in this version, so filter manually.
     raw = cat.order_book_deltas()
     flat = [d for d in raw if d.instrument_id == instrument_id]
-    # Deterministic sort: CLEAR must precede ADDs within a snapshot (ts_event shared).
+    # Sort by ts_event, then action rank (CLEAR before ADDs within a snapshot).
+    # Final ordering by (sourceSequence, childIndex) is done by the caller.
     flat.sort(
         key=lambda d: (
             d.ts_event,
             d.ts_init,
-            _ACTION_RANK.get(d.action.name, 9),
+            _ACTION_RANK.get(_action_name(d), 9),
             str(d.order.side) if d.order else "",
             str(d.order.price) if d.order else "",
         )
     )
     return flat
+
+
+def _match_deltas_to_lineage(
+    up_deltas: list, down_deltas: list, lineage: list[dict], up_instr, down_instr
+) -> list[tuple]:
+    """Match catalog delta rows to lineage rows by (tokenId, ts_event, actionRank, order).
+
+    Both the delta lists and the lineage rows are sorted deterministically, so we can
+    match them in order within each (tokenId, ts_event) group.
+    Returns a list of (delta, sourceSequence, childIndex, sideKey) tuples.
+    """
+    # Group lineage rows by tokenId, sorted by (sourceSequence, childIndex).
+    from collections import defaultdict
+
+    lin_by_token: dict[str, list[dict]] = defaultdict(list)
+    for row in lineage:
+        tid = row.get("tokenId")
+        if tid:
+            lin_by_token[tid].append(row)
+    for tid in lin_by_token:
+        lin_by_token[tid].sort(key=lambda r: (r.get("sourceSequence", 0), r.get("childIndex", 0)))
+
+    # Filter lineage to only delta rows (recordType starts with "OrderBookDelta").
+    lin_delta_by_token: dict[str, list[dict]] = defaultdict(list)
+    for tid, rows in lin_by_token.items():
+        lin_delta_by_token[tid] = [
+            r for r in rows if r.get("recordType", "").startswith("OrderBookDelta")
+        ]
+
+    up_token = up_instr.raw_symbol.value
+    down_token = down_instr.raw_symbol.value if down_instr else None
+
+    result: list[tuple] = []
+    for deltas, token, side_key in [
+        (up_deltas, up_token, "UP"),
+        (down_deltas, down_token, "DOWN"),
+    ]:
+        if not deltas or not token:
+            continue
+        lin_rows = lin_delta_by_token.get(token, [])
+        # Match by position within the sorted group — both are sorted by (ts_event, action_rank).
+        # This works because the converter writes deltas and lineage in the same order.
+        for i, d in enumerate(deltas):
+            if i < len(lin_rows):
+                row = lin_rows[i]
+                seq = row.get("sourceSequence", 0)
+                child = row.get("childIndex", 0)
+            else:
+                seq = 0
+                child = i
+            result.append((d, seq, child, side_key))
+    return result
 
 
 def _as_deltas(delta):

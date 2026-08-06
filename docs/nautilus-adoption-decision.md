@@ -6,18 +6,44 @@ while keeping the TypeScript recorder as the authoritative lossless acquisition 
 
 ## Conclusion
 
-**`ADOPT_WITH_CUSTOM_ADAPTER`**
+**`EVALUATION_INCOMPLETE`**
 
-NautilusTrader provides a strong, deterministic, production-grade engine for replay, backtesting,
-matching/fill simulation, portfolio accounting, and execution. It can represent both outcome-token
-books correctly and preserve source-envelope lineage **when a custom adapter is built**. It cannot,
-on its own, preserve the recorder's lossless audit semantics or model Chainlink reference prices —
-those require custom work that this spike has prototyped.
+The initial spike demonstrated that NautilusTrader can replay schema-v2 recordings deterministically
+and that a custom adapter can preserve source-envelope lineage. However, a subsequent review
+identified critical shortcomings (P0) and important gaps (P1) that have been addressed in this
+revision but require further validation before a final adoption decision:
 
-The existing Nautilus Polymarket adapter is reusable for **live execution and live market data** but
-is **not directly reusable for replaying schema-v2 recordings**: it expects a live CLOB/Gamma client
-and discards raw frame text, dedup metadata, and connection-generation lineage. Replay requires the
-custom schema-v2 → Nautilus converter and catalog driver built in this spike.
+### P0 findings (addressed)
+
+1. **Replay sequence preservation**: Replay now orders by `(sourceSequence, childIndex)` embedded
+   in each delta's `sequence` field, not by source timestamps which may be delayed or equal.
+2. **Multi-token price_change**: The converter now resolves the instrument per-change using
+   `price_changes[i].asset_id` when the envelope `tokenId` is null.
+3. **BacktestNode proof**: A real `BacktestNode` now runs against the converted catalog with a
+   strategy that receives book events, submits orders, and captures portfolio/account state.
+4. **Reader invariant cross-checks**: The reader now independently recomputes reference anomalies,
+   event counts, and book health from events rather than trusting health status fields.
+5. **Lineage one-to-one with catalog rows**: Each expanded catalog row (CLEAR + N ADDs from one
+   snapshot) has its own lineage row with a distinct `childIndex`.
+
+### P1 findings (addressed)
+
+1. **Python CI**: `uv sync --frozen --extra dev` installs dev dependencies.
+2. **Decimal guarantees**: Comparisons use `Decimal`, JSON float fallback uses `parse_float=Decimal`,
+   and a precision report is generated.
+3. **Audit classification**: `RECEIVED_NOT_APPLIED` is no longer classified as a duplicate — only
+   `DUPLICATE_APPLIED` is.
+4. **Lifecycle support**: `RECONNECT`, `RESYNC_BOUNDARY`, `STALE_FEED`, `GAP_DETECTED`, and
+   `CONNECTION_GENERATION_CHANGE` events are routed to lifecycle events.
+5. **Realistic fixture**: A 10-event fixture with snapshots, deltas, trades, multi-token
+   price_changes, lifecycle events, and same-time conflicts is now tested.
+
+### Remaining work before final decision
+
+- Validate the adapter against real (non-synthetic) schema-v2 recordings.
+- Test fill simulation with orders that actually cross the book.
+- Validate reference price custom data flow through the BacktestNode.
+- Performance test with larger event streams.
 
 ## Answers to the required questions
 

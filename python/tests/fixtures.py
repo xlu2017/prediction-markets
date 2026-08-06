@@ -356,3 +356,254 @@ def write_sample_run(directory: Path) -> Path:
     manifest = base_manifest(m, finalEventCount=4)
     health = base_health()
     return write_run(directory, manifest, health, sample_events(), market=m)
+
+
+def trade_event(
+    seq: int,
+    token_id: str,
+    price: str,
+    size: str,
+    aggressor: str,
+    ts: int,
+    gen: int = 1,
+) -> dict:
+    payload = {
+        "event_type": "price_change",
+        "asset_id": token_id,
+        "market": "0xcondition",
+        "trades": [{"price": price, "size": size, "side": aggressor}],
+        "timestamp": str(ts),
+    }
+    raw = json.dumps(payload)
+    return {
+        "schemaVersion": 2,
+        "runId": "fixture-run-001",
+        "sequence": seq,
+        "source": "POLYMARKET_CLOB",
+        "eventType": "trade",
+        "marketId": "market-200",
+        "conditionId": "0xcondition",
+        "sourceMarketId": "0xcondition",
+        "tokenId": token_id,
+        "observedTokenIds": None,
+        "sourceTimestamp": ts,
+        "topLevelSourceTimestamp": None,
+        "payloadSourceTimestamp": None,
+        "receivedAt": ts + 5,
+        "processedAt": ts + 6,
+        "connectionGeneration": gen,
+        "frameId": f"frame-{seq}",
+        "messageIndex": 0,
+        "messageCount": 1,
+        "isDuplicate": False,
+        "dedupeState": "UNIQUE_APPLIED",
+        "duplicateOfSequence": None,
+        "dedupeReason": None,
+        "payload": payload,
+        "rawText": raw,
+        "rawMessageText": raw,
+    }
+
+
+def lifecycle_event(
+    seq: int,
+    kind: str,
+    ts: int,
+    gen: int = 1,
+    detail: str = "",
+) -> dict:
+    return {
+        "schemaVersion": 2,
+        "runId": "fixture-run-001",
+        "sequence": seq,
+        "source": "POLYMARKET_CLOB",
+        "eventType": kind,
+        "marketId": "market-200",
+        "conditionId": "0xcondition",
+        "sourceMarketId": "0xcondition",
+        "tokenId": None,
+        "observedTokenIds": None,
+        "sourceTimestamp": ts,
+        "topLevelSourceTimestamp": None,
+        "payloadSourceTimestamp": None,
+        "receivedAt": ts + 5,
+        "processedAt": ts + 6,
+        "connectionGeneration": gen,
+        "frameId": f"frame-{seq}",
+        "messageIndex": 0,
+        "messageCount": 1,
+        "isDuplicate": False,
+        "dedupeState": "UNIQUE_APPLIED",
+        "duplicateOfSequence": None,
+        "dedupeReason": detail,
+        "payload": {"event_type": kind, "detail": detail},
+        "rawText": json.dumps({"event_type": kind, "detail": detail}),
+        "rawMessageText": json.dumps({"event_type": kind, "detail": detail}),
+    }
+
+
+def multi_token_price_change_event(
+    seq: int,
+    changes: list[dict],
+    ts: int,
+    gen: int = 1,
+) -> dict:
+    """A price_change event with multiple token changes and null envelope tokenId."""
+    payload = {
+        "event_type": "price_change",
+        "asset_id": None,
+        "market": "0xcondition",
+        "price_changes": changes,
+        "timestamp": str(ts),
+    }
+    raw = json.dumps(payload)
+    return {
+        "schemaVersion": 2,
+        "runId": "fixture-run-001",
+        "sequence": seq,
+        "source": "POLYMARKET_CLOB",
+        "eventType": "price_change",
+        "marketId": "market-200",
+        "conditionId": "0xcondition",
+        "sourceMarketId": "0xcondition",
+        "tokenId": None,
+        "observedTokenIds": None,
+        "sourceTimestamp": ts,
+        "topLevelSourceTimestamp": None,
+        "payloadSourceTimestamp": None,
+        "receivedAt": ts + 5,
+        "processedAt": ts + 6,
+        "connectionGeneration": gen,
+        "frameId": f"frame-{seq}",
+        "messageIndex": 0,
+        "messageCount": 1,
+        "isDuplicate": False,
+        "dedupeState": "UNIQUE_APPLIED",
+        "duplicateOfSequence": None,
+        "dedupeReason": None,
+        "payload": payload,
+        "rawText": raw,
+        "rawMessageText": raw,
+    }
+
+
+def realistic_events() -> list[dict]:
+    """A realistic event stream with snapshots, deltas, trades, lifecycle, multi-token changes.
+
+    Includes:
+    - Market discovery
+    - Initial snapshots for both tokens (same source timestamp = same-time conflict)
+    - A price_change delta on UP token
+    - A trade on DOWN token
+    - A multi-token price_change (envelope tokenId=null, per-change asset_id)
+    - A lifecycle RECONNECT event
+    - A second reference price observation
+    - Final snapshots reflecting the changes
+    """
+    base_ts = 1785909720100
+    return [
+        market_discovered(1),
+        # Both token snapshots at the same source timestamp (same-time conflict).
+        book_event(
+            2, "111111", [{"price": ".48", "size": "30"}], [{"price": ".52", "size": "25"}], base_ts
+        ),
+        book_event(
+            3, "222222", [{"price": ".47", "size": "20"}], [{"price": ".53", "size": "22"}], base_ts
+        ),
+        # Price change delta on UP token.
+        price_change_event(
+            4, "111111", [{"price": ".49", "size": "10", "side": "BUY"}], base_ts + 100
+        ),
+        # Trade on DOWN token.
+        trade_event(5, "222222", ".48", "5", "BUY", base_ts + 200),
+        # Multi-token price_change: envelope tokenId=null, each change has its own asset_id.
+        multi_token_price_change_event(
+            6,
+            [
+                {"price": ".50", "size": "15", "side": "BUY", "asset_id": "111111"},
+                {"price": ".49", "size": "12", "side": "BUY", "asset_id": "222222"},
+            ],
+            base_ts + 300,
+        ),
+        # Lifecycle: reconnect event.
+        lifecycle_event(7, "RECONNECT", base_ts + 400, gen=2, detail="WebSocket reconnected"),
+        # Second reference price observation.
+        reference_event(8, value="67235.1", ts=base_ts + 500),
+        # Updated snapshots after deltas.
+        book_event(
+            9,
+            "111111",
+            [{"price": ".50", "size": "15"}],
+            [{"price": ".51", "size": "20"}],
+            base_ts + 600,
+        ),
+        book_event(
+            10,
+            "222222",
+            [{"price": ".49", "size": "12"}],
+            [{"price": ".54", "size": "18"}],
+            base_ts + 700,
+        ),
+    ]
+
+
+def realistic_health() -> dict:
+    """Health summary matching the realistic_events stream."""
+    books = {
+        "111111": {
+            "tokenId": "111111",
+            "state": "SYNCHRONIZED",
+            "integrity": "NORMAL",
+            "crossedIncidentCount": 0,
+            "synchronizationEpoch": 0,
+            "snapshotConnectionGeneration": 2,
+            "bestBid": ".50",
+            "bestAsk": ".51",
+            "bidDepthCount": 1,
+            "askDepthCount": 1,
+            "lastSuccessfulUpdateTime": 1785909720806,
+            "healthy": True,
+        },
+        "222222": {
+            "tokenId": "222222",
+            "state": "SYNCHRONIZED",
+            "integrity": "NORMAL",
+            "crossedIncidentCount": 0,
+            "synchronizationEpoch": 0,
+            "snapshotConnectionGeneration": 2,
+            "bestBid": ".49",
+            "bestAsk": ".54",
+            "bidDepthCount": 1,
+            "askDepthCount": 1,
+            "lastSuccessfulUpdateTime": 1785909720806,
+            "healthy": True,
+        },
+    }
+    health = base_health(books=books)
+    health["totalEventsReceived"] = 10
+    health["eventCountsBySource"] = {
+        "POLYMARKET_MARKET": 1,
+        "POLYMARKET_CLOB": 7,
+        "POLYMARKET_REFERENCE_PRICE": 2,
+    }
+    health["eventCountsByType"] = {
+        "POLYMARKET_MARKET:MARKET_DISCOVERED": 1,
+        "POLYMARKET_CLOB:book": 4,
+        "POLYMARKET_CLOB:price_change": 2,
+        "POLYMARKET_CLOB:trade": 1,
+        "POLYMARKET_CLOB:RECONNECT": 1,
+        "POLYMARKET_REFERENCE_PRICE:REFERENCE_PRICE": 2,
+    }
+    health["reconnectCount"] = 1
+    health["lastReferenceReceivedAt"] = 1785909720605
+    health["lastReferenceSourceTimestamp"] = 1785909720600
+    health["finalReferenceAgeMs"] = 401
+    health["finalReferenceSourceAgeMs"] = 406
+    return health
+
+
+def write_realistic_run(directory: Path) -> Path:
+    m = base_market()
+    manifest = base_manifest(m, finalEventCount=10)
+    health = realistic_health()
+    return write_run(directory, manifest, health, realistic_events(), market=m)
