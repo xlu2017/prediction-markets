@@ -339,7 +339,16 @@ export function runtimeValidateHealth(raw: unknown): HealthSummary {
   assertOptionalNumber(record.finalReferenceAgeMs, "health.finalReferenceAgeMs");
   assertOptionalNumber(record.finalReferenceSourceAgeMs, "health.finalReferenceSourceAgeMs");
   assertBoolean(record.referenceFresh, "health.referenceFresh");
-  assertPositiveNumber(record.referenceClockSkewMs, "health.referenceClockSkewMs");
+  const referenceClockSkewMs = assertPositiveNumber(
+    record.referenceClockSkewMs,
+    "health.referenceClockSkewMs",
+  );
+  const RECORDER_REFERENCE_CLOCK_SKEW_MS = 5_000;
+  if (referenceClockSkewMs !== RECORDER_REFERENCE_CLOCK_SKEW_MS) {
+    throw new Error(
+      `health.referenceClockSkewMs is ${referenceClockSkewMs}, expected ${RECORDER_REFERENCE_CLOCK_SKEW_MS} (recorder policy is not configurable)`,
+    );
+  }
   assertNonNegativeSafeInteger(
     record.referenceTimestampAnomalyCount,
     "health.referenceTimestampAnomalyCount",
@@ -684,17 +693,8 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
   if (health.malformedEventCount > 0) {
     errors.push(`malformedEventCount is ${health.malformedEventCount}, expected 0`);
   }
-  if (health.staleFeedIncidents > 0) {
-    errors.push(`staleFeedIncidents is ${health.staleFeedIncidents}, expected 0`);
-  }
   if (Object.keys(health.openGapsByFeed).length > 0) {
     errors.push(`openGapsByFeed is non-empty: ${Object.keys(health.openGapsByFeed).join(", ")}`);
-  }
-  if (health.dataGapCount > 0) {
-    errors.push(`dataGapCount is ${health.dataGapCount}, expected 0`);
-  }
-  if (health.closedGapCount > 0) {
-    errors.push(`closedGapCount is ${health.closedGapCount}, expected 0`);
   }
   if (health.qualityFailures.length > 0) {
     const codes = health.qualityFailures.map((f) => f.code).join(", ");
@@ -819,6 +819,7 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
       let recomputedClosedGapCount = 0;
       let recomputedTotalGapDurationMs = 0;
       let recomputedMaxGapDurationMs = 0;
+      let recomputedStaleFeedIncidents = 0;
       const openGaps = new Map<string, number>();
       for (const event of events) {
         recomputedSourceCounts[event.source] = (recomputedSourceCounts[event.source] ?? 0) + 1;
@@ -826,6 +827,7 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
           (recomputedTypeCounts[`${event.source}:${event.eventType}`] ?? 0) + 1;
         if (event.eventType === "MALFORMED_EVENT") recomputedMalformed += 1;
         if (event.isDuplicate) recomputedDuplicates += 1;
+        if (event.eventType === "STALE_STREAM") recomputedStaleFeedIncidents += 1;
         if (event.eventType === "DATA_GAP_STARTED") {
           const feed = (event.payload as Record<string, unknown>).feed;
           if (typeof feed === "string") {
@@ -905,6 +907,11 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
       if (recomputedMaxGapDurationMs !== health.maximumGapDurationMs) {
         errors.push(
           `recomputed maximumGapDurationMs ${recomputedMaxGapDurationMs} does not match health.maximumGapDurationMs ${health.maximumGapDurationMs}`,
+        );
+      }
+      if (recomputedStaleFeedIncidents !== health.staleFeedIncidents) {
+        errors.push(
+          `recomputed staleFeedIncidents ${recomputedStaleFeedIncidents} does not match health.staleFeedIncidents ${health.staleFeedIncidents}`,
         );
       }
       const referenceObs = new Set<number>();
@@ -1032,6 +1039,8 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
       const replayBooks = new OrderBookTracker(tokenIds);
       const appliedBookGenerations = new Map<string, number>();
       let latestAcceptedClobGeneration: number | null = null;
+      let replayResyncPending = false;
+      let replayResyncPendingGeneration: number | null = null;
       let recomputedMaxSourceLatency: number | null = null;
       let recomputedMaxProcessingLatency: number | null = null;
       let recomputedLastRefReceivedAt: number | null = null;
@@ -1078,11 +1087,24 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
               continue;
             }
             const payload = event.payload as Record<string, unknown>;
+            const payloadEventType = payload.event_type;
+            if (payloadEventType !== event.eventType) {
+              errors.push(
+                `book event sequence ${event.sequence}: payload.event_type ${String(payloadEventType)} does not match envelope.eventType ${event.eventType}`,
+              );
+              continue;
+            }
             const assetId = payload.asset_id;
-            const market = payload.market;
             if (assetId !== event.tokenId) {
               errors.push(
                 `book event sequence ${event.sequence}: payload.asset_id ${String(assetId)} does not match tokenId ${event.tokenId}`,
+              );
+              continue;
+            }
+            const market = payload.market;
+            if (market !== event.sourceMarketId) {
+              errors.push(
+                `book event sequence ${event.sequence}: payload.market ${String(market)} does not match envelope.sourceMarketId ${event.sourceMarketId}`,
               );
               continue;
             }
@@ -1095,6 +1117,14 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
             try {
               replayBooks.apply(event.payload, event.processedAt, event.connectionGeneration ?? 0);
               appliedBookGenerations.set(event.tokenId, event.connectionGeneration ?? 0);
+              if (
+                replayResyncPending &&
+                replayResyncPendingGeneration !== null &&
+                (event.connectionGeneration ?? 0) > replayResyncPendingGeneration
+              ) {
+                replayResyncPending = false;
+                replayResyncPendingGeneration = null;
+              }
             } catch (replayError) {
               errors.push(
                 `replay failed for book event sequence ${event.sequence}: ${replayError instanceof Error ? replayError.message : String(replayError)}`,
@@ -1102,6 +1132,80 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
             }
           }
           if (event.eventType === "price_change") {
+            const payload = event.payload as Record<string, unknown>;
+            const payloadEventType = payload.event_type;
+            if (payloadEventType !== event.eventType) {
+              errors.push(
+                `price_change event sequence ${event.sequence}: payload.event_type ${String(payloadEventType)} does not match envelope.eventType ${event.eventType}`,
+              );
+              continue;
+            }
+            const market = payload.market;
+            if (market !== event.sourceMarketId) {
+              errors.push(
+                `price_change event sequence ${event.sequence}: payload.market ${String(market)} does not match envelope.sourceMarketId ${event.sourceMarketId}`,
+              );
+              continue;
+            }
+            if (market !== manifest.market.conditionId) {
+              errors.push(
+                `price_change event sequence ${event.sequence}: payload.market ${String(market)} does not match conditionId ${manifest.market.conditionId}`,
+              );
+              continue;
+            }
+            const payloadTokens = new Set<string>();
+            if (typeof payload.asset_id === "string") payloadTokens.add(payload.asset_id);
+            if (Array.isArray(payload.price_changes)) {
+              for (const item of payload.price_changes) {
+                const record =
+                  item !== null && typeof item === "object"
+                    ? (item as Record<string, unknown>)
+                    : null;
+                if (record !== null && typeof record.asset_id === "string") {
+                  payloadTokens.add(record.asset_id);
+                }
+              }
+            }
+            const payloadTokenSet = [...payloadTokens];
+            if (payloadTokenSet.length === 1) {
+              const token = payloadTokenSet[0];
+              if (event.tokenId !== token) {
+                errors.push(
+                  `price_change event sequence ${event.sequence}: envelope.tokenId ${String(event.tokenId)} does not match single payload token ${token}`,
+                );
+                continue;
+              }
+              if (event.observedTokenIds !== null) {
+                errors.push(
+                  `price_change event sequence ${event.sequence}: observedTokenIds must be null for single-token payload, got ${JSON.stringify(event.observedTokenIds)}`,
+                );
+                continue;
+              }
+            } else if (payloadTokenSet.length > 1) {
+              if (event.tokenId !== null) {
+                errors.push(
+                  `price_change event sequence ${event.sequence}: envelope.tokenId must be null for multi-token payload, got ${event.tokenId}`,
+                );
+                continue;
+              }
+              const observed =
+                event.observedTokenIds !== null ? [...event.observedTokenIds].sort() : [];
+              const sortedPayload = [...payloadTokenSet].sort();
+              if (
+                observed.length !== sortedPayload.length ||
+                observed.some((t, i) => t !== sortedPayload[i])
+              ) {
+                errors.push(
+                  `price_change event sequence ${event.sequence}: observedTokenIds ${JSON.stringify(event.observedTokenIds)} does not match payload token set ${JSON.stringify(sortedPayload)}`,
+                );
+                continue;
+              }
+            } else {
+              errors.push(
+                `price_change event sequence ${event.sequence}: payload has no asset_id tokens`,
+              );
+              continue;
+            }
             try {
               replayBooks.apply(event.payload, event.processedAt, event.connectionGeneration ?? 0);
             } catch (replayError) {
@@ -1116,7 +1220,11 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
           (event.eventType === "DATA_GAP_STARTED" || event.eventType === "STALE_STREAM") &&
           (event.payload as Record<string, unknown>).feed === "clob-market"
         ) {
-          replayBooks.requireResync();
+          if (!replayResyncPending) {
+            replayResyncPending = true;
+            replayResyncPendingGeneration = event.connectionGeneration;
+            replayBooks.requireResync();
+          }
         }
         if (
           event.source === "POLYMARKET_REFERENCE_PRICE" &&

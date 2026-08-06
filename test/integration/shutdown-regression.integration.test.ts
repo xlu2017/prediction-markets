@@ -186,8 +186,14 @@ describe("real shutdown interleaving regression", () => {
       .map((l) => JSON.parse(l) as RawEventEnvelope);
 
     // Exactly one controlled-shutdown CONNECTION_CLOSED is persisted
-    const closedEvents = events.filter((e) => e.eventType === "CONNECTION_CLOSED");
-    expect(closedEvents.length).toBeGreaterThanOrEqual(1);
+    const closedEvents = events.filter(
+      (e) =>
+        e.eventType === "CONNECTION_CLOSED" &&
+        e.source === "POLYMARKET_CLOB" &&
+        e.connectionGeneration === 1 &&
+        (e.payload as Record<string, unknown>).reason === "controlled shutdown",
+    );
+    expect(closedEvents.length).toBe(1);
 
     // events line count = manifest.finalEventCount
     expect(events.length).toBe(manifest.finalEventCount);

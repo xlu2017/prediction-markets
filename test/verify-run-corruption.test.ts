@@ -650,7 +650,9 @@ describe("verify-run corrupted artifact detection", () => {
     payload.market = "0xwrong";
     lines[1] = JSON.stringify(book1);
     await writeLines(path.join(dir, "events.jsonl"), lines);
-    await expect(verifyRun(dir, 1)).rejects.toThrow(/payload\.market.*does not match conditionId/);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /payload\.market.*does not match envelope\.sourceMarketId/,
+    );
   });
 
   it("fails when final bestBid is changed in health", async () => {
@@ -703,5 +705,314 @@ describe("verify-run corrupted artifact detection", () => {
     await expect(verifyRun(dir, 1)).rejects.toThrow(
       /replayed crossedIncidentCount.*does not match health/,
     );
+  });
+
+  it("fails when health.referenceClockSkewMs differs from recorder policy (5000)", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const health = await readJson(path.join(dir, "health.json"));
+    health.referenceClockSkewMs = 10_000;
+    await writeJson(path.join(dir, "health.json"), health);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/referenceClockSkewMs is 10000, expected 5000/);
+  });
+
+  it("fails when price_change payload.market is changed to another condition", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const priceChange = {
+      ...book1,
+      sequence: 5,
+      eventType: "price_change",
+      tokenId: "111111",
+      observedTokenIds: null,
+      payload: {
+        event_type: "price_change",
+        asset_id: "111111",
+        market: "0xwrong",
+        price_changes: [{ asset_id: "111111", price: ".49", size: "10", side: "BUY" }],
+        timestamp: String(1785909720100),
+      },
+    };
+    lines.push(JSON.stringify(priceChange));
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.finalEventCount = 5;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    const health = await readJson(path.join(dir, "health.json"));
+    health.totalEventsReceived = 5;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:price_change"] = 1;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_CLOB = 3;
+    await writeJson(path.join(dir, "health.json"), health);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /price_change event sequence 5: payload\.market.*does not match envelope\.sourceMarketId/,
+    );
+  });
+
+  it("fails when price_change payload.event_type is changed", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const priceChange = {
+      ...book1,
+      sequence: 5,
+      eventType: "price_change",
+      tokenId: "111111",
+      observedTokenIds: null,
+      payload: {
+        event_type: "book",
+        asset_id: "111111",
+        market: "0xcondition",
+        price_changes: [{ asset_id: "111111", price: ".49", size: "10", side: "BUY" }],
+        timestamp: String(1785909720100),
+      },
+    };
+    lines.push(JSON.stringify(priceChange));
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.finalEventCount = 5;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    const health = await readJson(path.join(dir, "health.json"));
+    health.totalEventsReceived = 5;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:price_change"] = 1;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_CLOB = 3;
+    await writeJson(path.join(dir, "health.json"), health);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /price_change event sequence 5: payload\.event_type.*does not match envelope\.eventType/,
+    );
+  });
+
+  it("fails when price_change observedTokenIds is missing a payload token", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const priceChange = {
+      ...book1,
+      sequence: 5,
+      eventType: "price_change",
+      tokenId: null,
+      observedTokenIds: ["111111"],
+      payload: {
+        event_type: "price_change",
+        asset_id: "111111",
+        market: "0xcondition",
+        price_changes: [
+          { asset_id: "111111", price: ".49", size: "10", side: "BUY" },
+          { asset_id: "222222", price: ".51", size: "10", side: "SELL" },
+        ],
+        timestamp: String(1785909720100),
+      },
+    };
+    lines.push(JSON.stringify(priceChange));
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.finalEventCount = 5;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    const health = await readJson(path.join(dir, "health.json"));
+    health.totalEventsReceived = 5;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:price_change"] = 1;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_CLOB = 3;
+    await writeJson(path.join(dir, "health.json"), health);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /price_change event sequence 5: observedTokenIds.*does not match payload token set/,
+    );
+  });
+
+  it("fails when price_change observedTokenIds contains an extra token", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const priceChange = {
+      ...book1,
+      sequence: 5,
+      eventType: "price_change",
+      tokenId: null,
+      observedTokenIds: ["111111", "222222", "999999"],
+      payload: {
+        event_type: "price_change",
+        asset_id: "111111",
+        market: "0xcondition",
+        price_changes: [
+          { asset_id: "111111", price: ".49", size: "10", side: "BUY" },
+          { asset_id: "222222", price: ".51", size: "10", side: "SELL" },
+        ],
+        timestamp: String(1785909720100),
+      },
+    };
+    lines.push(JSON.stringify(priceChange));
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.finalEventCount = 5;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    const health = await readJson(path.join(dir, "health.json"));
+    health.totalEventsReceived = 5;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:price_change"] = 1;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_CLOB = 3;
+    await writeJson(path.join(dir, "health.json"), health);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /price_change event sequence 5: observedTokenIds.*does not match payload token set/,
+    );
+  });
+
+  it("fails when price_change tokenId is inconsistent with payload asset_id", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const priceChange = {
+      ...book1,
+      sequence: 5,
+      eventType: "price_change",
+      tokenId: "222222",
+      observedTokenIds: null,
+      payload: {
+        event_type: "price_change",
+        asset_id: "111111",
+        market: "0xcondition",
+        price_changes: [{ asset_id: "111111", price: ".49", size: "10", side: "BUY" }],
+        timestamp: String(1785909720100),
+      },
+    };
+    lines.push(JSON.stringify(priceChange));
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.finalEventCount = 5;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    const health = await readJson(path.join(dir, "health.json"));
+    health.totalEventsReceived = 5;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:price_change"] = 1;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_CLOB = 3;
+    await writeJson(path.join(dir, "health.json"), health);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /price_change event sequence 5: envelope\.tokenId.*does not match single payload token/,
+    );
+  });
+
+  it("replay resync guard: epoch advances exactly once for STALE_STREAM + DATA_GAP_STARTED", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const market = JSON.parse(requireLine(lines, 0)) as Record<string, unknown>;
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const book2 = JSON.parse(requireLine(lines, 2)) as Record<string, unknown>;
+    const ref = JSON.parse(requireLine(lines, 3)) as Record<string, unknown>;
+
+    const staleStream = {
+      ...book1,
+      sequence: 5,
+      eventType: "STALE_STREAM",
+      tokenId: null,
+      observedTokenIds: null,
+      sourceMarketId: null,
+      sourceTimestamp: null,
+      payload: { feed: "clob-market", reason: "stale" },
+    };
+    const gapStarted = {
+      ...book1,
+      sequence: 6,
+      eventType: "DATA_GAP_STARTED",
+      tokenId: null,
+      observedTokenIds: null,
+      sourceMarketId: null,
+      sourceTimestamp: null,
+      payload: { feed: "clob-market" },
+    };
+    const book1Gen2 = {
+      ...book1,
+      sequence: 7,
+      connectionGeneration: 2,
+      processedAt: 1785909720120,
+      receivedAt: 1785909720119,
+      sourceTimestamp: 1785909720118,
+    };
+    const book2Gen2 = {
+      ...book2,
+      sequence: 8,
+      connectionGeneration: 2,
+      processedAt: 1785909720121,
+      receivedAt: 1785909720120,
+      sourceTimestamp: 1785909720119,
+    };
+    const refGen2 = {
+      ...ref,
+      sequence: 9,
+      connectionGeneration: 2,
+      receivedAt: 1785909720123,
+      processedAt: 1785909720124,
+      sourceTimestamp: 1785909720122,
+      topLevelSourceTimestamp: 1785909720122,
+      payloadSourceTimestamp: 1785909720122,
+    };
+    const closed = {
+      ...book1,
+      sequence: 10,
+      eventType: "CONNECTION_CLOSED",
+      tokenId: null,
+      observedTokenIds: null,
+      sourceMarketId: null,
+      sourceTimestamp: null,
+      payload: { code: 1000, reason: "controlled shutdown" },
+    };
+
+    const newLines = [
+      JSON.stringify(market),
+      JSON.stringify(book1),
+      JSON.stringify(book2),
+      JSON.stringify(ref),
+      JSON.stringify(staleStream),
+      JSON.stringify(gapStarted),
+      JSON.stringify(book1Gen2),
+      JSON.stringify(book2Gen2),
+      JSON.stringify(refGen2),
+      JSON.stringify(closed),
+    ];
+    await writeLines(path.join(dir, "events.jsonl"), newLines);
+
+    const health = await readJson(path.join(dir, "health.json"));
+    health.totalEventsReceived = 10;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_CLOB = 7;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_REFERENCE_PRICE = 2;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:book"] = 4;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:STALE_STREAM"] = 1;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:DATA_GAP_STARTED"] = 1;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:CONNECTION_CLOSED"] = 1;
+    (health.eventCountsByType as Record<string, number>)[
+      "POLYMARKET_REFERENCE_PRICE:REFERENCE_PRICE"
+    ] = 2;
+    health.staleFeedIncidents = 1;
+    health.dataGapCount = 1;
+    health.closedGapCount = 0;
+    health.reconnectCount = 1;
+    health.maximumSourceToReceiveLatencyMs = 5;
+    health.maximumReceiveToProcessLatencyMs = 1;
+    health.lastReferenceReceivedAt = 1785909720123;
+    health.lastReferenceSourceTimestamp = 1785909720122;
+    health.lastReferenceConnectionGeneration = 2;
+    health.finalReferenceAgeMs = 1785909720126 - 1785909720123;
+    health.finalReferenceSourceAgeMs = 1785909720126 - 1785909720122;
+    const bookHealth = health.finalBookHealth as Record<string, Record<string, unknown>>;
+    const upHealth = bookHealth["111111"];
+    if (upHealth === undefined) throw new Error("fixture missing book 111111");
+    const downHealth = bookHealth["222222"];
+    if (downHealth === undefined) throw new Error("fixture missing book 222222");
+    upHealth.synchronizationEpoch = 1;
+    upHealth.snapshotConnectionGeneration = 2;
+    upHealth.lastSuccessfulUpdateTime = 1785909720120;
+    downHealth.synchronizationEpoch = 1;
+    downHealth.snapshotConnectionGeneration = 2;
+    downHealth.lastSuccessfulUpdateTime = 1785909720121;
+    await writeJson(path.join(dir, "health.json"), health);
+
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.finalEventCount = 10;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+
+    // The verifier should pass — epoch advanced exactly once despite
+    // both STALE_STREAM and DATA_GAP_STARTED being present
+    await expect(verifyRun(dir, 1)).resolves.toBeUndefined();
   });
 });

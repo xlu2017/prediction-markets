@@ -234,3 +234,6 @@ strings.
 - Only the current two-token BTC five-minute Up/Down contract format is supported.
 - The public smoke test was not run in the build environment because direct Polymarket egress was
   unavailable. A manual, read-only GitHub Actions workflow is included.
+- Until raw-message reparsing is added, the `verify-run` artifact checker proves internal
+  consistency of normalized envelopes, replayed state, `health.json`, and `manifest.json`. It does
+  not independently prove that normalized payloads are identical to the preserved wire messages.
