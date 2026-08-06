@@ -44,6 +44,7 @@ function rawDataToString(data: RawData): string {
 
 export class ManagedWebSocket {
   private socket: WebSocket | null = null;
+  private closePromise: Promise<void> = Promise.resolve();
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
   private staleTimer: NodeJS.Timeout | null = null;
@@ -85,7 +86,14 @@ export class ManagedWebSocket {
     this.clearTimers();
     const socket = this.socket;
     this.socket = null;
-    if (socket === null || socket.readyState === WebSocket.CLOSED) return;
+    if (socket === null) {
+      await this.closePromise;
+      return;
+    }
+    if (socket.readyState === WebSocket.CLOSED) {
+      await this.closePromise;
+      return;
+    }
 
     await new Promise<void>((resolve) => {
       const timeout = setTimeout(() => {
@@ -100,6 +108,7 @@ export class ManagedWebSocket {
       if (socket.readyState === WebSocket.CONNECTING) socket.terminate();
       else socket.close(1000, "controlled shutdown");
     });
+    await this.closePromise;
   }
 
   public notifyValidDataMessage(receivedAt: number, connectionGeneration: number): boolean {
@@ -125,6 +134,11 @@ export class ManagedWebSocket {
     const currentGeneration = this.generation;
     const socket = this.createSocket(this.options.url);
     this.socket = socket;
+    this.closePromise = new Promise<void>((resolveClose) => {
+      socket.once("close", () => {
+        resolveClose();
+      });
+    });
 
     this.emitLifecycle("CONNECTION_ATTEMPT", currentGeneration, { url: this.options.url });
 
