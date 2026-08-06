@@ -166,6 +166,7 @@ export class RecorderEventProcessor {
   private queue: Promise<void> = Promise.resolve();
   private fatalError: Error | null = null;
   private clobResyncPending = false;
+  private clobResyncPendingGeneration: number | null = null;
 
   public constructor(
     runId: string,
@@ -194,13 +195,13 @@ export class RecorderEventProcessor {
         event.eventType === "DATA_GAP_STARTED" &&
         (event.payload as Record<string, unknown>).feed === "clob-market"
       ) {
-        this.requireClobResync();
+        this.requireClobResync(event.connectionGeneration);
       }
       if (
         event.eventType === "STALE_STREAM" &&
         (event.payload as Record<string, unknown>).feed === "clob-market"
       ) {
-        this.requireClobResync();
+        this.requireClobResync(event.connectionGeneration);
       }
       const envelope = this.sequencer.next({
         source: event.source,
@@ -217,9 +218,10 @@ export class RecorderEventProcessor {
     });
   }
 
-  private requireClobResync(): void {
+  private requireClobResync(generation: number): void {
     if (this.clobResyncPending) return;
     this.clobResyncPending = true;
+    this.clobResyncPendingGeneration = generation;
     this.books.requireResync();
     this.onClobGap?.();
   }
@@ -459,8 +461,14 @@ export class RecorderEventProcessor {
     this.health.observe(envelope, tokens);
     if (isDuplicate) this.health.duplicateEvent();
     else {
-      if (eventType === "book" || eventType === "price_change") {
+      if (
+        (eventType === "book" || eventType === "price_change") &&
+        this.clobResyncPending &&
+        this.clobResyncPendingGeneration !== null &&
+        frame.connectionGeneration > this.clobResyncPendingGeneration
+      ) {
         this.clobResyncPending = false;
+        this.clobResyncPendingGeneration = null;
       }
       this.onValidData?.(frame);
     }

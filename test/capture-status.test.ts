@@ -385,9 +385,94 @@ describe("capture status fail-closed semantics", () => {
     );
     const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1);
     expect(summary.referenceTimestampAnomalyCount).toBe(1);
+    expect(summary.referenceTimestampMissingCount).toBe(1);
+    expect(summary.referenceStaleAtReceiptCount).toBe(0);
+    expect(summary.referenceFutureSourceSkewCount).toBe(0);
     expect(summary.usableForReplay).toBe(false);
     expect(summary.qualityFailures.some((f) => f.code === "REFERENCE_TIMESTAMP_MISSING")).toBe(
       true,
     );
+  });
+
+  it("counts stale-at-receipt anomalies using referenceStaleAfterMs, not a fixed multiple", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books, 10_000);
+    setupBooks(books);
+    observeBookSnapshots(health);
+    // Source timestamp 20s behind receipt — exceeds 10s stale threshold but is < 30s (old fixed cutoff)
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 1,
+        receivedAt: NOW,
+        sourceTimestamp: NOW - 20_000,
+      }),
+    );
+    // Later valid observation
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 2,
+        receivedAt: NOW + 50,
+        sourceTimestamp: NOW + 50,
+      }),
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1);
+    expect(summary.referenceStaleAtReceiptCount).toBe(1);
+    expect(summary.referenceTimestampAnomalyCount).toBe(1);
+    expect(summary.usableForReplay).toBe(false);
+  });
+
+  it("does not count source age as anomalous when within referenceStaleAfterMs", () => {
+    const books = new OrderBookTracker(TOKENS);
+    // Use a 60s stale threshold — 31s source age should NOT be anomalous
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books, 60_000);
+    setupBooks(books);
+    observeBookSnapshots(health);
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 1,
+        receivedAt: NOW,
+        sourceTimestamp: NOW - 31_000,
+      }),
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 60_000, 1);
+    expect(summary.referenceStaleAtReceiptCount).toBe(0);
+    expect(summary.referenceTimestampAnomalyCount).toBe(0);
+  });
+
+  it("counts future source-clock skew anomalies using referenceClockSkewMs", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books, 10_000);
+    setupBooks(books);
+    observeBookSnapshots(health);
+    // Source timestamp 10s in the future — exceeds 5s skew tolerance
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 1,
+        receivedAt: NOW,
+        sourceTimestamp: NOW + 10_000,
+      }),
+    );
+    // Later valid observation
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 2,
+        receivedAt: NOW + 50,
+        sourceTimestamp: NOW + 50,
+      }),
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 10_000, 1);
+    expect(summary.referenceFutureSourceSkewCount).toBe(1);
+    expect(summary.referenceTimestampAnomalyCount).toBe(1);
+    expect(summary.usableForReplay).toBe(false);
   });
 });

@@ -138,4 +138,199 @@ describe("resync guard clears only on book events", () => {
     // gapCallbacks should be 1 (from STALE_STREAM only), not 2.
     expect(gapCallbacks).toBe(1);
   });
+
+  it("does not clear clobResyncPending on book events from the same stale generation", async () => {
+    const market = validMarket();
+    const books = new OrderBookTracker([market.upTokenId, market.downTokenId]);
+    const health = new HealthTracker(
+      "test",
+      "2026-08-05T06:02:00.000Z",
+      [market.upTokenId, market.downTokenId],
+      books,
+    );
+    const store = new CapturingStore();
+    const logger = createLogger("error");
+    const noop = (): void => {
+      void 0;
+    };
+    let gapCallbacks = 0;
+    const onClobGap = (): void => {
+      gapCallbacks += 1;
+    };
+    const processor = new RecorderEventProcessor(
+      "test-run",
+      market,
+      store as unknown as ConstructorParameters<typeof RecorderEventProcessor>[2],
+      books,
+      health,
+      logger,
+      () => FIXED_NOW,
+      noop,
+      noop,
+      onClobGap,
+    );
+
+    // Apply initial book snapshots at generation 1
+    const bookFrame = makeFrame(
+      JSON.stringify({
+        event_type: "book",
+        asset_id: market.upTokenId,
+        market: market.conditionId,
+        bids: [{ price: ".48", size: "30" }],
+        asks: [{ price: ".52", size: "25" }],
+        timestamp: String(FIXED_NOW),
+      }),
+      1,
+    );
+    processor.enqueueFrame(bookFrame);
+    const bookFrame2 = makeFrame(
+      JSON.stringify({
+        event_type: "book",
+        asset_id: market.downTokenId,
+        market: market.conditionId,
+        bids: [{ price: ".47", size: "20" }],
+        asks: [{ price: ".53", size: "22" }],
+        timestamp: String(FIXED_NOW),
+      }),
+      1,
+    );
+    processor.enqueueFrame(bookFrame2);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // Emit STALE_STREAM lifecycle for clob-market at generation 1
+    processor.enqueueLifecycle({
+      source: "POLYMARKET_CLOB",
+      eventType: "STALE_STREAM",
+      receivedAt: FIXED_NOW,
+      connectionGeneration: 1,
+      payload: { feed: "clob-market", staleAfterMs: 15000 },
+    });
+
+    // A late book from the SAME stale generation 1 arrives — should NOT clear the guard
+    const lateBookFrame = makeFrame(
+      JSON.stringify({
+        event_type: "book",
+        asset_id: market.upTokenId,
+        market: market.conditionId,
+        bids: [{ price: ".49", size: "10" }],
+        asks: [{ price: ".51", size: "15" }],
+        timestamp: String(FIXED_NOW),
+      }),
+      1,
+    );
+    processor.enqueueFrame(lateBookFrame);
+
+    // Emit DATA_GAP_STARTED lifecycle for clob-market at generation 1
+    processor.enqueueLifecycle({
+      source: "POLYMARKET_CLOB",
+      eventType: "DATA_GAP_STARTED",
+      receivedAt: FIXED_NOW,
+      connectionGeneration: 1,
+      payload: { feed: "clob-market", gapStartedAt: FIXED_NOW },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // The late book from the same generation should NOT have cleared the guard,
+    // so DATA_GAP_STARTED should not trigger a second resync.
+    expect(gapCallbacks).toBe(1);
+  });
+
+  it("clears clobResyncPending on book events from a strictly newer generation", async () => {
+    const market = validMarket();
+    const books = new OrderBookTracker([market.upTokenId, market.downTokenId]);
+    const health = new HealthTracker(
+      "test",
+      "2026-08-05T06:02:00.000Z",
+      [market.upTokenId, market.downTokenId],
+      books,
+    );
+    const store = new CapturingStore();
+    const logger = createLogger("error");
+    const noop = (): void => {
+      void 0;
+    };
+    let gapCallbacks = 0;
+    const onClobGap = (): void => {
+      gapCallbacks += 1;
+    };
+    const processor = new RecorderEventProcessor(
+      "test-run",
+      market,
+      store as unknown as ConstructorParameters<typeof RecorderEventProcessor>[2],
+      books,
+      health,
+      logger,
+      () => FIXED_NOW,
+      noop,
+      noop,
+      onClobGap,
+    );
+
+    // Apply initial book snapshots at generation 1
+    const bookFrame = makeFrame(
+      JSON.stringify({
+        event_type: "book",
+        asset_id: market.upTokenId,
+        market: market.conditionId,
+        bids: [{ price: ".48", size: "30" }],
+        asks: [{ price: ".52", size: "25" }],
+        timestamp: String(FIXED_NOW),
+      }),
+      1,
+    );
+    processor.enqueueFrame(bookFrame);
+    const bookFrame2 = makeFrame(
+      JSON.stringify({
+        event_type: "book",
+        asset_id: market.downTokenId,
+        market: market.conditionId,
+        bids: [{ price: ".47", size: "20" }],
+        asks: [{ price: ".53", size: "22" }],
+        timestamp: String(FIXED_NOW),
+      }),
+      1,
+    );
+    processor.enqueueFrame(bookFrame2);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+
+    // Emit STALE_STREAM lifecycle for clob-market at generation 1
+    processor.enqueueLifecycle({
+      source: "POLYMARKET_CLOB",
+      eventType: "STALE_STREAM",
+      receivedAt: FIXED_NOW,
+      connectionGeneration: 1,
+      payload: { feed: "clob-market", staleAfterMs: 15000 },
+    });
+
+    // A book from generation 2 (newer) arrives — should clear the guard
+    const newGenBookFrame = makeFrame(
+      JSON.stringify({
+        event_type: "book",
+        asset_id: market.upTokenId,
+        market: market.conditionId,
+        bids: [{ price: ".49", size: "10" }],
+        asks: [{ price: ".51", size: "15" }],
+        timestamp: String(FIXED_NOW),
+      }),
+      2,
+    );
+    processor.enqueueFrame(newGenBookFrame);
+
+    // Emit DATA_GAP_STARTED lifecycle for clob-market at generation 1
+    // Since the guard was cleared by the gen-2 book, this should trigger a second resync
+    processor.enqueueLifecycle({
+      source: "POLYMARKET_CLOB",
+      eventType: "DATA_GAP_STARTED",
+      receivedAt: FIXED_NOW,
+      connectionGeneration: 1,
+      payload: { feed: "clob-market", gapStartedAt: FIXED_NOW },
+    });
+
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // The gen-2 book should have cleared the guard,
+    // so DATA_GAP_STARTED should trigger a second resync.
+    expect(gapCallbacks).toBe(2);
+  });
 });

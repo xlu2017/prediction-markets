@@ -69,5 +69,8 @@
   "finalReferenceSourceAgeMs": 6,
   "referenceFresh": true,
   "referenceClockSkewMs": 5000,
-  "referenceTimestampAnomalyCount": 0
+  "referenceTimestampAnomalyCount": 0,
+  "referenceTimestampMissingCount": 0,
+  "referenceStaleAtReceiptCount": 0,
+  "referenceFutureSourceSkewCount": 0
 }

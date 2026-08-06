@@ -46,14 +46,21 @@ export class HealthTracker {
   private totalGapDurationMs = 0;
   private maximumGapDurationMs = 0;
   private readonly referenceClockSkewMs = 5_000;
+  private readonly referenceStaleAfterMs: number;
   private referenceTimestampAnomalyCount = 0;
+  private referenceTimestampMissingCount = 0;
+  private referenceStaleAtReceiptCount = 0;
+  private referenceFutureSourceSkewCount = 0;
 
   public constructor(
     private readonly runId: string,
     private readonly startedAt: string,
     private readonly expectedTokenIds: [string, string],
     private readonly books: OrderBookTracker,
-  ) {}
+    referenceStaleAfterMs = 10_000,
+  ) {
+    this.referenceStaleAfterMs = referenceStaleAfterMs;
+  }
 
   public observe(envelope: RawEventEnvelope, tokenIds: string[] = []): void {
     this.total += 1;
@@ -94,11 +101,16 @@ export class HealthTracker {
       if (envelope.sourceTimestamp !== null) {
         this.lastReferenceSourceTimestamp = envelope.sourceTimestamp;
         const sourceAge = envelope.receivedAt - envelope.sourceTimestamp;
-        if (sourceAge < -this.referenceClockSkewMs || sourceAge > this.referenceClockSkewMs * 6) {
+        if (sourceAge < -this.referenceClockSkewMs) {
           this.referenceTimestampAnomalyCount += 1;
+          this.referenceFutureSourceSkewCount += 1;
+        } else if (sourceAge > this.referenceStaleAfterMs) {
+          this.referenceTimestampAnomalyCount += 1;
+          this.referenceStaleAtReceiptCount += 1;
         }
       } else {
         this.referenceTimestampAnomalyCount += 1;
+        this.referenceTimestampMissingCount += 1;
       }
     }
     if (envelope.eventType === "DATA_GAP_STARTED") {
@@ -400,6 +412,9 @@ export class HealthTracker {
       referenceFresh,
       referenceClockSkewMs: this.referenceClockSkewMs,
       referenceTimestampAnomalyCount: this.referenceTimestampAnomalyCount,
+      referenceTimestampMissingCount: this.referenceTimestampMissingCount,
+      referenceStaleAtReceiptCount: this.referenceStaleAtReceiptCount,
+      referenceFutureSourceSkewCount: this.referenceFutureSourceSkewCount,
     };
   }
 }

@@ -175,7 +175,13 @@ export async function runRecorder(
     }),
   );
   const books = new OrderBookTracker([market.upTokenId, market.downTokenId]);
-  const health = new HealthTracker(runId, startedAt, [market.upTokenId, market.downTokenId], books);
+  const health = new HealthTracker(
+    runId,
+    startedAt,
+    [market.upTokenId, market.downTokenId],
+    books,
+    referenceStaleAfterMs,
+  );
   const fatalController = new AbortController();
   const feedsBySource = new Map<string, ManagedWebSocket>();
   let currentClobGeneration: number | null = null;

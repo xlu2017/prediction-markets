@@ -129,12 +129,16 @@ time of the last valid non-duplicate Chainlink observation, or null),
 `finalReferenceSourceAgeMs` (age by source timestamp, or null), `referenceFresh` (true only if the
 reference was observed, both ages are within the staleness threshold, and the source timestamp is
 not beyond the clock skew tolerance), `referenceClockSkewMs` (tolerance for future source
-timestamps, default 5000ms), and `referenceTimestampAnomalyCount` (cumulative count of reference
-observations with missing or extreme source timestamps). A single shared `evaluateReferenceQuality`
-predicate is used for both `computeCaptureStatus` and `referenceFresh`, ensuring they can never
-contradict each other. Missing source timestamps produce `REFERENCE_TIMESTAMP_MISSING`, stale source
-timestamps produce `REFERENCE_STREAM_STALE`, future source timestamps beyond the skew tolerance
-produce `REFERENCE_CLOCK_SKEW`, and negative receipt ages produce `REFERENCE_LOCAL_CLOCK_SKEW`.
+timestamps, default 5000ms), `referenceTimestampAnomalyCount` (cumulative count of reference
+observations with missing or anomalous source timestamps), and a breakdown into
+`referenceTimestampMissingCount`, `referenceStaleAtReceiptCount`, and
+`referenceFutureSourceSkewCount`. Each historical reference observation is evaluated using the same
+configured `referenceStaleAfterMs` and `referenceClockSkewMs` thresholds as finalization. A single
+shared `evaluateReferenceQuality` predicate is used for both `computeCaptureStatus` and
+`referenceFresh`, ensuring they can never contradict each other. Missing source timestamps produce
+`REFERENCE_TIMESTAMP_MISSING`, stale source timestamps produce `REFERENCE_STREAM_STALE`, future
+source timestamps beyond the skew tolerance produce `REFERENCE_CLOCK_SKEW`, and negative receipt
+ages produce `REFERENCE_LOCAL_CLOCK_SKEW`.
 
 ## Clock semantics
 

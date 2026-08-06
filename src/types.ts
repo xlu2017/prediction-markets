@@ -161,6 +161,9 @@ export type HealthSummary = {
   referenceFresh: boolean;
   referenceClockSkewMs: number;
   referenceTimestampAnomalyCount: number;
+  referenceTimestampMissingCount: number;
+  referenceStaleAtReceiptCount: number;
+  referenceFutureSourceSkewCount: number;
 };
 
 export type LogLevel = "debug" | "error" | "info" | "warn";

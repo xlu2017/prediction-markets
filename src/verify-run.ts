@@ -68,6 +68,31 @@ function assertOptionalString(value: unknown, label: string): string | null {
   return assertString(value, label);
 }
 
+function assertNonNegativeSafeInteger(value: unknown, label: string): number {
+  const n = assertNumber(value, label);
+  if (!Number.isSafeInteger(n) || n < 0) {
+    throw new Error(`${label} is not a non-negative safe integer`);
+  }
+  return n;
+}
+
+function assertEnum<T extends string>(value: unknown, allowed: readonly T[], label: string): T {
+  const s = assertString(value, label);
+  if (!allowed.includes(s as T)) {
+    throw new Error(`${label} is ${s}, expected one of ${allowed.join(", ")}`);
+  }
+  return s as T;
+}
+
+const BOOK_STATES = [
+  "UNINITIALIZED",
+  "SYNCHRONIZED",
+  "STALE",
+  "RESYNC_REQUIRED",
+  "INVALID",
+] as const;
+const BOOK_INTEGRITIES = ["NORMAL", "LOCKED", "CROSSED"] as const;
+
 function runtimeValidateManifest(raw: unknown): RunManifest {
   const record = raw as Record<string, unknown>;
   if (typeof record !== "object") throw new Error("manifest is not an object");
@@ -106,18 +131,18 @@ function runtimeValidateBookHealth(raw: unknown, tokenId: string): BookHealth {
   const record = raw as Record<string, unknown>;
   if (typeof record !== "object") throw new Error(`book health for ${tokenId} is not an object`);
   assertString(record.tokenId, `book.${tokenId}.tokenId`);
-  assertString(record.state, `book.${tokenId}.state`);
-  assertString(record.integrity, `book.${tokenId}.integrity`);
-  assertNumber(record.crossedIncidentCount, `book.${tokenId}.crossedIncidentCount`);
-  assertNumber(record.synchronizationEpoch, `book.${tokenId}.synchronizationEpoch`);
+  assertEnum(record.state, BOOK_STATES, `book.${tokenId}.state`);
+  assertEnum(record.integrity, BOOK_INTEGRITIES, `book.${tokenId}.integrity`);
+  assertNonNegativeSafeInteger(record.crossedIncidentCount, `book.${tokenId}.crossedIncidentCount`);
+  assertNonNegativeSafeInteger(record.synchronizationEpoch, `book.${tokenId}.synchronizationEpoch`);
   assertOptionalNumber(
     record.snapshotConnectionGeneration,
     `book.${tokenId}.snapshotConnectionGeneration`,
   );
   assertOptionalString(record.bestBid, `book.${tokenId}.bestBid`);
   assertOptionalString(record.bestAsk, `book.${tokenId}.bestAsk`);
-  assertNumber(record.bidDepthCount, `book.${tokenId}.bidDepthCount`);
-  assertNumber(record.askDepthCount, `book.${tokenId}.askDepthCount`);
+  assertNonNegativeSafeInteger(record.bidDepthCount, `book.${tokenId}.bidDepthCount`);
+  assertNonNegativeSafeInteger(record.askDepthCount, `book.${tokenId}.askDepthCount`);
   assertOptionalNumber(record.lastSuccessfulUpdateTime, `book.${tokenId}.lastSuccessfulUpdateTime`);
   assertBoolean(record.healthy, `book.${tokenId}.healthy`);
   return raw as BookHealth;
@@ -131,11 +156,11 @@ function runtimeValidateHealth(raw: unknown): HealthSummary {
   assertString(record.runId, "health.runId");
   assertIsoTimestamp(record.startedAt, "health.startedAt");
   if (record.endedAt !== null) assertIsoTimestamp(record.endedAt, "health.endedAt");
-  assertNumber(record.totalEventsReceived, "health.totalEventsReceived");
-  assertNumber(record.malformedEventCount, "health.malformedEventCount");
-  assertNumber(record.duplicateEventCount, "health.duplicateEventCount");
-  assertNumber(record.reconnectCount, "health.reconnectCount");
-  assertNumber(record.staleFeedIncidents, "health.staleFeedIncidents");
+  assertNonNegativeSafeInteger(record.totalEventsReceived, "health.totalEventsReceived");
+  assertNonNegativeSafeInteger(record.malformedEventCount, "health.malformedEventCount");
+  assertNonNegativeSafeInteger(record.duplicateEventCount, "health.duplicateEventCount");
+  assertNonNegativeSafeInteger(record.reconnectCount, "health.reconnectCount");
+  assertNonNegativeSafeInteger(record.staleFeedIncidents, "health.staleFeedIncidents");
   assertBoolean(record.bothTokenStreamsObserved, "health.bothTokenStreamsObserved");
   assertBoolean(record.referencePriceStreamObserved, "health.referencePriceStreamObserved");
   assertBoolean(record.usableForReplay, "health.usableForReplay");
@@ -143,7 +168,22 @@ function runtimeValidateHealth(raw: unknown): HealthSummary {
   assertPositiveNumber(record.clobStaleAfterMs, "health.clobStaleAfterMs");
   assertPositiveNumber(record.referenceStaleAfterMs, "health.referenceStaleAfterMs");
   assertPositiveNumber(record.referenceClockSkewMs, "health.referenceClockSkewMs");
-  assertNumber(record.referenceTimestampAnomalyCount, "health.referenceTimestampAnomalyCount");
+  assertNonNegativeSafeInteger(
+    record.referenceTimestampAnomalyCount,
+    "health.referenceTimestampAnomalyCount",
+  );
+  assertNonNegativeSafeInteger(
+    record.referenceTimestampMissingCount,
+    "health.referenceTimestampMissingCount",
+  );
+  assertNonNegativeSafeInteger(
+    record.referenceStaleAtReceiptCount,
+    "health.referenceStaleAtReceiptCount",
+  );
+  assertNonNegativeSafeInteger(
+    record.referenceFutureSourceSkewCount,
+    "health.referenceFutureSourceSkewCount",
+  );
   assertOptionalNumber(record.lastReferenceReceivedAt, "health.lastReferenceReceivedAt");
   assertOptionalNumber(record.lastReferenceSourceTimestamp, "health.lastReferenceSourceTimestamp");
   assertOptionalNumber(record.finalReferenceAgeMs, "health.finalReferenceAgeMs");
@@ -244,6 +284,31 @@ async function verifyRun(directory: string): Promise<void> {
 
   if (health.runId !== manifest.runId) {
     errors.push(`health.runId ${health.runId} does not match manifest.runId ${manifest.runId}`);
+  }
+  if (health.startedAt !== manifest.startedAt) {
+    errors.push(
+      `health.startedAt ${health.startedAt} does not match manifest.startedAt ${manifest.startedAt}`,
+    );
+  }
+  if (health.endedAt !== null && manifest.completionStatus === "COMPLETED") {
+    if (
+      health.endedAt !== manifest.startedAt &&
+      Date.parse(health.endedAt) < Date.parse(manifest.startedAt)
+    ) {
+      errors.push(
+        `health.endedAt ${health.endedAt} is before manifest.startedAt ${manifest.startedAt}`,
+      );
+    }
+  }
+  if (health.clobStaleAfterMs !== manifest.clobStaleAfterMs) {
+    errors.push(
+      `health.clobStaleAfterMs ${health.clobStaleAfterMs} does not match manifest.clobStaleAfterMs ${manifest.clobStaleAfterMs}`,
+    );
+  }
+  if (health.referenceStaleAfterMs !== manifest.referenceStaleAfterMs) {
+    errors.push(
+      `health.referenceStaleAfterMs ${health.referenceStaleAfterMs} does not match manifest.referenceStaleAfterMs ${manifest.referenceStaleAfterMs}`,
+    );
   }
   if (health.captureStatus !== "COMPLETE") {
     errors.push(`health captureStatus is ${health.captureStatus}, expected COMPLETE`);
@@ -391,22 +456,56 @@ async function verifyRun(directory: string): Promise<void> {
           }
         }
       }
-      // Recompute reference freshness from events rather than trusting health.referenceFresh
+      // Recompute reference freshness and historical anomalies from events
       const referenceObs = new Set<number>();
       let lastRefReceivedAt: number | null = null;
       let lastRefSourceTimestamp: number | null = null;
-      let refAnomalyCount = 0;
+      let recomputedMissing = 0;
+      let recomputedStaleAtReceipt = 0;
+      let recomputedFutureSkew = 0;
       for (const event of events) {
         if (event.eventType === "REFERENCE_PRICE" && !event.isDuplicate) {
-          if (event.sourceTimestamp !== null) referenceObs.add(event.sourceTimestamp);
+          if (event.sourceTimestamp !== null) {
+            referenceObs.add(event.sourceTimestamp);
+            lastRefSourceTimestamp = event.sourceTimestamp;
+            const sourceAge = event.receivedAt - event.sourceTimestamp;
+            if (sourceAge < -health.referenceClockSkewMs) {
+              recomputedFutureSkew += 1;
+            } else if (sourceAge > health.referenceStaleAfterMs) {
+              recomputedStaleAtReceipt += 1;
+            }
+          } else {
+            recomputedMissing += 1;
+          }
           lastRefReceivedAt = event.receivedAt;
-          if (event.sourceTimestamp !== null) lastRefSourceTimestamp = event.sourceTimestamp;
-          else refAnomalyCount += 1;
         }
       }
+      const recomputedAnomalyCount =
+        recomputedMissing + recomputedStaleAtReceipt + recomputedFutureSkew;
       if (referenceObs.size < minReferenceObservations) {
         errors.push(
           `unique Chainlink reference observations ${referenceObs.size} < minimum ${minReferenceObservations}`,
+        );
+      }
+      // Compare recomputed anomaly counts with health summary
+      if (recomputedAnomalyCount !== health.referenceTimestampAnomalyCount) {
+        errors.push(
+          `recomputed reference anomaly count ${recomputedAnomalyCount} does not match health.referenceTimestampAnomalyCount ${health.referenceTimestampAnomalyCount}`,
+        );
+      }
+      if (recomputedMissing !== health.referenceTimestampMissingCount) {
+        errors.push(
+          `recomputed missing count ${recomputedMissing} does not match health.referenceTimestampMissingCount ${health.referenceTimestampMissingCount}`,
+        );
+      }
+      if (recomputedStaleAtReceipt !== health.referenceStaleAtReceiptCount) {
+        errors.push(
+          `recomputed stale-at-receipt count ${recomputedStaleAtReceipt} does not match health.referenceStaleAtReceiptCount ${health.referenceStaleAtReceiptCount}`,
+        );
+      }
+      if (recomputedFutureSkew !== health.referenceFutureSourceSkewCount) {
+        errors.push(
+          `recomputed future-skew count ${recomputedFutureSkew} does not match health.referenceFutureSourceSkewCount ${health.referenceFutureSourceSkewCount}`,
         );
       }
       // Recompute freshness using the endedAt from health
@@ -442,8 +541,8 @@ async function verifyRun(directory: string): Promise<void> {
           errors.push("recomputed reference has no canonical source timestamp");
         }
       }
-      if (refAnomalyCount > 0) {
-        errors.push(`recomputed reference timestamp anomaly count ${refAnomalyCount} > 0`);
+      if (recomputedAnomalyCount > 0) {
+        errors.push(`recomputed reference timestamp anomaly count ${recomputedAnomalyCount} > 0`);
       }
     }
   }

@@ -154,17 +154,21 @@ old value retransmitted on a new connection from appearing fresh. A single share
 ensuring they can never contradict each other. Missing source timestamps produce
 `REFERENCE_TIMESTAMP_MISSING`, stale source timestamps produce `REFERENCE_STREAM_STALE`, future
 source timestamps beyond the skew tolerance produce `REFERENCE_CLOCK_SKEW`, and negative receipt
-ages (local clock skew) produce `REFERENCE_LOCAL_CLOCK_SKEW`. Reference timestamp anomalies (missing
-or extreme source timestamps) are tracked cumulatively via `referenceTimestampAnomalyCount`, so a
-bad observation followed by a valid one still produces a quality failure.
+ages (local clock skew) produce `REFERENCE_LOCAL_CLOCK_SKEW`. Reference timestamp anomalies are
+tracked cumulatively via `referenceTimestampAnomalyCount` with a breakdown into
+`referenceTimestampMissingCount`, `referenceStaleAtReceiptCount`, and
+`referenceFutureSourceSkewCount`. Each historical reference observation is evaluated using the same
+configured `referenceStaleAfterMs` and `referenceClockSkewMs` thresholds as finalization, so a bad
+observation followed by a valid one still produces a quality failure.
 
 If no valid data arrives within the feed-specific threshold, the feed emits a `STALE_STREAM`
 incident, closes the socket, and schedules a reconnect. Open gaps are tracked in `health.json` under
 `openGapsByFeed`. A stale CLOB socket that closes and emits `DATA_GAP_STARTED` does not increment
-the synchronization epoch twice: the processor uses a `clobResyncPending` flag so that both the
-`STALE_STREAM` and the subsequent `DATA_GAP_STARTED` from the same outage count as one resync. The
-flag is cleared only when a valid CLOB book event (`book` or `price_change`) is applied, not by
-non-book CLOB events.
+the synchronization epoch twice: the processor uses a `clobResyncPending` flag bound to the outage
+generation so that both the `STALE_STREAM` and the subsequent `DATA_GAP_STARTED` from the same
+outage count as one resync. The flag is cleared only when a valid CLOB book event (`book` or
+`price_change`) from a strictly newer connection generation is applied, not by non-book CLOB events
+or by late books from the stale generation.
 
 Frames that are whitespace-only or belong to a different market condition are recorded as
 `EMPTY_FRAME` and `IGNORED_FOREIGN_MARKET` events respectively, preserving their exact wire content
