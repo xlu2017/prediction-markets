@@ -192,9 +192,9 @@ rawMessageText     str|null
 5. The converter derives the smallest `10**n` `price_increment` and `size_increment` that can
    represent every source price and quantity exactly. This uses the most-negative base-10 exponent
    observed across `tickSize`, snapshot levels, deltas, and trades.
-6. Every source price and quantity is round-tripped through the selected `Price`/`Quantity` precision
-   before the catalog is written. Any value that would be quantized raises `ValueError` and aborts
-   conversion, so sub-tick prices and sizes are never silently lost.
+6. Every source price and quantity is round-tripped through the selected `Price`/`Quantity`
+   precision before the catalog is written. Any value that would be quantized raises `ValueError`
+   and aborts conversion, so sub-tick prices and sizes are never silently lost.
 7. Nautilus `Price`/`Quantity` are internally fixed-point (integer mantissa + precision); the string
    parse preserves the source precision up to the instrument's `price_precision`/ `size_precision`.
    Precision loss, if any, is recorded in the conversion report.
@@ -224,8 +224,8 @@ It is a cryptographic commitment to every input and artifact that contributes to
   conversion time.
 
 `replay_catalog` and `run_backtest_proof` fail closed by recomputing all manifest fields and raising
-`ValueError` on any mismatch. This protects against tampering with catalog data, sidecars, the source
-event corpus, the conversion report, or the integrity manifest itself.
+`ValueError` on any mismatch. This protects against tampering with catalog data, sidecars, the
+source event corpus, the conversion report, or the integrity manifest itself.
 
 ## Event-ordering rules
 
