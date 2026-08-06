@@ -192,13 +192,14 @@ export async function runRecorder(
     if (feed.isPreGapObservation(frame.receivedAt)) return false;
     return true;
   };
-  const commitValidData = (frame: FeedFrame): void => {
+  const commitValidData = (frame: FeedFrame): boolean => {
     const feed = feedsBySource.get(frame.source);
-    if (feed === undefined) return;
-    feed.commitValidDataMessage(frame.receivedAt, frame.connectionGeneration);
-    if (frame.source === "POLYMARKET_CLOB") {
+    if (feed === undefined) return false;
+    const committed = feed.commitValidDataMessage(frame.receivedAt, frame.connectionGeneration);
+    if (committed && frame.source === "POLYMARKET_CLOB") {
       currentClobGeneration = frame.connectionGeneration;
     }
+    return committed;
   };
   const onClobGap = (): void => {
     currentClobGeneration = null;

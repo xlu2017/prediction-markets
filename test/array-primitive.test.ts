@@ -36,6 +36,7 @@ describe("array slicing with primitive elements", () => {
       void 0;
     };
     const acceptAll = (): boolean => true;
+    const commitAll = (): boolean => true;
     const processor = new RecorderEventProcessor(
       "test-run",
       market,
@@ -47,7 +48,7 @@ describe("array slicing with primitive elements", () => {
       acceptAll,
       noop,
       noop,
-      noop,
+      commitAll,
     );
 
     const raw = JSON.stringify([

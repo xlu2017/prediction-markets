@@ -92,7 +92,8 @@ export class HealthTracker {
     if (
       envelope.source === "POLYMARKET_REFERENCE_PRICE" &&
       envelope.eventType === "REFERENCE_PRICE" &&
-      !envelope.isDuplicate
+      !envelope.isDuplicate &&
+      envelope.dedupeState === "UNIQUE_APPLIED"
     ) {
       this.referenceObserved = true;
       this.lastReferenceReceivedAt = envelope.receivedAt;

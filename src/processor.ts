@@ -179,7 +179,7 @@ export class RecorderEventProcessor {
     private readonly checkGeneration?: (frame: FeedFrame) => boolean,
     private readonly onFatalError?: () => void,
     private readonly onClobGap?: () => void,
-    private readonly commitValidData?: (frame: FeedFrame) => void,
+    private readonly commitValidData?: (frame: FeedFrame) => boolean,
   ) {
     this.sequencer = new EventSequencer(runId);
   }
@@ -471,8 +471,9 @@ export class RecorderEventProcessor {
     if (isDuplicate) {
       this.health.duplicateEvent();
     } else if (dedupeState === "UNIQUE_APPLIED") {
-      this.commitValidData?.(frame);
+      const committed = this.commitValidData?.(frame) ?? true;
       if (
+        committed &&
         eventType === "book" &&
         this.clobResyncPending &&
         this.clobResyncPendingGeneration !== null &&
@@ -509,23 +510,30 @@ export class RecorderEventProcessor {
     const topLevelTimestamp = timestampFrom(parsedEvent.timestamp);
     const payloadTimestamp = parsedPayload !== null ? timestampFrom(parsedPayload.timestamp) : null;
     const sourceTimestamp = payloadTimestamp ?? topLevelTimestamp;
-    const dedupeKey = this.buildDedupeKey(frame, frameHash, parsed, sourceTimestamp);
-    const dedupeResult = this.deduplicator.classify(dedupeKey);
-    const isDuplicate = dedupeResult.isDuplicate;
-    let dedupeState: DedupeState;
-
-    if (isDuplicate) {
-      dedupeState = "DUPLICATE_APPLIED";
-    } else {
-      this.deduplicator.registerApplied(dedupeKey, this.sequencer.count + 1);
-      dedupeState = "UNIQUE_APPLIED";
-    }
-
     const payload = asRecord(event.payload);
     const isBtcPrice =
       event.topic === "crypto_prices_chainlink" &&
       payload?.symbol === "btc/usd" &&
       (typeof payload.value === "number" || typeof payload.value === "string");
+    const dedupeKey = this.buildDedupeKey(frame, frameHash, parsed, sourceTimestamp);
+    const dedupeResult = this.deduplicator.classify(dedupeKey);
+    const isDuplicate = dedupeResult.isDuplicate;
+    let dedupeState: DedupeState;
+    let inactiveReason: string | null = null;
+
+    if (isDuplicate) {
+      dedupeState = "DUPLICATE_APPLIED";
+    } else {
+      const generationAccepted = this.checkGeneration?.(frame) ?? true;
+      if (!generationAccepted) {
+        dedupeState = "RECEIVED_NOT_APPLIED";
+        inactiveReason = this.describeInactiveReason(frame);
+      } else {
+        this.deduplicator.registerApplied(dedupeKey, this.sequencer.count + 1);
+        dedupeState = "UNIQUE_APPLIED";
+      }
+    }
+
     const envelope = this.sequencer.next({
       source: frame.source,
       eventType: isBtcPrice ? "REFERENCE_PRICE" : referenceEventType.toUpperCase(),
@@ -546,7 +554,7 @@ export class RecorderEventProcessor {
       duplicateOfSequence: dedupeResult.duplicateOfSequence,
       dedupeReason: isDuplicate
         ? "matching connection generation, frame hash, message index, message hash, and source timestamp"
-        : null,
+        : inactiveReason,
       payload: event,
       rawText: frame.rawText,
       rawMessageText: parsed.rawMessageText,
@@ -555,19 +563,28 @@ export class RecorderEventProcessor {
     this.health.observe(envelope);
     if (isDuplicate) {
       this.health.duplicateEvent();
-    } else if (isBtcPrice) {
-      const refAccepted = this.checkGeneration?.(frame) ?? true;
-      if (refAccepted) {
-        this.commitValidData?.(frame);
-      } else {
+    } else if (dedupeState === "UNIQUE_APPLIED" && isBtcPrice) {
+      const committed = this.commitValidData?.(frame) ?? true;
+      if (!committed) {
         this.logger.warn(
-          "Reference frame from inactive generation, not refreshing stale detector",
+          "Reference frame failed commit-time revalidation, not refreshing stale detector",
           {
             generation: frame.connectionGeneration,
           },
         );
       }
+    } else if (dedupeState === "RECEIVED_NOT_APPLIED" && isBtcPrice) {
+      this.logger.warn("Reference frame from inactive generation, not refreshing stale detector", {
+        generation: frame.connectionGeneration,
+      });
     }
+  }
+
+  private describeInactiveReason(frame: FeedFrame): string {
+    if (this.checkGeneration?.(frame) === false) {
+      return "frame from inactive connection generation or pre-gap observation";
+    }
+    return "frame from inactive connection generation";
   }
 
   private async writeMalformed(

@@ -47,6 +47,7 @@ describe("resync guard clears only on book events", () => {
       void 0;
     };
     const acceptAll = (): boolean => true;
+    const commitAll = (): boolean => true;
     let gapCallbacks = 0;
     const onClobGap = (): void => {
       gapCallbacks += 1;
@@ -62,7 +63,7 @@ describe("resync guard clears only on book events", () => {
       acceptAll,
       noop,
       onClobGap,
-      noop,
+      commitAll,
     );
 
     // Apply initial book snapshots so books are SYNCHRONIZED
@@ -156,6 +157,7 @@ describe("resync guard clears only on book events", () => {
       void 0;
     };
     const acceptAll = (): boolean => true;
+    const commitAll = (): boolean => true;
     let gapCallbacks = 0;
     const onClobGap = (): void => {
       gapCallbacks += 1;
@@ -171,7 +173,7 @@ describe("resync guard clears only on book events", () => {
       acceptAll,
       noop,
       onClobGap,
-      noop,
+      commitAll,
     );
 
     // Apply initial book snapshots at generation 1
@@ -255,6 +257,7 @@ describe("resync guard clears only on book events", () => {
       void 0;
     };
     const acceptAll = (): boolean => true;
+    const commitAll = (): boolean => true;
     let gapCallbacks = 0;
     const onClobGap = (): void => {
       gapCallbacks += 1;
@@ -270,7 +273,7 @@ describe("resync guard clears only on book events", () => {
       acceptAll,
       noop,
       onClobGap,
-      noop,
+      commitAll,
     );
 
     // Apply initial book snapshots at generation 1
@@ -357,6 +360,7 @@ describe("resync guard clears only on book events", () => {
     let activeGeneration = 1;
     const onValidData = (frame: FeedFrame): boolean =>
       frame.connectionGeneration >= activeGeneration;
+    const commitAll = (): boolean => true;
     let gapCallbacks = 0;
     const onClobGap = (): void => {
       gapCallbacks += 1;
@@ -372,7 +376,7 @@ describe("resync guard clears only on book events", () => {
       onValidData,
       noop,
       onClobGap,
-      noop,
+      commitAll,
     );
 
     // Apply initial book snapshots at generation 1
@@ -489,6 +493,7 @@ describe("resync guard clears only on book events", () => {
     let activeGeneration = 1;
     const onValidData = (frame: FeedFrame): boolean =>
       frame.connectionGeneration >= activeGeneration;
+    const commitAll = (): boolean => true;
     let gapCallbacks = 0;
     const onClobGap = (): void => {
       gapCallbacks += 1;
@@ -504,7 +509,7 @@ describe("resync guard clears only on book events", () => {
       onValidData,
       noop,
       onClobGap,
-      noop,
+      commitAll,
     );
 
     // Apply initial book snapshots at generation 1

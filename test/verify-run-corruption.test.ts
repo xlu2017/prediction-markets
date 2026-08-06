@@ -257,4 +257,139 @@ describe("verify-run corrupted artifact detection", () => {
     await writeJson(path.join(dir, "health.json"), health);
     await expect(verifyRun(dir, 1)).rejects.toThrow(/malformed count.*does not match/);
   });
+
+  it("fails when all reference events are RECEIVED_NOT_APPLIED", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const refLine = requireLine(lines, 3);
+    const ref = JSON.parse(refLine) as Record<string, unknown>;
+    ref.dedupeState = "RECEIVED_NOT_APPLIED";
+    ref.dedupeReason = "frame from inactive connection generation";
+    lines[3] = JSON.stringify(ref);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /unique Chainlink reference observations.*minimum/,
+    );
+  });
+
+  it("fails when all book snapshots are RECEIVED_NOT_APPLIED", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    book1.dedupeState = "RECEIVED_NOT_APPLIED";
+    book1.dedupeReason = "frame from inactive connection generation";
+    lines[1] = JSON.stringify(book1);
+    const book2 = JSON.parse(requireLine(lines, 2)) as Record<string, unknown>;
+    book2.dedupeState = "RECEIVED_NOT_APPLIED";
+    book2.dedupeReason = "frame from inactive connection generation";
+    lines[2] = JSON.stringify(book2);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    const health = await readJson(path.join(dir, "health.json"));
+    const bookHealth = health.finalBookHealth as Record<string, Record<string, unknown>>;
+    const upBook = bookHealth["111111"];
+    if (upBook === undefined) throw new Error("fixture missing book 111111");
+    upBook.state = "UNINITIALIZED";
+    const downBook = bookHealth["222222"];
+    if (downBook === undefined) throw new Error("fixture missing book 222222");
+    downBook.state = "UNINITIALIZED";
+    await writeJson(path.join(dir, "health.json"), health);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/book for token.*SYNCHRONIZED/);
+  });
+
+  it("fails when isDuplicate contradicts dedupeState (UNIQUE_APPLIED with isDuplicate=true)", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const first = JSON.parse(requireLine(lines, 0)) as Record<string, unknown>;
+    first.isDuplicate = true;
+    first.dedupeState = "UNIQUE_APPLIED";
+    lines[0] = JSON.stringify(first);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/UNIQUE_APPLIED requires isDuplicate=false/);
+  });
+
+  it("fails when DUPLICATE_APPLIED has null duplicateOfSequence", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const first = JSON.parse(requireLine(lines, 0)) as Record<string, unknown>;
+    first.isDuplicate = true;
+    first.dedupeState = "DUPLICATE_APPLIED";
+    first.duplicateOfSequence = null;
+    lines[0] = JSON.stringify(first);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /DUPLICATE_APPLIED requires duplicateOfSequence to be a positive prior sequence/,
+    );
+  });
+
+  it("fails when duplicateOfSequence points forward", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const first = JSON.parse(requireLine(lines, 0)) as Record<string, unknown>;
+    first.isDuplicate = true;
+    first.dedupeState = "DUPLICATE_APPLIED";
+    first.duplicateOfSequence = 999;
+    lines[0] = JSON.stringify(first);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /duplicateOfSequence.*must be less than sequence/,
+    );
+  });
+
+  it("fails when duplicateOfSequence points to itself", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const first = JSON.parse(requireLine(lines, 0)) as Record<string, unknown>;
+    first.isDuplicate = true;
+    first.dedupeState = "DUPLICATE_APPLIED";
+    first.duplicateOfSequence = 1;
+    lines[0] = JSON.stringify(first);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /duplicateOfSequence.*must be less than sequence/,
+    );
+  });
+
+  it("fails when messageIndex >= messageCount", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const second = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    second.messageIndex = 5;
+    second.messageCount = 1;
+    lines[1] = JSON.stringify(second);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/messageIndex.*must be less than messageCount/);
+  });
+
+  it("fails when payload contains a non-finite number", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const first = JSON.parse(requireLine(lines, 0)) as Record<string, unknown>;
+    first.payload = { value: "__PLACEHOLDER__" };
+    const line = JSON.stringify(first).replace('"__PLACEHOLDER__"', "1e500");
+    lines[0] = line;
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/payload.*non-finite number/);
+  });
+
+  it("fails when minReferenceObservations is not a positive integer", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    await expect(verifyRun(dir, 0)).rejects.toThrow(
+      /minReferenceObservations must be a positive safe integer/,
+    );
+    await expect(verifyRun(dir, -1)).rejects.toThrow(
+      /minReferenceObservations must be a positive safe integer/,
+    );
+    await expect(verifyRun(dir, 1.5)).rejects.toThrow(
+      /minReferenceObservations must be a positive safe integer/,
+    );
+  });
 });

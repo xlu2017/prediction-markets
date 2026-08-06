@@ -359,10 +359,90 @@ export function runtimeValidateEvent(raw: unknown, index: number): RawEventEnvel
     assertString(record.rawText, `events.jsonl line ${index + 1}: rawText`);
   if (record.rawMessageText !== null)
     assertString(record.rawMessageText, `events.jsonl line ${index + 1}: rawMessageText`);
+  const label = `events.jsonl line ${index + 1}`;
+  const dedupeState = record.dedupeState as string;
+  const isDuplicate = record.isDuplicate as boolean;
+  const duplicateOfSequence = record.duplicateOfSequence as number | null;
+  const sequence = record.sequence as number;
+  if (dedupeState === "UNIQUE_APPLIED") {
+    if (isDuplicate) {
+      throw new Error(`${label}: UNIQUE_APPLIED requires isDuplicate=false, got ${isDuplicate}`);
+    }
+    if (duplicateOfSequence !== null) {
+      throw new Error(
+        `${label}: UNIQUE_APPLIED requires duplicateOfSequence=null, got ${duplicateOfSequence}`,
+      );
+    }
+  } else if (dedupeState === "DUPLICATE_APPLIED") {
+    if (!isDuplicate) {
+      throw new Error(`${label}: DUPLICATE_APPLIED requires isDuplicate=true, got ${isDuplicate}`);
+    }
+    if (
+      duplicateOfSequence === null ||
+      !Number.isSafeInteger(duplicateOfSequence) ||
+      duplicateOfSequence <= 0
+    ) {
+      throw new Error(
+        `${label}: DUPLICATE_APPLIED requires duplicateOfSequence to be a positive prior sequence, got ${String(duplicateOfSequence)}`,
+      );
+    }
+    if (duplicateOfSequence >= sequence) {
+      throw new Error(
+        `${label}: DUPLICATE_APPLIED duplicateOfSequence ${duplicateOfSequence} must be less than sequence ${sequence}`,
+      );
+    }
+  } else if (dedupeState === "RECEIVED_NOT_APPLIED") {
+    if (isDuplicate) {
+      throw new Error(
+        `${label}: RECEIVED_NOT_APPLIED requires isDuplicate=false, got ${isDuplicate}`,
+      );
+    }
+    if (duplicateOfSequence !== null) {
+      throw new Error(
+        `${label}: RECEIVED_NOT_APPLIED requires duplicateOfSequence=null, got ${duplicateOfSequence}`,
+      );
+    }
+  }
+  const messageIndex = record.messageIndex as number | null;
+  const messageCount = record.messageCount as number | null;
+  if (messageIndex !== null && messageCount !== null && messageIndex >= messageCount) {
+    throw new Error(
+      `${label}: messageIndex ${messageIndex} must be less than messageCount ${messageCount}`,
+    );
+  }
+  validateJsonValue(record.payload, `${label}.payload`);
   return raw as RawEventEnvelope;
 }
 
+function validateJsonValue(value: unknown, label: string): void {
+  if (value === null || typeof value === "boolean" || typeof value === "string") return;
+  if (typeof value === "number") {
+    if (!Number.isFinite(value)) {
+      throw new Error(`${label} contains non-finite number`);
+    }
+    return;
+  }
+  if (Array.isArray(value)) {
+    for (let i = 0; i < value.length; i += 1) {
+      validateJsonValue(value[i], `${label}[${i}]`);
+    }
+    return;
+  }
+  if (typeof value === "object") {
+    for (const [key, val] of Object.entries(value as Record<string, unknown>)) {
+      validateJsonValue(val, `${label}.${key}`);
+    }
+    return;
+  }
+  throw new Error(`${label} contains unsupported value type: ${typeof value}`);
+}
+
 export async function verifyRun(directory: string, minReferenceObservations = 5): Promise<void> {
+  if (!Number.isSafeInteger(minReferenceObservations) || minReferenceObservations <= 0) {
+    throw new Error(
+      `minReferenceObservations must be a positive safe integer, got ${minReferenceObservations}`,
+    );
+  }
   const manifestPath = path.join(directory, "manifest.json");
   const healthPath = path.join(directory, "health.json");
   const eventsPath = path.join(directory, "events.jsonl");
@@ -730,7 +810,11 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
       let recomputedFutureSkew = 0;
       const recomputedAnomalyCodes = new Set<QualityFailureCode>();
       for (const event of events) {
-        if (event.eventType === "REFERENCE_PRICE" && !event.isDuplicate) {
+        if (
+          event.eventType === "REFERENCE_PRICE" &&
+          !event.isDuplicate &&
+          event.dedupeState === "UNIQUE_APPLIED"
+        ) {
           if (event.sourceTimestamp !== null) {
             referenceObs.add(event.sourceTimestamp);
             lastRefSourceTimestamp = event.sourceTimestamp;
