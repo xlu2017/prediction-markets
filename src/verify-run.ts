@@ -546,6 +546,229 @@ function validateJsonValue(value: unknown, label: string): void {
   throw new Error(`${label} contains unsupported value type: ${typeof value}`);
 }
 
+export type ClobReplayResult = {
+  snapshot: Record<string, BookHealth>;
+  appliedBookGenerations: Map<string, number>;
+  latestAcceptedClobGeneration: number | null;
+  resyncPending: boolean;
+  errors: string[];
+};
+
+export function replayClobState(
+  events: RawEventEnvelope[],
+  conditionId: string,
+  tokenIds: string[],
+  endedAtMs: number,
+  staleAfterMs: number,
+): ClobReplayResult {
+  const expectedTokenSet = new Set(tokenIds);
+  const replayBooks = new OrderBookTracker(tokenIds);
+  const appliedBookGenerations = new Map<string, number>();
+  let latestAcceptedClobGeneration: number | null = null;
+  let replayResyncPending = false;
+  const errors: string[] = [];
+  const clobLifecycleEventTypes = new Set([
+    "CONNECTION_ATTEMPT",
+    "CONNECTION_OPEN",
+    "CONNECTION_CLOSED",
+    "SUBSCRIPTION_SENT",
+    "RECONNECT_SCHEDULED",
+    "DATA_GAP_STARTED",
+    "DATA_GAP_ENDED",
+    "STALE_STREAM",
+    "EMPTY_FRAME",
+    "IGNORED_FOREIGN_MARKET",
+    "MALFORMED_EVENT",
+  ]);
+
+  for (const event of events) {
+    if (
+      event.source === "POLYMARKET_CLOB" &&
+      !event.isDuplicate &&
+      event.dedupeState === "UNIQUE_APPLIED"
+    ) {
+      if (event.connectionGeneration !== null) {
+        if (
+          latestAcceptedClobGeneration === null ||
+          event.connectionGeneration > latestAcceptedClobGeneration
+        ) {
+          latestAcceptedClobGeneration = event.connectionGeneration;
+        }
+      }
+    }
+
+    // CLOB feed resync lifecycle: set pending on gap/stale, clear on DATA_GAP_ENDED.
+    if (event.source === "POLYMARKET_CLOB" && event.eventType === "DATA_GAP_ENDED") {
+      const feed = (event.payload as Record<string, unknown>).feed;
+      if (feed === "clob-market") {
+        replayResyncPending = false;
+      }
+    }
+    if (
+      event.source === "POLYMARKET_CLOB" &&
+      (event.eventType === "DATA_GAP_STARTED" || event.eventType === "STALE_STREAM") &&
+      (event.payload as Record<string, unknown>).feed === "clob-market"
+    ) {
+      if (!replayResyncPending) {
+        replayResyncPending = true;
+        replayBooks.requireResync();
+      }
+    }
+
+    if (
+      event.source === "POLYMARKET_CLOB" &&
+      !event.isDuplicate &&
+      event.dedupeState === "UNIQUE_APPLIED"
+    ) {
+      // Lifecycle events carry feed state, not market payloads; skip generic data checks.
+      if (clobLifecycleEventTypes.has(event.eventType)) continue;
+
+      // Generic CLOB applied-event identity
+      if (event.sourceMarketId === null) {
+        errors.push(`event sequence ${event.sequence}: sourceMarketId is null for CLOB data event`);
+        continue;
+      }
+      if (
+        typeof event.payload !== "object" ||
+        event.payload === null ||
+        Array.isArray(event.payload)
+      ) {
+        errors.push(
+          `event sequence ${event.sequence}: CLOB data payload must be an object, got ${typeof event.payload}`,
+        );
+        continue;
+      }
+      const payload = event.payload as Record<string, unknown>;
+      const payloadEventType = payload.event_type;
+      if (payloadEventType !== event.eventType) {
+        errors.push(
+          `event sequence ${event.sequence}: payload.event_type ${String(payloadEventType)} does not match envelope.eventType ${event.eventType}`,
+        );
+        continue;
+      }
+      const payloadMarket = payload.market;
+      if (payloadMarket !== event.sourceMarketId) {
+        errors.push(
+          `event sequence ${event.sequence}: payload.market ${String(payloadMarket)} does not match envelope.sourceMarketId ${event.sourceMarketId}`,
+        );
+        continue;
+      }
+      if (payloadMarket !== conditionId) {
+        errors.push(
+          `event sequence ${event.sequence}: payload.market ${payloadMarket} does not match conditionId ${conditionId}`,
+        );
+        continue;
+      }
+
+      if (event.eventType === "book") {
+        if (event.tokenId === null || !expectedTokenSet.has(event.tokenId)) {
+          errors.push(
+            `book event sequence ${event.sequence}: tokenId ${String(event.tokenId)} is not an expected token`,
+          );
+          continue;
+        }
+        if (event.observedTokenIds !== null) {
+          errors.push(
+            `book event sequence ${event.sequence}: observedTokenIds must be null for a full snapshot, got ${JSON.stringify(event.observedTokenIds)}`,
+          );
+          continue;
+        }
+        const assetId = payload.asset_id;
+        if (assetId !== event.tokenId) {
+          errors.push(
+            `book event sequence ${event.sequence}: payload.asset_id ${String(assetId)} does not match tokenId ${event.tokenId}`,
+          );
+          continue;
+        }
+        try {
+          replayBooks.apply(event.payload, event.processedAt, event.connectionGeneration ?? 0);
+          appliedBookGenerations.set(event.tokenId, event.connectionGeneration ?? 0);
+        } catch (replayError) {
+          errors.push(
+            `replay failed for book event sequence ${event.sequence}: ${replayError instanceof Error ? replayError.message : String(replayError)}`,
+          );
+        }
+      } else if (event.eventType === "price_change") {
+        const payloadTokens = new Set<string>();
+        if (typeof payload.asset_id === "string") payloadTokens.add(payload.asset_id);
+        if (Array.isArray(payload.price_changes)) {
+          for (const item of payload.price_changes) {
+            const record =
+              item !== null && typeof item === "object" ? (item as Record<string, unknown>) : null;
+            if (record !== null && typeof record.asset_id === "string") {
+              payloadTokens.add(record.asset_id);
+            }
+          }
+        }
+        const payloadTokenSet = [...payloadTokens];
+        if (payloadTokenSet.length === 1) {
+          const token = payloadTokenSet[0];
+          if (event.tokenId !== token) {
+            errors.push(
+              `price_change event sequence ${event.sequence}: envelope.tokenId ${String(event.tokenId)} does not match single payload token ${token}`,
+            );
+            continue;
+          }
+          if (event.observedTokenIds !== null) {
+            errors.push(
+              `price_change event sequence ${event.sequence}: observedTokenIds must be null for single-token payload, got ${JSON.stringify(event.observedTokenIds)}`,
+            );
+            continue;
+          }
+        } else if (payloadTokenSet.length > 1) {
+          if (event.tokenId !== null) {
+            errors.push(
+              `price_change event sequence ${event.sequence}: envelope.tokenId must be null for multi-token payload, got ${event.tokenId}`,
+            );
+            continue;
+          }
+          const observed =
+            event.observedTokenIds !== null ? [...event.observedTokenIds].sort() : [];
+          const sortedPayload = [...payloadTokenSet].sort();
+          if (
+            observed.length !== sortedPayload.length ||
+            observed.some((t, i) => t !== sortedPayload[i])
+          ) {
+            errors.push(
+              `price_change event sequence ${event.sequence}: observedTokenIds ${JSON.stringify(event.observedTokenIds)} does not match payload token set ${JSON.stringify(sortedPayload)}`,
+            );
+            continue;
+          }
+        } else {
+          errors.push(
+            `price_change event sequence ${event.sequence}: payload has no asset_id tokens`,
+          );
+          continue;
+        }
+        try {
+          replayBooks.apply(event.payload, event.processedAt, event.connectionGeneration ?? 0);
+        } catch (replayError) {
+          errors.push(
+            `replay failed for price_change event sequence ${event.sequence}: ${replayError instanceof Error ? replayError.message : String(replayError)}`,
+          );
+        }
+      } else {
+        // Other CLOB event types (e.g. last_trade_price) only need the generic identity checks
+        try {
+          replayBooks.apply(event.payload, event.processedAt, event.connectionGeneration ?? 0);
+        } catch (replayError) {
+          errors.push(
+            `replay failed for ${event.eventType} event sequence ${event.sequence}: ${replayError instanceof Error ? replayError.message : String(replayError)}`,
+          );
+        }
+      }
+    }
+  }
+
+  return {
+    snapshot: replayBooks.snapshot(endedAtMs, staleAfterMs),
+    appliedBookGenerations,
+    latestAcceptedClobGeneration,
+    resyncPending: replayResyncPending,
+    errors,
+  };
+}
+
 export async function verifyRun(directory: string, minReferenceObservations = 5): Promise<void> {
   if (!Number.isSafeInteger(minReferenceObservations) || minReferenceObservations <= 0) {
     throw new Error(
@@ -693,9 +916,6 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
   if (health.malformedEventCount > 0) {
     errors.push(`malformedEventCount is ${health.malformedEventCount}, expected 0`);
   }
-  if (Object.keys(health.openGapsByFeed).length > 0) {
-    errors.push(`openGapsByFeed is non-empty: ${Object.keys(health.openGapsByFeed).join(", ")}`);
-  }
   if (health.qualityFailures.length > 0) {
     const codes = health.qualityFailures.map((f) => f.code).join(", ");
     errors.push(`qualityFailures is non-empty: ${codes}`);
@@ -820,6 +1040,7 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
       let recomputedTotalGapDurationMs = 0;
       let recomputedMaxGapDurationMs = 0;
       let recomputedStaleFeedIncidents = 0;
+      let recomputedReconnectCount = 0;
       const openGaps = new Map<string, number>();
       for (const event of events) {
         recomputedSourceCounts[event.source] = (recomputedSourceCounts[event.source] ?? 0) + 1;
@@ -828,6 +1049,7 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
         if (event.eventType === "MALFORMED_EVENT") recomputedMalformed += 1;
         if (event.isDuplicate) recomputedDuplicates += 1;
         if (event.eventType === "STALE_STREAM") recomputedStaleFeedIncidents += 1;
+        if (event.eventType === "RECONNECT_SCHEDULED") recomputedReconnectCount += 1;
         if (event.eventType === "DATA_GAP_STARTED") {
           const feed = (event.payload as Record<string, unknown>).feed;
           if (typeof feed === "string") {
@@ -912,6 +1134,57 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
       if (recomputedStaleFeedIncidents !== health.staleFeedIncidents) {
         errors.push(
           `recomputed staleFeedIncidents ${recomputedStaleFeedIncidents} does not match health.staleFeedIncidents ${health.staleFeedIncidents}`,
+        );
+      }
+      if (recomputedReconnectCount !== health.reconnectCount) {
+        errors.push(
+          `recomputed reconnectCount ${recomputedReconnectCount} does not match health.reconnectCount ${health.reconnectCount}`,
+        );
+      }
+      const healthOpenGaps = Object.entries(health.openGapsByFeed).sort(([a], [b]) =>
+        a.localeCompare(b),
+      );
+      const recomputedOpenGaps = [...openGaps.entries()].sort(([a], [b]) => a.localeCompare(b));
+      if (healthOpenGaps.length !== recomputedOpenGaps.length) {
+        errors.push(
+          `recomputed open gap count ${recomputedOpenGaps.length} does not match health.openGapsByFeed count ${healthOpenGaps.length}`,
+        );
+      } else {
+        for (let i = 0; i < healthOpenGaps.length; i += 1) {
+          const healthOpenGap = healthOpenGaps[i];
+          const recomputedOpenGap = recomputedOpenGaps[i];
+          if (healthOpenGap === undefined || recomputedOpenGap === undefined) {
+            break;
+          }
+          const [healthFeed, healthGap] = healthOpenGap;
+          const [recomputedFeed, recomputedStartedAt] = recomputedOpenGap;
+          if (healthFeed !== recomputedFeed) {
+            errors.push(
+              `recomputed open gap feed ${recomputedFeed} does not match health ${healthFeed}`,
+            );
+            break;
+          }
+          if (healthGap.startedAt !== recomputedStartedAt) {
+            errors.push(
+              `recomputed open gap ${recomputedFeed} startedAt ${recomputedStartedAt} does not match health ${healthGap.startedAt}`,
+            );
+            break;
+          }
+        }
+      }
+      if (recomputedDataGapCount > 0) {
+        errors.push(
+          `recomputed dataGapCount ${recomputedDataGapCount} > 0; run contains at least one DATA_GAP_STARTED event`,
+        );
+      }
+      if (recomputedClosedGapCount > 0) {
+        errors.push(
+          `recomputed closedGapCount ${recomputedClosedGapCount} > 0; run contains at least one DATA_GAP_ENDED event`,
+        );
+      }
+      if (recomputedOpenGaps.length > 0) {
+        errors.push(
+          `recomputed openGapsByFeed is non-empty: ${recomputedOpenGaps.map(([feed]) => feed).join(", ")}`,
         );
       }
       const referenceObs = new Set<number>();
@@ -1035,12 +1308,6 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
         errors.push(`recomputed reference timestamp anomaly count ${recomputedAnomalyCount} > 0`);
       }
       const tokenIds = [manifest.market.upTokenId, manifest.market.downTokenId];
-      const expectedTokenSet = new Set(tokenIds);
-      const replayBooks = new OrderBookTracker(tokenIds);
-      const appliedBookGenerations = new Map<string, number>();
-      let latestAcceptedClobGeneration: number | null = null;
-      let replayResyncPending = false;
-      let replayResyncPendingGeneration: number | null = null;
       let recomputedMaxSourceLatency: number | null = null;
       let recomputedMaxProcessingLatency: number | null = null;
       let recomputedLastRefReceivedAt: number | null = null;
@@ -1061,172 +1328,6 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
           recomputedMaxProcessingLatency = processingLatency;
         }
         if (
-          event.source === "POLYMARKET_CLOB" &&
-          !event.isDuplicate &&
-          event.dedupeState === "UNIQUE_APPLIED"
-        ) {
-          if (event.connectionGeneration !== null) {
-            if (
-              latestAcceptedClobGeneration === null ||
-              event.connectionGeneration > latestAcceptedClobGeneration
-            ) {
-              latestAcceptedClobGeneration = event.connectionGeneration;
-            }
-          }
-          if (event.eventType === "book") {
-            if (event.tokenId === null || !expectedTokenSet.has(event.tokenId)) {
-              errors.push(
-                `book event sequence ${event.sequence}: tokenId ${String(event.tokenId)} is not an expected token`,
-              );
-              continue;
-            }
-            if (event.observedTokenIds !== null) {
-              errors.push(
-                `book event sequence ${event.sequence}: observedTokenIds must be null for a full snapshot, got ${JSON.stringify(event.observedTokenIds)}`,
-              );
-              continue;
-            }
-            const payload = event.payload as Record<string, unknown>;
-            const payloadEventType = payload.event_type;
-            if (payloadEventType !== event.eventType) {
-              errors.push(
-                `book event sequence ${event.sequence}: payload.event_type ${String(payloadEventType)} does not match envelope.eventType ${event.eventType}`,
-              );
-              continue;
-            }
-            const assetId = payload.asset_id;
-            if (assetId !== event.tokenId) {
-              errors.push(
-                `book event sequence ${event.sequence}: payload.asset_id ${String(assetId)} does not match tokenId ${event.tokenId}`,
-              );
-              continue;
-            }
-            const market = payload.market;
-            if (market !== event.sourceMarketId) {
-              errors.push(
-                `book event sequence ${event.sequence}: payload.market ${String(market)} does not match envelope.sourceMarketId ${event.sourceMarketId}`,
-              );
-              continue;
-            }
-            if (market !== manifest.market.conditionId) {
-              errors.push(
-                `book event sequence ${event.sequence}: payload.market ${String(market)} does not match conditionId ${manifest.market.conditionId}`,
-              );
-              continue;
-            }
-            try {
-              replayBooks.apply(event.payload, event.processedAt, event.connectionGeneration ?? 0);
-              appliedBookGenerations.set(event.tokenId, event.connectionGeneration ?? 0);
-              if (
-                replayResyncPending &&
-                replayResyncPendingGeneration !== null &&
-                (event.connectionGeneration ?? 0) > replayResyncPendingGeneration
-              ) {
-                replayResyncPending = false;
-                replayResyncPendingGeneration = null;
-              }
-            } catch (replayError) {
-              errors.push(
-                `replay failed for book event sequence ${event.sequence}: ${replayError instanceof Error ? replayError.message : String(replayError)}`,
-              );
-            }
-          }
-          if (event.eventType === "price_change") {
-            const payload = event.payload as Record<string, unknown>;
-            const payloadEventType = payload.event_type;
-            if (payloadEventType !== event.eventType) {
-              errors.push(
-                `price_change event sequence ${event.sequence}: payload.event_type ${String(payloadEventType)} does not match envelope.eventType ${event.eventType}`,
-              );
-              continue;
-            }
-            const market = payload.market;
-            if (market !== event.sourceMarketId) {
-              errors.push(
-                `price_change event sequence ${event.sequence}: payload.market ${String(market)} does not match envelope.sourceMarketId ${event.sourceMarketId}`,
-              );
-              continue;
-            }
-            if (market !== manifest.market.conditionId) {
-              errors.push(
-                `price_change event sequence ${event.sequence}: payload.market ${String(market)} does not match conditionId ${manifest.market.conditionId}`,
-              );
-              continue;
-            }
-            const payloadTokens = new Set<string>();
-            if (typeof payload.asset_id === "string") payloadTokens.add(payload.asset_id);
-            if (Array.isArray(payload.price_changes)) {
-              for (const item of payload.price_changes) {
-                const record =
-                  item !== null && typeof item === "object"
-                    ? (item as Record<string, unknown>)
-                    : null;
-                if (record !== null && typeof record.asset_id === "string") {
-                  payloadTokens.add(record.asset_id);
-                }
-              }
-            }
-            const payloadTokenSet = [...payloadTokens];
-            if (payloadTokenSet.length === 1) {
-              const token = payloadTokenSet[0];
-              if (event.tokenId !== token) {
-                errors.push(
-                  `price_change event sequence ${event.sequence}: envelope.tokenId ${String(event.tokenId)} does not match single payload token ${token}`,
-                );
-                continue;
-              }
-              if (event.observedTokenIds !== null) {
-                errors.push(
-                  `price_change event sequence ${event.sequence}: observedTokenIds must be null for single-token payload, got ${JSON.stringify(event.observedTokenIds)}`,
-                );
-                continue;
-              }
-            } else if (payloadTokenSet.length > 1) {
-              if (event.tokenId !== null) {
-                errors.push(
-                  `price_change event sequence ${event.sequence}: envelope.tokenId must be null for multi-token payload, got ${event.tokenId}`,
-                );
-                continue;
-              }
-              const observed =
-                event.observedTokenIds !== null ? [...event.observedTokenIds].sort() : [];
-              const sortedPayload = [...payloadTokenSet].sort();
-              if (
-                observed.length !== sortedPayload.length ||
-                observed.some((t, i) => t !== sortedPayload[i])
-              ) {
-                errors.push(
-                  `price_change event sequence ${event.sequence}: observedTokenIds ${JSON.stringify(event.observedTokenIds)} does not match payload token set ${JSON.stringify(sortedPayload)}`,
-                );
-                continue;
-              }
-            } else {
-              errors.push(
-                `price_change event sequence ${event.sequence}: payload has no asset_id tokens`,
-              );
-              continue;
-            }
-            try {
-              replayBooks.apply(event.payload, event.processedAt, event.connectionGeneration ?? 0);
-            } catch (replayError) {
-              errors.push(
-                `replay failed for price_change event sequence ${event.sequence}: ${replayError instanceof Error ? replayError.message : String(replayError)}`,
-              );
-            }
-          }
-        }
-        if (
-          event.source === "POLYMARKET_CLOB" &&
-          (event.eventType === "DATA_GAP_STARTED" || event.eventType === "STALE_STREAM") &&
-          (event.payload as Record<string, unknown>).feed === "clob-market"
-        ) {
-          if (!replayResyncPending) {
-            replayResyncPending = true;
-            replayResyncPendingGeneration = event.connectionGeneration;
-            replayBooks.requireResync();
-          }
-        }
-        if (
           event.source === "POLYMARKET_REFERENCE_PRICE" &&
           event.eventType === "REFERENCE_PRICE" &&
           !event.isDuplicate &&
@@ -1240,6 +1341,17 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
             recomputedLastRefConnectionGeneration = event.connectionGeneration;
           }
         }
+      }
+      const clobEndedAtMs = health.endedAt !== null ? Date.parse(health.endedAt) : 0;
+      const clobReplay = replayClobState(
+        events,
+        manifest.market.conditionId,
+        tokenIds,
+        clobEndedAtMs,
+        health.clobStaleAfterMs,
+      );
+      for (const error of clobReplay.errors) {
+        errors.push(error);
       }
       for (const expected of tokenIds) {
         let found = false;
@@ -1265,7 +1377,7 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
         for (const expected of tokenIds) {
           const healthBook = health.finalBookHealth[expected];
           if (healthBook === undefined) continue;
-          const replayGen = appliedBookGenerations.get(expected);
+          const replayGen = clobReplay.appliedBookGenerations.get(expected);
           if (replayGen !== undefined && healthBook.snapshotConnectionGeneration !== null) {
             if (replayGen !== healthBook.snapshotConnectionGeneration) {
               errors.push(
@@ -1275,19 +1387,16 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
           }
           if (
             replayGen !== undefined &&
-            latestAcceptedClobGeneration !== null &&
-            replayGen !== latestAcceptedClobGeneration
+            clobReplay.latestAcceptedClobGeneration !== null &&
+            replayGen !== clobReplay.latestAcceptedClobGeneration
           ) {
             errors.push(
-              `token ${expected}: latest applied snapshot generation ${replayGen} does not equal latest accepted CLOB generation ${latestAcceptedClobGeneration}`,
+              `token ${expected}: latest applied snapshot generation ${replayGen} does not equal latest accepted CLOB generation ${clobReplay.latestAcceptedClobGeneration}`,
             );
           }
         }
       }
-      const replaySnapshot = replayBooks.snapshot(
-        health.endedAt !== null ? Date.parse(health.endedAt) : 0,
-        health.clobStaleAfterMs,
-      );
+      const replaySnapshot = clobReplay.snapshot;
       for (const expected of tokenIds) {
         const healthBook = health.finalBookHealth[expected];
         if (healthBook === undefined) continue;

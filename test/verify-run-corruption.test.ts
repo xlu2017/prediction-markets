@@ -746,7 +746,7 @@ describe("verify-run corrupted artifact detection", () => {
     await writeJson(path.join(dir, "health.json"), health);
     await writeLines(path.join(dir, "events.jsonl"), lines);
     await expect(verifyRun(dir, 1)).rejects.toThrow(
-      /price_change event sequence 5: payload\.market.*does not match envelope\.sourceMarketId/,
+      /event sequence 5: payload\.market.*does not match envelope\.sourceMarketId/,
     );
   });
 
@@ -780,7 +780,7 @@ describe("verify-run corrupted artifact detection", () => {
     await writeJson(path.join(dir, "health.json"), health);
     await writeLines(path.join(dir, "events.jsonl"), lines);
     await expect(verifyRun(dir, 1)).rejects.toThrow(
-      /price_change event sequence 5: payload\.event_type.*does not match envelope\.eventType/,
+      /event sequence 5: payload\.event_type.*does not match envelope\.eventType/,
     );
   });
 
@@ -986,7 +986,7 @@ describe("verify-run corrupted artifact detection", () => {
     health.staleFeedIncidents = 1;
     health.dataGapCount = 1;
     health.closedGapCount = 0;
-    health.reconnectCount = 1;
+    health.reconnectCount = 0;
     health.maximumSourceToReceiveLatencyMs = 5;
     health.maximumReceiveToProcessLatencyMs = 1;
     health.lastReferenceReceivedAt = 1785909720123;
@@ -1011,8 +1011,227 @@ describe("verify-run corrupted artifact detection", () => {
     manifest.finalEventCount = 10;
     await writeJson(path.join(dir, "manifest.json"), manifest);
 
-    // The verifier should pass — epoch advanced exactly once despite
-    // both STALE_STREAM and DATA_GAP_STARTED being present
-    await expect(verifyRun(dir, 1)).resolves.toBeUndefined();
+    // A run with an open DATA_GAP_STARTED event is not usable for deterministic replay.
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /recomputed dataGapCount|recomputed openGapsByFeed/,
+    );
+  });
+
+  it("fails when an open DATA_GAP_STARTED is hidden by empty openGapsByFeed and COMPLETE status", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const gapStarted = {
+      ...book1,
+      sequence: 5,
+      eventType: "DATA_GAP_STARTED",
+      tokenId: null,
+      observedTokenIds: null,
+      sourceMarketId: null,
+      sourceTimestamp: null,
+      payload: { feed: "clob-market" },
+    };
+    lines.push(JSON.stringify(gapStarted));
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+
+    const health = await readJson(path.join(dir, "health.json"));
+    health.totalEventsReceived = 5;
+    health.captureStatus = "COMPLETE";
+    health.usableForReplay = true;
+    health.qualityFailures = [];
+    health.openGapsByFeed = {};
+    health.dataGapCount = 1;
+    health.closedGapCount = 0;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:DATA_GAP_STARTED"] = 1;
+    await writeJson(path.join(dir, "health.json"), health);
+
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.captureStatus = "COMPLETE";
+    manifest.usableForReplay = true;
+    manifest.finalEventCount = 5;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /recomputed dataGapCount.*>|recomputed openGapsByFeed/,
+    );
+  });
+
+  it("fails when a closed DATA_GAP is hidden by COMPLETE status and empty qualityFailures", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const market = JSON.parse(requireLine(lines, 0)) as Record<string, unknown>;
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const book2 = JSON.parse(requireLine(lines, 2)) as Record<string, unknown>;
+    const ref = JSON.parse(requireLine(lines, 3)) as Record<string, unknown>;
+
+    const gapStarted = {
+      ...book1,
+      sequence: 5,
+      eventType: "DATA_GAP_STARTED",
+      tokenId: null,
+      observedTokenIds: null,
+      sourceMarketId: null,
+      sourceTimestamp: null,
+      payload: { feed: "clob-market" },
+      receivedAt: 1785909720130,
+      processedAt: 1785909720131,
+    };
+    const gapEnded = {
+      ...book1,
+      sequence: 6,
+      eventType: "DATA_GAP_ENDED",
+      tokenId: null,
+      observedTokenIds: null,
+      sourceMarketId: null,
+      sourceTimestamp: null,
+      payload: { feed: "clob-market" },
+      receivedAt: 1785909720140,
+      processedAt: 1785909720141,
+    };
+    const book1Gen2 = {
+      ...book1,
+      sequence: 7,
+      connectionGeneration: 2,
+      processedAt: 1785909720120,
+      receivedAt: 1785909720119,
+      sourceTimestamp: 1785909720118,
+    };
+    const book2Gen2 = {
+      ...book2,
+      sequence: 8,
+      connectionGeneration: 2,
+      processedAt: 1785909720121,
+      receivedAt: 1785909720120,
+      sourceTimestamp: 1785909720119,
+    };
+    const refGen2 = {
+      ...ref,
+      sequence: 9,
+      connectionGeneration: 2,
+      receivedAt: 1785909720123,
+      processedAt: 1785909720124,
+      sourceTimestamp: 1785909720122,
+      topLevelSourceTimestamp: 1785909720122,
+      payloadSourceTimestamp: 1785909720122,
+    };
+
+    const newLines = [
+      JSON.stringify(market),
+      JSON.stringify(book1),
+      JSON.stringify(book2),
+      JSON.stringify(ref),
+      JSON.stringify(gapStarted),
+      JSON.stringify(gapEnded),
+      JSON.stringify(book1Gen2),
+      JSON.stringify(book2Gen2),
+      JSON.stringify(refGen2),
+    ];
+    await writeLines(path.join(dir, "events.jsonl"), newLines);
+
+    const health = await readJson(path.join(dir, "health.json"));
+    health.totalEventsReceived = 9;
+    health.captureStatus = "COMPLETE";
+    health.usableForReplay = true;
+    health.qualityFailures = [];
+    health.openGapsByFeed = {};
+    health.dataGapCount = 1;
+    health.closedGapCount = 1;
+    health.totalGapDurationMs = 10;
+    health.maximumGapDurationMs = 10;
+    health.reconnectCount = 0;
+    health.staleFeedIncidents = 0;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_CLOB = 7;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_REFERENCE_PRICE = 2;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:book"] = 4;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:DATA_GAP_STARTED"] = 1;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:DATA_GAP_ENDED"] = 1;
+    (health.eventCountsByType as Record<string, number>)[
+      "POLYMARKET_REFERENCE_PRICE:REFERENCE_PRICE"
+    ] = 2;
+    await writeJson(path.join(dir, "health.json"), health);
+
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.captureStatus = "COMPLETE";
+    manifest.usableForReplay = true;
+    manifest.finalEventCount = 9;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /recomputed closedGapCount.*>|recomputed dataGapCount.*>/,
+    );
+  });
+
+  it("fails when a non-book CLOB event has payload.market for another condition", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const lastTrade = {
+      ...book1,
+      sequence: 5,
+      eventType: "last_trade_price",
+      tokenId: null,
+      observedTokenIds: null,
+      payload: {
+        event_type: "last_trade_price",
+        asset_id: "111111",
+        market: "0xwrong",
+        price: ".49",
+        size: "10",
+        side: "BUY",
+        timestamp: String(1785909720100),
+      },
+    };
+    lines.push(JSON.stringify(lastTrade));
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.finalEventCount = 5;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    const health = await readJson(path.join(dir, "health.json"));
+    health.totalEventsReceived = 5;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:last_trade_price"] = 1;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_CLOB = 3;
+    await writeJson(path.join(dir, "health.json"), health);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /event sequence 5: payload\.market.*does not match/,
+    );
+  });
+
+  it("fails when a non-book CLOB event payload.event_type differs from envelope", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book1 = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    const lastTrade = {
+      ...book1,
+      sequence: 5,
+      eventType: "last_trade_price",
+      tokenId: null,
+      observedTokenIds: null,
+      payload: {
+        event_type: "book",
+        asset_id: "111111",
+        market: "0xcondition",
+        price: ".49",
+        size: "10",
+        side: "BUY",
+        timestamp: String(1785909720100),
+      },
+    };
+    lines.push(JSON.stringify(lastTrade));
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.finalEventCount = 5;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    const health = await readJson(path.join(dir, "health.json"));
+    health.totalEventsReceived = 5;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:last_trade_price"] = 1;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_CLOB = 3;
+    await writeJson(path.join(dir, "health.json"), health);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /event sequence 5: payload\.event_type.*does not match envelope\.eventType/,
+    );
   });
 });
