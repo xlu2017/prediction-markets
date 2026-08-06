@@ -524,15 +524,23 @@ describe("check-append-commit race", () => {
     store.resume();
     await new Promise((resolve) => setTimeout(resolve, 100));
 
-    // The frame was UNIQUE_APPLIED (precheck passed), but commit returned false
+    // The frame was UNIQUE_APPLIED (precheck passed), but commit returned false.
+    // Under the chronology-preserving contract, the frame remains UNIQUE_APPLIED
+    // as historical data. Commit failure means only that it cannot close the
+    // newer gap or refresh feed freshness.
     const refEnvelope = store.envelopes.find((e) => e.eventType === "REFERENCE_PRICE");
     expect(refEnvelope?.dedupeState).toBe("UNIQUE_APPLIED");
     expect(commitCommitted).toBe(true);
 
-    // Health should NOT have observed the reference because commit failed
-    // (in real usage, commitValidDataMessage returning false means the feed
-    // didn't refresh — but health.observe() already ran before commit)
-    // The health.observe() call happens before commit, so referenceObserved
-    // would be true. The commit failure only prevents feed freshness refresh.
+    // Health observed the event (health.observe runs before commit).
+    // The commit failure only prevents feed freshness refresh, not health observation.
+    const summary = health.summary(
+      "2026-08-05T06:02:01.000Z",
+      FIXED_NOW + 1000,
+      15000,
+      10000,
+      null,
+    );
+    expect(summary.referencePriceStreamObserved).toBe(true);
   });
 });

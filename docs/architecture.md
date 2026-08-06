@@ -180,6 +180,15 @@ validation, mutation, envelope persistence, and dedupe registration succeed, ens
 `books.apply()` cannot close a gap or refresh staleness. This prevents pre-gap observations from
 retroactively closing a gap that started after the frame was received.
 
+**Commit-failed reference semantics (chronology-preserving contract).** When a reference frame
+passes the pre-commit generation check but `commitValidDataMessage` returns `false` (e.g. because
+the generation advanced during an `append()` pause), the envelope remains `UNIQUE_APPLIED` as
+historical data. The frame was received before the gap and is preserved in the event stream. Commit
+failure means only that the frame cannot close the newer gap or refresh feed freshness — it does not
+retroactively reject the frame. `HealthTracker.observe()` runs before commit, so the observation is
+counted. The gap remains open and the run remains unusable until a newer-generation frame
+successfully commits.
+
 Frames that are whitespace-only or belong to a different market condition are recorded as
 `EMPTY_FRAME` and `IGNORED_FOREIGN_MARKET` events respectively, preserving their exact wire content
 for audit purposes. They do not count as malformed and do not refresh feed freshness.

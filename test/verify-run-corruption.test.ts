@@ -4,7 +4,7 @@ import path from "node:path";
 
 import { afterEach, describe, expect, it } from "vitest";
 
-import { verifyRun } from "../src/verify-run.js";
+import { verifyRun, runtimeValidateManifest } from "../src/verify-run.js";
 
 const FIXTURE_DIR = path.resolve(__dirname, "..", "fixtures", "sample-run");
 const cleanups: (() => Promise<void>)[] = [];
@@ -298,6 +298,29 @@ describe("verify-run corrupted artifact detection", () => {
     await expect(verifyRun(dir, 1)).rejects.toThrow(/book for token.*SYNCHRONIZED/);
   });
 
+  it("fails when all book snapshots are RECEIVED_NOT_APPLIED but health is unchanged", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    for (let i = 0; i < lines.length; i += 1) {
+      const parsed = JSON.parse(requireLine(lines, i)) as Record<string, unknown>;
+      if (
+        parsed.source === "POLYMARKET_CLOB" &&
+        parsed.eventType === "book" &&
+        parsed.dedupeState === "UNIQUE_APPLIED"
+      ) {
+        parsed.dedupeState = "RECEIVED_NOT_APPLIED";
+        parsed.dedupeReason = "frame from inactive connection generation";
+        lines[i] = JSON.stringify(parsed);
+      }
+    }
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    // health.json is left completely unchanged
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /no UNIQUE_APPLIED book snapshot for expected token/,
+    );
+  });
+
   it("fails when isDuplicate contradicts dedupeState (UNIQUE_APPLIED with isDuplicate=true)", async () => {
     const dir = await createTempRunDir();
     await copyFixture(dir);
@@ -391,5 +414,135 @@ describe("verify-run corrupted artifact detection", () => {
     await expect(verifyRun(dir, 1.5)).rejects.toThrow(
       /minReferenceObservations must be a positive safe integer/,
     );
+  });
+
+  it("accepts negative maximumSourceToReceiveLatencyMs within clock-skew tolerance", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const ref = JSON.parse(requireLine(lines, 3)) as Record<string, unknown>;
+    // receivedAt - sourceTimestamp = -1000ms (source timestamp is 1s ahead)
+    ref.sourceTimestamp = (ref.receivedAt as number) + 1000;
+    lines[3] = JSON.stringify(ref);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    const health = await readJson(path.join(dir, "health.json"));
+    // Set the latency to -1000 (signed, finite, within referenceClockSkewMs=5000)
+    health.maximumSourceToReceiveLatencyMs = -1000;
+    health.referenceClockSkewMs = 5000;
+    await writeJson(path.join(dir, "health.json"), health);
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.referenceStaleAfterMs = health.referenceStaleAfterMs;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    // The verifier must accept the negative latency metric
+    await expect(verifyRun(dir, 1)).resolves.toBeUndefined();
+  });
+
+  it("fails when manifest.market.referenceSymbol is not btc/usd", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    (manifest.market as Record<string, unknown>).referenceSymbol = "eth/usd";
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/referenceSymbol.*expected btc\/usd/);
+  });
+
+  it("fails when manifest.market.referenceTopic is not crypto_prices_chainlink", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    (manifest.market as Record<string, unknown>).referenceTopic = "wrong_topic";
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /referenceTopic.*expected crypto_prices_chainlink/,
+    );
+  });
+
+  it("fails when manifest.market.rawMetadata is not a JsonValue", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    (manifest.market as Record<string, unknown>).rawMetadata = { bad: Number.NaN };
+    expect(() => runtimeValidateManifest(manifest)).toThrow(/rawMetadata/);
+  });
+
+  it("fails when manifest.market.rawGammaText is not a string", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    (manifest.market as Record<string, unknown>).rawGammaText = 123;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/rawGammaText.*string/);
+  });
+
+  it("fails when manifest.commandArguments is not a JsonValue", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.commandArguments = { bad: Number.NaN };
+    expect(() => runtimeValidateManifest(manifest)).toThrow(/commandArguments/);
+  });
+
+  it("fails when finalBookHealth map key does not match book.tokenId", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const health = await readJson(path.join(dir, "health.json"));
+    const bookHealth = health.finalBookHealth as Record<string, Record<string, unknown>>;
+    const upBook = bookHealth["111111"];
+    if (upBook === undefined) throw new Error("fixture missing book 111111");
+    upBook.tokenId = "999999";
+    await writeJson(path.join(dir, "health.json"), health);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/map key.*does not match book.tokenId/);
+  });
+
+  it("fails when frameId/messageIndex/messageCount nullability is inconsistent", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    book.frameId = "frame-1";
+    book.messageIndex = null;
+    book.messageCount = 1;
+    lines[1] = JSON.stringify(book);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /frameId, messageIndex, messageCount must be all null or all non-null/,
+    );
+  });
+
+  it("fails when messageCount is 0 for a framed message", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    book.frameId = "frame-1";
+    book.messageIndex = 0;
+    book.messageCount = 0;
+    lines[1] = JSON.stringify(book);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/messageCount must be > 0/);
+  });
+
+  it("fails when feed-derived event has connectionGeneration <= 0", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    book.connectionGeneration = 0;
+    lines[1] = JSON.stringify(book);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(
+      /connectionGeneration must be > 0 for feed-derived events/,
+    );
+  });
+
+  it("fails when processedAt < receivedAt", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const book = JSON.parse(requireLine(lines, 1)) as Record<string, unknown>;
+    book.processedAt = (book.receivedAt as number) - 1;
+    lines[1] = JSON.stringify(book);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/processedAt.*before receivedAt/);
   });
 });

@@ -475,4 +475,29 @@ describe("capture status fail-closed semantics", () => {
     expect(summary.referenceTimestampAnomalyCount).toBe(1);
     expect(summary.usableForReplay).toBe(false);
   });
+
+  it("records negative maximumSourceToReceiveLatencyMs within clock-skew tolerance", () => {
+    const books = new OrderBookTracker(TOKENS);
+    const health = new HealthTracker("test", "2026-08-05T06:02:00.000Z", TOKENS, books, 10_000);
+    setupBooks(books);
+    observeBookSnapshots(health);
+    // receivedAt - sourceTimestamp = -1000ms (source timestamp is 1s ahead)
+    // referenceClockSkewMs = 5000ms, so this is within tolerance
+    health.observe(
+      makeEnvelope({
+        source: "POLYMARKET_REFERENCE_PRICE",
+        eventType: "REFERENCE_PRICE",
+        sequence: 1,
+        receivedAt: NOW,
+        sourceTimestamp: NOW + 1000,
+      }),
+    );
+    const summary = health.summary(null, NOW + 100, 15_000, 5_000, 1);
+    // The latency is -1000ms, which is negative but within the 5s clock skew tolerance
+    expect(summary.maximumSourceToReceiveLatencyMs).toBe(-1000);
+    // Not anomalous because |latency| < referenceClockSkewMs
+    expect(summary.referenceFutureSourceSkewCount).toBe(0);
+    expect(summary.referenceTimestampAnomalyCount).toBe(0);
+    expect(summary.referencePriceStreamObserved).toBe(true);
+  });
 });

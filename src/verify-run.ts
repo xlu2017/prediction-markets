@@ -11,6 +11,7 @@ import type {
   RawEventEnvelope,
   RunManifest,
 } from "./types.js";
+import { OrderBookTracker } from "./book.js";
 
 const EVENT_SOURCES = [
   "POLYMARKET_CLOB",
@@ -100,6 +101,15 @@ function assertOptionalNonNegativeSafeInteger(value: unknown, label: string): nu
   return assertNonNegativeSafeInteger(value, label);
 }
 
+function assertOptionalFiniteNumber(value: unknown, label: string): number | null {
+  if (value === null) return null;
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    const type = typeof value;
+    throw new Error(`${label} has type ${type}, expected a finite number or null`);
+  }
+  return value;
+}
+
 function assertEnum<T extends string>(value: unknown, allowed: readonly T[], label: string): T {
   const s = assertString(value, label);
   if (!allowed.includes(s as T)) {
@@ -174,14 +184,25 @@ export function runtimeValidateManifest(raw: unknown): RunManifest {
   assertIsoTimestamp(market.opensAt, "manifest.market.opensAt");
   assertIsoTimestamp(market.closesAt, "manifest.market.closesAt");
   assertString(market.resolutionSource, "manifest.market.resolutionSource");
-  assertString(market.referenceSymbol, "manifest.market.referenceSymbol");
-  assertString(market.referenceTopic, "manifest.market.referenceTopic");
+  const referenceSymbol = assertString(market.referenceSymbol, "manifest.market.referenceSymbol");
+  if (referenceSymbol !== "btc/usd") {
+    throw new Error(`manifest.market.referenceSymbol is ${referenceSymbol}, expected btc/usd`);
+  }
+  const referenceTopic = assertString(market.referenceTopic, "manifest.market.referenceTopic");
+  if (referenceTopic !== "crypto_prices_chainlink") {
+    throw new Error(
+      `manifest.market.referenceTopic is ${referenceTopic}, expected crypto_prices_chainlink`,
+    );
+  }
   assertString(market.upTokenId, "manifest.market.upTokenId");
   assertString(market.downTokenId, "manifest.market.downTokenId");
   if (market.tickSize !== null) assertString(market.tickSize, "manifest.market.tickSize");
   assertBoolean(market.active, "manifest.market.active");
   assertBoolean(market.closed, "manifest.market.closed");
-  assertRecord(record.commandArguments, "manifest.commandArguments");
+  validateJsonValue(market.rawMetadata, "manifest.market.rawMetadata");
+  assertString(market.rawGammaText, "manifest.market.rawGammaText");
+  const cmdArgs = assertRecord(record.commandArguments, "manifest.commandArguments");
+  validateJsonValue(cmdArgs, "manifest.commandArguments");
   if (!Array.isArray(record.outputFiles)) throw new Error("manifest.outputFiles is not an array");
   for (let i = 0; i < record.outputFiles.length; i += 1) {
     if (typeof record.outputFiles[i] !== "string")
@@ -234,7 +255,7 @@ export function runtimeValidateHealth(raw: unknown): HealthSummary {
   assertNonNegativeSafeInteger(record.malformedEventCount, "health.malformedEventCount");
   assertNonNegativeSafeInteger(record.duplicateEventCount, "health.duplicateEventCount");
   assertNonNegativeSafeInteger(record.reconnectCount, "health.reconnectCount");
-  assertOptionalNonNegativeSafeInteger(
+  assertOptionalFiniteNumber(
     record.maximumSourceToReceiveLatencyMs,
     "health.maximumSourceToReceiveLatencyMs",
   );
@@ -360,6 +381,48 @@ export function runtimeValidateEvent(raw: unknown, index: number): RawEventEnvel
   if (record.rawMessageText !== null)
     assertString(record.rawMessageText, `events.jsonl line ${index + 1}: rawMessageText`);
   const label = `events.jsonl line ${index + 1}`;
+  const frameId = record.frameId as string | null;
+  const messageIndex = record.messageIndex as number | null;
+  const messageCount = record.messageCount as number | null;
+  const hasFrameId = frameId !== null;
+  const hasMessageIndex = messageIndex !== null;
+  const hasMessageCount = messageCount !== null;
+  if (hasFrameId !== hasMessageIndex || hasFrameId !== hasMessageCount) {
+    throw new Error(
+      `${label}: frameId, messageIndex, messageCount must be all null or all non-null (got frameId=${String(frameId)}, messageIndex=${String(messageIndex)}, messageCount=${String(messageCount)})`,
+    );
+  }
+  if (hasMessageCount && messageCount <= 0) {
+    throw new Error(`${label}: messageCount must be > 0 for framed messages, got ${messageCount}`);
+  }
+  const source = record.source as string;
+  const eventType = record.eventType as string;
+  const isFeedDerivedEvent =
+    source === "POLYMARKET_CLOB" || source === "POLYMARKET_REFERENCE_PRICE";
+  const isLifecycleEvent =
+    eventType === "DATA_GAP_STARTED" ||
+    eventType === "DATA_GAP_ENDED" ||
+    eventType === "CONNECTION_ATTEMPT" ||
+    eventType === "CONNECTION_OPEN" ||
+    eventType === "CONNECTION_CLOSED" ||
+    eventType === "SUBSCRIPTION_SENT" ||
+    eventType === "STALE_STREAM" ||
+    eventType === "RECONNECT_SCHEDULED";
+  if (isFeedDerivedEvent && !isLifecycleEvent) {
+    const gen = record.connectionGeneration as number | null;
+    if (gen === null || gen <= 0) {
+      throw new Error(
+        `${label}: connectionGeneration must be > 0 for feed-derived events, got ${String(gen)}`,
+      );
+    }
+  }
+  const receivedAt = record.receivedAt as number;
+  const processedAt = record.processedAt as number;
+  if (processedAt < receivedAt) {
+    throw new Error(
+      `${label}: processedAt ${processedAt} is before receivedAt ${receivedAt} (local clock regression)`,
+    );
+  }
   const dedupeState = record.dedupeState as string;
   const isDuplicate = record.isDuplicate as boolean;
   const duplicateOfSequence = record.duplicateOfSequence as number | null;
@@ -403,8 +466,6 @@ export function runtimeValidateEvent(raw: unknown, index: number): RawEventEnvel
       );
     }
   }
-  const messageIndex = record.messageIndex as number | null;
-  const messageCount = record.messageCount as number | null;
   if (messageIndex !== null && messageCount !== null && messageIndex >= messageCount) {
     throw new Error(
       `${label}: messageIndex ${messageIndex} must be less than messageCount ${messageCount}`,
@@ -623,6 +684,11 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
   for (const expected of expectedTokenIds) {
     if (!(expected in health.finalBookHealth)) {
       errors.push(`missing book health for expected token ID ${expected}`);
+    }
+  }
+  for (const [tokenId, book] of Object.entries(health.finalBookHealth)) {
+    if (book.tokenId !== tokenId) {
+      errors.push(`finalBookHealth map key ${tokenId} does not match book.tokenId ${book.tokenId}`);
     }
   }
 
@@ -921,6 +987,81 @@ export async function verifyRun(directory: string, minReferenceObservations = 5)
       }
       if (recomputedAnomalyCount > 0) {
         errors.push(`recomputed reference timestamp anomaly count ${recomputedAnomalyCount} > 0`);
+      }
+      const tokenIds = [manifest.market.upTokenId, manifest.market.downTokenId];
+      const replayBooks = new OrderBookTracker(tokenIds);
+      const appliedBookGenerations = new Map<string, number>();
+      let latestAcceptedClobGeneration: number | null = null;
+      for (const event of events) {
+        if (
+          event.source === "POLYMARKET_CLOB" &&
+          event.eventType === "book" &&
+          !event.isDuplicate &&
+          event.dedupeState === "UNIQUE_APPLIED"
+        ) {
+          const tokenId = event.tokenId;
+          if (tokenId !== null) {
+            try {
+              replayBooks.apply(event.payload, event.processedAt, event.connectionGeneration ?? 0);
+              appliedBookGenerations.set(tokenId, event.connectionGeneration ?? 0);
+            } catch (replayError) {
+              errors.push(
+                `replay failed for book event sequence ${event.sequence}: ${replayError instanceof Error ? replayError.message : String(replayError)}`,
+              );
+            }
+          }
+          if (
+            event.connectionGeneration !== null &&
+            (latestAcceptedClobGeneration === null ||
+              event.connectionGeneration > latestAcceptedClobGeneration)
+          ) {
+            latestAcceptedClobGeneration = event.connectionGeneration;
+          }
+        }
+      }
+      for (const expected of tokenIds) {
+        let found = false;
+        for (const event of events) {
+          if (
+            event.source === "POLYMARKET_CLOB" &&
+            event.eventType === "book" &&
+            !event.isDuplicate &&
+            event.dedupeState === "UNIQUE_APPLIED"
+          ) {
+            const tokens =
+              event.observedTokenIds ?? (event.tokenId !== null ? [event.tokenId] : []);
+            if (tokens.includes(expected)) {
+              found = true;
+              break;
+            }
+          }
+        }
+        if (!found) {
+          errors.push(
+            `no UNIQUE_APPLIED book snapshot for expected token ${expected} found in events.jsonl`,
+          );
+        }
+      }
+      for (const expected of tokenIds) {
+        const healthBook = health.finalBookHealth[expected];
+        if (healthBook === undefined) continue;
+        const replayGen = appliedBookGenerations.get(expected);
+        if (replayGen !== undefined && healthBook.snapshotConnectionGeneration !== null) {
+          if (replayGen !== healthBook.snapshotConnectionGeneration) {
+            errors.push(
+              `token ${expected}: latest applied snapshot generation ${replayGen} does not match health.snapshotConnectionGeneration ${healthBook.snapshotConnectionGeneration}`,
+            );
+          }
+        }
+        if (
+          replayGen !== undefined &&
+          latestAcceptedClobGeneration !== null &&
+          replayGen > latestAcceptedClobGeneration
+        ) {
+          errors.push(
+            `token ${expected}: latest applied snapshot generation ${replayGen} exceeds latest accepted CLOB generation ${latestAcceptedClobGeneration}`,
+          );
+        }
       }
     }
   }
