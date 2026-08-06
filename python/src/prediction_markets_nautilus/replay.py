@@ -13,8 +13,9 @@ connected.
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
 from .hashes import hash_value
 from .models import LifecycleEvent, ReferencePriceUpdate
@@ -79,6 +80,7 @@ class ReplayResult:
     final_down_book: BookState
     reference_count: int
     event_count: int
+    integrity_manifest: dict = field(default_factory=dict)
 
     def to_dict(self) -> dict:
         return {
@@ -96,6 +98,7 @@ class ReplayResult:
             "finalUpBook": _book_to_dict(self.final_up_book),
             "finalDownBook": _book_to_dict(self.final_down_book),
             "referenceCount": self.reference_count,
+            "integrityManifest": self.integrity_manifest,
         }
 
 
@@ -199,10 +202,10 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
                 )
         input_stream.append(
             {
+                **_to_dict(delta),
                 "sourceSequence": ev["seq"],
                 "childIndex": ev["child"],
                 "side": side_key,
-                "action": str(delta.action),
             }
         )
 
@@ -225,28 +228,9 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
     ref_records = []
     for cd in refs:
         r = cd.data
-        ref_entry = {
-            "sourceSequence": r.sourceSequence,
-            "childIndex": r.childIndex,
-            "symbol": r.symbol,
-            "topic": r.topic,
-            "value": r.value,
-            "topLevelSourceTimestamp": r.topLevelSourceTimestamp,
-            "payloadSourceTimestamp": r.payloadSourceTimestamp,
-            "ts_event": r.ts_event,
-            "ts_init": r.ts_init,
-        }
-        ref_records.append(ref_entry)
-        # Include references in the canonical input stream.
-        input_stream.append(
-            {
-                "sourceSequence": r.sourceSequence,
-                "childIndex": r.childIndex,
-                "side": "REFERENCE",
-                "symbol": r.symbol,
-                "value": r.value,
-            }
-        )
+        ref_records.append(r.to_dict())
+        # Include references in the canonical input stream with all fields.
+        input_stream.append({**r.to_dict(), "side": "REFERENCE"})
     ref_records.sort(key=lambda x: (x["sourceSequence"], x["childIndex"]))
 
     # Trade ticks — ordered by (sourceSequence, childIndex) and included in input stream.
@@ -257,31 +241,19 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
         parts = tid_str.rsplit("-", 2)
         tt_seq = int(parts[-2]) if len(parts) == 3 else 0
         tt_child = int(parts[-1]) if len(parts) == 3 else 0
-        input_stream.append(
-            {
-                "sourceSequence": tt_seq,
-                "childIndex": tt_child,
-                "side": "TRADE",
-                "price": str(tt.price),
-                "size": str(tt.size),
-            }
-        )
+        tr = _to_dict(tt)
+        tr["aggressorSide"] = tr.pop("side", "")
+        tr["sourceSequence"] = tt_seq
+        tr["childIndex"] = tt_child
+        tr["side"] = "TRADE"
+        input_stream.append(tr)
 
     # Lifecycle events (audit/catalog sidecar) — include sourceSequence, childIndex,
     # and the full typed payload (feed name, close code, gap duration, etc.).
     lifecycle = cat.custom_data(cls=LifecycleEvent)
     for cd in lifecycle:
         le = cd.data
-        input_stream.append(
-            {
-                "sourceSequence": le.sourceSequence,
-                "childIndex": le.childIndex,
-                "side": "LIFECYCLE",
-                "kind": le.kind,
-                "generation": le.generation,
-                "payloadJson": le.payloadJson,
-            }
-        )
+        input_stream.append({**le.to_dict(), "side": "LIFECYCLE"})
 
     # Audit events (duplicates, empty frames, unsupported events) — included in the
     # canonical input hash so the hash covers the complete source stream, not just
@@ -292,15 +264,7 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
 
         audit_table = pq.read_table(audit_path)
         for row in audit_table.to_pylist():
-            input_stream.append(
-                {
-                    "sourceSequence": row.get("sourceSequence", 0),
-                    "childIndex": row.get("childIndex", 0),
-                    "side": "AUDIT",
-                    "kind": row.get("kind", ""),
-                    "originalEventType": row.get("originalEventType", ""),
-                }
-            )
+            input_stream.append({**row, "side": "AUDIT"})
 
     # Canonical sort by (sourceSequence, childIndex, side) — includes ALL event types.
     input_stream.sort(
@@ -308,16 +272,37 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
     )
 
     # Content-complete input hashes.
-    source_corpus_hash = _read_source_corpus_hash(cat_dir)
+    source_corpus_hash, source_line_count, verifier_parameters = _read_source_corpus_hash(cat_dir)
     engine_input_stream = [e for e in input_stream if e.get("side") != "AUDIT"]
-    strategy_input_stream = [e for e in input_stream if e.get("side") in {"UP", "DOWN", "REFERENCE"}]
+    strategy_input_stream = [
+        e for e in input_stream if e.get("side") in {"UP", "DOWN", "REFERENCE"}
+    ]
 
     run_id = _read_run_id(cat_dir)
+    normalized_engine_input_hash = hash_value(engine_input_stream)
+    strategy_visible_input_hash = hash_value(strategy_input_stream)
+    integrity_manifest = {
+        "version": "1",
+        "runId": run_id,
+        "canonicalizationVersion": "1",
+        "sourceCorpusHash": source_corpus_hash,
+        "normalizedEngineInputHash": normalized_engine_input_hash,
+        "strategyVisibleInputHash": strategy_visible_input_hash,
+        "recordCounts": {
+            "sourceCorpusLineCount": source_line_count,
+            "engineInputCount": len(engine_input_stream),
+            "strategyVisibleInputCount": len(strategy_input_stream),
+        },
+        "verifierParameters": verifier_parameters,
+    }
+    (cat_dir / "integrity-manifest.json").write_text(
+        json.dumps(integrity_manifest, indent=2), encoding="utf-8"
+    )
     return ReplayResult(
         run_id=run_id,
         source_corpus_hash=source_corpus_hash,
-        normalized_engine_input_hash=hash_value(engine_input_stream),
-        strategy_visible_input_hash=hash_value(strategy_input_stream),
+        normalized_engine_input_hash=normalized_engine_input_hash,
+        strategy_visible_input_hash=strategy_visible_input_hash,
         up_book_after_each_event=up_after,
         down_book_after_each_event=down_after,
         final_up_book_hash=hash_value(_book_to_dict(final_up)),
@@ -328,6 +313,7 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
         final_down_book=final_down,
         reference_count=len(ref_records),
         event_count=len(events),
+        integrity_manifest=integrity_manifest,
     )
 
 
@@ -414,6 +400,16 @@ def _as_deltas(delta):
     return OrderBookDeltas(delta.instrument_id, [delta])
 
 
+def _to_dict(obj: Any) -> dict:
+    """Safely get a plain dict for a Nautilus data object."""
+    if hasattr(obj, "to_dict"):
+        try:
+            return obj.to_dict()
+        except TypeError:
+            return type(obj).to_dict(obj)
+    return dict(obj)
+
+
 def _read_run_id(cat_dir: Path) -> str:
     report_path = cat_dir / "conversion-report.json"
     if report_path.exists():
@@ -421,11 +417,23 @@ def _read_run_id(cat_dir: Path) -> str:
     return ""
 
 
-def _read_source_corpus_hash(cat_dir: Path) -> str:
+def _read_source_corpus_hash(cat_dir: Path) -> tuple[str, int, dict]:
+    """Read and validate the persisted source-corpus integrity artifact.
+
+    Returns the verified hash, the raw line count, and the verifier parameters.
+    Raises ValueError if the artifact is missing or malformed.
+    """
     path = cat_dir / "source-corpus-hash.json"
-    if path.exists():
-        return json.loads(path.read_text(encoding="utf-8")).get("sourceCorpusHash", "")
-    return ""
+    if not path.exists():
+        raise ValueError(f"source-corpus-hash.json missing in {cat_dir}")
+    data = json.loads(path.read_text(encoding="utf-8"))
+    h = data.get("sourceCorpusHash", "")
+    if not isinstance(h, str) or len(h) != 64 or any(c not in "0123456789abcdef" for c in h):
+        raise ValueError(f"invalid sourceCorpusHash in {path}")
+    line_count = data.get("sourceCorpusLineCount", 0)
+    if not isinstance(line_count, int) or line_count < 0:
+        raise ValueError(f"invalid sourceCorpusLineCount in {path}")
+    return h, line_count, data.get("verifierParameters", {})
 
 
 def compare_final_books(result: ReplayResult, catalog_directory: str | Path) -> dict:

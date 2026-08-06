@@ -76,11 +76,8 @@ revision but require further validation before a final adoption decision:
 
 ### Remaining work before final decision
 
-- Rebase the adapter onto the current PR #2 recorder contract and run the authoritative TypeScript
-  verifier before conversion.
-- Implement content-complete input hashes: `sourceCorpusHash`, `normalizedEngineInputHash`, and
-  `strategyVisibleInputHash`.
-- Validate the adapter against real (non-synthetic) schema-v2 recordings.
+- Validate the adapter against a real, verifier-passing schema-v2 recording (not synthetic
+  fixtures).
 - Performance test with larger event streams.
 
 ## Answers to the required questions
@@ -184,11 +181,10 @@ revision but require further validation before a final adoption decision:
 ## Spike evidence
 
 - Sample fixture `fixtures/sample-run` converts: 2 snapshots, 1 reference, 1 lifecycle, 0 audit.
-- Two independent process replays produce identical hashes (see CI).
+- Two independent process replays produce identical content-complete hashes (see CI).
 - Final-book comparison `allMatch: true` against `health.finalBookHealth`.
-- 33 edge-case tests pass (20 required cases + reference-price queryability + realistic fixture
-  suite + BacktestNode proof + regressing-timestamp proof + missing-reference-value abort + reader
-  invariant rejection tests + universal `catalogRecordId` uniqueness).
+- 47 edge-case tests pass, including 14 hash-sensitivity mutation tests covering price, size,
+  timestamp, reference value/topic, trade side, lifecycle payload, audit-only, and event reordering.
 - BacktestNode proof: 6 book events (Up and Down), 1 Chainlink reference event (via event engine), 1
   market order, 1 fill, `ledgerMatch: true`, cash debited to `999_994.800000 pUSD`, `LONG 10.000000`
   position, raw received ledger equals expected ledger in recorder order.
@@ -197,15 +193,13 @@ revision but require further validation before a final adoption decision:
 ## Recommendation
 
 The evaluation remains **incomplete**. Nautilus demonstrates the required catalog, custom-data,
-backtest, matching, fill, and accounting primitives for the synthetic proof, but several blockers
-must be resolved before a final adoption decision:
+backtest, matching, fill, and accounting primitives for the synthetic proof. The adapter now runs
+the authoritative TypeScript verifier before conversion, has been rebased onto the current recorder
+contract, and computes content-complete input hashes (`sourceCorpusHash`,
+`normalizedEngineInputHash`, `strategyVisibleInputHash`) backed by mutation tests.
 
-- The Python contract mirror is behind the latest recorder PR (#2); conversion must run the
-  authoritative TypeScript verifier before consuming a run.
-- The adapter has not yet been validated against a real (non-synthetic) verified recording.
-- Content-complete input hashes (`sourceCorpusHash`, `normalizedEngineInputHash`,
-  `strategyVisibleInputHash`) remain to be defined and verified.
+The only remaining blocker before a final adoption decision is validation against a real
+(non-synthetic) verified schema-v2 recording end-to-end.
 
 Keep the TypeScript recorder as the authoritative lossless audit layer. Continue the Nautilus
-adapter work only after rebasing onto the current recorder contract and validating one real
-recording end-to-end.
+adapter work after one real recording passes conversion, replay, and BacktestNode acceptance.

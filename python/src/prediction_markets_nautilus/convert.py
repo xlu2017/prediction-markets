@@ -9,6 +9,7 @@ source envelope.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import shutil
 import subprocess
@@ -19,7 +20,6 @@ from typing import Any
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .hashes import hash_value
 from .models import (
     Level,
     LifecycleEvent,
@@ -1032,21 +1032,19 @@ def _verify_run_directory(run_directory: str | Path, min_reference_observations:
         except FileNotFoundError:
             continue
         except subprocess.CalledProcessError as e:
-            raise ValueError(f"TypeScript verifier rejected run (exit {e.returncode}): {run_dir}") from e
+            raise ValueError(
+                f"TypeScript verifier rejected run (exit {e.returncode}): {run_dir}"
+            ) from e
     raise RuntimeError("TypeScript verifier not available: all candidate runners failed to start")
 
 
-def _source_corpus_hash(run_directory: str | Path) -> str:
-    """Hash the raw events.jsonl lines to prove the normalized corpus is complete."""
+def _source_corpus_hash(run_directory: str | Path) -> tuple[str, int]:
+    """SHA-256 hex digest of the raw events.jsonl bytes and the raw line count."""
     events_path = Path(run_directory) / "events.jsonl"
     if not events_path.exists():
         raise ValueError(f"events.jsonl not found in {events_path}")
-    lines = [
-        line
-        for line in events_path.read_text(encoding="utf-8").splitlines()
-        if line.strip()
-    ]
-    return hash_value(lines)
+    raw = events_path.read_bytes()
+    return hashlib.sha256(raw).hexdigest(), len(raw.splitlines())
 
 
 def convert_run(
@@ -1065,9 +1063,26 @@ def convert_run(
     run = load_run(run_directory)
     normalized = normalize_run(run)
     report = write_catalog(normalized, catalog_directory)
-    source_corpus_hash = _source_corpus_hash(run_directory)
+    source_corpus_hash, source_line_count = _source_corpus_hash(run_directory)
+    verifier_parameters = {
+        "minReferenceObservations": min_reference_observations,
+        "verify": verify,
+    }
     (Path(catalog_directory) / "source-corpus-hash.json").write_text(
-        json.dumps({"sourceCorpusHash": source_corpus_hash}, indent=2), encoding="utf-8"
+        json.dumps(
+            {
+                "sourceCorpusHash": source_corpus_hash,
+                "sourceCorpusLineCount": source_line_count,
+                "verifierParameters": verifier_parameters,
+            },
+            indent=2,
+        ),
+        encoding="utf-8",
+    )
+    report["sourceCorpusHash"] = source_corpus_hash
+    report["verifierParameters"] = verifier_parameters
+    (Path(catalog_directory) / "conversion-report.json").write_text(
+        json.dumps(report, indent=2), encoding="utf-8"
     )
     # Expected final-book health sidecar for self-contained Phase 9 comparison.
     expected = {
