@@ -15,12 +15,12 @@ import shutil
 import subprocess
 from decimal import Decimal
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import pyarrow as pa
 import pyarrow.parquet as pq
 
-from .hashes import canonical_json, hash_json_file, hash_parquet_rows, hash_value
+from .hashes import canonical_json, hash_json_file, hash_parquet_rows
 from .models import (
     Level,
     LifecycleEvent,
@@ -88,7 +88,7 @@ def _short_instrument_symbol(condition_id: str, token_id: str) -> str:
     """Short, stable Nautilus symbol for the instrument ID to avoid filesystem path limits."""
     import hashlib
 
-    digest = hashlib.sha256(f"{condition_id}:{token_id}".encode("utf-8")).hexdigest()
+    digest = hashlib.sha256(f"{condition_id}:{token_id}".encode()).hexdigest()
     return f"pm{digest[:20]}"  # 22 chars, enough for uniqueness and short paths
 
 
@@ -570,7 +570,7 @@ def _decimal_exponent(value: str) -> int:
     The most-negative exponent in a set of prices/quantities is the smallest
     power-of-10 unit needed to represent every value exactly.
     """
-    return Decimal(value).as_tuple().exponent
+    return cast(int, Decimal(value).as_tuple().exponent)
 
 
 def _derive_effective_increments(normalized: NormalizedRun) -> tuple[Decimal, Decimal, int, int]:
@@ -1111,10 +1111,22 @@ def write_catalog(
             for lv in [*snap.bids, *snap.asks]:
                 instr = instruments_by_id[snap.instrumentId]
                 _check_round_trip(
-                    lv.price, instr, instr.make_price, "price", "snapshot", snap.lineage, precision_issues
+                    lv.price,
+                    instr,
+                    instr.make_price,
+                    "price",
+                    "snapshot",
+                    snap.lineage,
+                    precision_issues,
                 )
                 _check_round_trip(
-                    lv.size, instr, instr.make_qty, "size", "snapshot", snap.lineage, precision_issues
+                    lv.size,
+                    instr,
+                    instr.make_qty,
+                    "size",
+                    "snapshot",
+                    snap.lineage,
+                    precision_issues,
                 )
         elif rtype == "delta":
             d = rec
@@ -1277,7 +1289,9 @@ def write_catalog(
     cat = ParquetDataCatalog(str(cat_dir))
     instruments_r, up_instr, down_instr, up_deltas, down_deltas = _catalog_read(cat)
     input_stream = _build_input_stream(up_deltas, down_deltas, up_instr, down_instr, cat, cat_dir)
-    integrity_fields = _catalog_integrity_fields(input_stream, instruments_r, source_corpus_line_count)
+    integrity_fields = _catalog_integrity_fields(
+        input_stream, instruments_r, source_corpus_line_count
+    )
 
     # Artifact hashes for the integrity manifest.
     lineage_hash = hash_parquet_rows(cat_dir / "lineage.parquet")

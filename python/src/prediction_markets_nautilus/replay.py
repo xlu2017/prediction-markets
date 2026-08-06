@@ -322,7 +322,9 @@ def _verify_catalog_integrity(cat_dir: Path, *, allow_unverified: bool = False) 
         raise ValueError("lineageSidecarHash mismatch")
     if hash_parquet_rows(cat_dir / "audit.parquet") != manifest.get("auditSidecarHash"):
         raise ValueError("auditSidecarHash mismatch")
-    if hash_json_file(cat_dir / "expected-final-books.json") != manifest.get("expectedFinalBooksHash"):
+    if hash_json_file(cat_dir / "expected-final-books.json") != manifest.get(
+        "expectedFinalBooksHash"
+    ):
         raise ValueError("expectedFinalBooksHash mismatch")
     if hash_json_file(cat_dir / "conversion-report.json") != manifest.get("conversionReportHash"):
         raise ValueError("conversionReportHash mismatch")
@@ -339,7 +341,9 @@ def _verify_catalog_integrity(cat_dir: Path, *, allow_unverified: bool = False) 
         "recordCounts",
     ):
         if catalog_fields.get(key) != manifest.get(key):
-            raise ValueError(f"{key} mismatch: expected {catalog_fields.get(key)!r}, got {manifest.get(key)!r}")
+            raise ValueError(
+                f"{key} mismatch: expected {catalog_fields.get(key)!r}, got {manifest.get(key)!r}"
+            )
 
     # Effective increment/precision values.
     from decimal import Decimal
