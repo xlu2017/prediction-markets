@@ -813,10 +813,23 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
     all_refs: list = []
     all_lifecycle: list = []
     catalog_lineage_rows: list[dict] = []
+    catalog_ordinal = 0
+
+    def _add_lineage_row(base: dict, record_type: str | None = None) -> dict:
+        nonlocal catalog_ordinal
+        catalog_ordinal += 1
+        rt = base.get("recordType") or record_type
+        row = {**base, "recordType": rt}
+        run_id = row.get("runId", "")
+        seq = row.get("sourceSequence", 0)
+        child = row.get("childIndex", 0)
+        token = row.get("resolvedTokenId") or row.get("tokenId") or "none"
+        row["catalogRecordId"] = f"{run_id}:{seq}:{child}:{token}:{rt}:{catalog_ordinal}"
+        return row
 
     # Instrument lineage (one row per instrument).
     for instr in normalized.instruments:
-        catalog_lineage_rows.append({**instr.lineage.to_dict(), "recordType": "Instrument"})
+        catalog_lineage_rows.append(_add_lineage_row(instr.lineage.to_dict(), "Instrument"))
 
     # Process all engine-bound records in recorder order (sourceSequence, childIndex)
     # so the ReplayClock produces monotonically increasing timestamps that preserve
@@ -841,7 +854,7 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
             snap = rec
             deltas_obj, rows = _snapshot_to_deltas(snap, instruments_by_id, clock)
             all_deltas.append(deltas_obj)
-            catalog_lineage_rows.extend(rows)
+            catalog_lineage_rows.extend([_add_lineage_row(r) for r in rows])
             snapshot_count += 1
             for lv in [*snap.bids, *snap.asks]:
                 _check_precision(
@@ -855,7 +868,7 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
             d = rec
             deltas_obj, rows = _delta_to_nautilus(d, instruments_by_id, clock)
             all_deltas.append(deltas_obj)
-            catalog_lineage_rows.extend(rows)
+            catalog_lineage_rows.extend([_add_lineage_row(r) for r in rows])
             delta_count += 1
             _check_precision(
                 d.price, instruments_by_id[d.instrumentId], "delta", d.lineage, precision_issues
@@ -864,7 +877,7 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
             t = rec
             trade_obj, rows = _trade_to_nautilus(t, instruments_by_id, clock)
             all_trades.append(trade_obj)
-            catalog_lineage_rows.extend(rows)
+            catalog_lineage_rows.extend([_add_lineage_row(r) for r in rows])
             trade_count += 1
             _check_precision(
                 t.price, instruments_by_id[t.instrumentId], "trade", t.lineage, precision_issues
@@ -873,13 +886,13 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
             r = rec
             ref_obj, rows = _reference_to_nautilus(r, clock)
             all_refs.append(ref_obj)
-            catalog_lineage_rows.extend(rows)
+            catalog_lineage_rows.extend([_add_lineage_row(r) for r in rows])
             reference_count += 1
         elif rtype == "lifecycle":
             ev = rec
             lc_obj, rows = _lifecycle_to_nautilus(ev, clock)
             all_lifecycle.append(lc_obj)
-            catalog_lineage_rows.extend(rows)
+            catalog_lineage_rows.extend([_add_lineage_row(r) for r in rows])
             lifecycle_count += 1
 
     # Abort if any precision loss was detected — sub-tick prices must not be silently quantized.
@@ -900,7 +913,7 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
 
     # Audit events: one lineage row per audit event.
     for a in normalized.audit:
-        catalog_lineage_rows.append({**a.lineage.to_dict(), "recordType": "AuditEvent"})
+        catalog_lineage_rows.append(_add_lineage_row(a.lineage.to_dict(), "AuditEvent"))
 
     if all_deltas:
         # Sort by ts_init as required by the catalog.
