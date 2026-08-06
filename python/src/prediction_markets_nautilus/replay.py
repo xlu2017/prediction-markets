@@ -150,13 +150,13 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
     events: list[dict] = []
     for d in up_deltas:
         seq_key = d.sequence
-        seq = seq_key // 1000
-        child = seq_key % 1000
+        seq = seq_key // 1_000_000
+        child = seq_key % 1_000_000
         events.append({"seq": seq, "child": child, "side": "UP", "delta": d})
     for d in down_deltas:
         seq_key = d.sequence
-        seq = seq_key // 1000
-        child = seq_key % 1000
+        seq = seq_key // 1_000_000
+        child = seq_key % 1_000_000
         events.append({"seq": seq, "child": child, "side": "DOWN", "delta": d})
     # Deterministic sort by recorder sequence, then child index, then side as tiebreaker.
     events.sort(key=lambda e: (e["seq"], e["child"], e["side"]))
@@ -228,30 +228,67 @@ def replay_catalog(catalog_directory: str | Path) -> ReplayResult:
         )
     )
 
-    # Reference-price stream from custom data.
+    # Reference-price stream from custom data — ordered by (sourceSequence, childIndex).
     refs = cat.custom_data(cls=ReferencePriceUpdate)
     ref_records = []
     for cd in refs:
         r = cd.data
-        ref_records.append(
+        ref_entry = {
+            "sourceSequence": r.sourceSequence,
+            "childIndex": r.childIndex,
+            "symbol": r.symbol,
+            "topic": r.topic,
+            "value": r.value,
+            "topLevelSourceTimestamp": r.topLevelSourceTimestamp,
+            "payloadSourceTimestamp": r.payloadSourceTimestamp,
+            "ts_event": r.ts_event,
+            "ts_init": r.ts_init,
+        }
+        ref_records.append(ref_entry)
+        # Include references in the canonical input stream.
+        input_stream.append(
             {
+                "sourceSequence": r.sourceSequence,
+                "childIndex": r.childIndex,
+                "side": "REFERENCE",
                 "symbol": r.symbol,
-                "topic": r.topic,
                 "value": r.value,
-                "topLevelSourceTimestamp": r.topLevelSourceTimestamp,
-                "payloadSourceTimestamp": r.payloadSourceTimestamp,
-                "ts_event": r.ts_event,
-                "ts_init": r.ts_init,
             }
         )
-    ref_records.sort(key=lambda x: (x["ts_event"], x["ts_init"]))
+    ref_records.sort(key=lambda x: (x["sourceSequence"], x["childIndex"]))
 
-    # Lifecycle events (audit/catalog sidecar).
+    # Trade ticks — ordered by (sourceSequence, childIndex) and included in input stream.
+    trade_ticks = cat.trade_ticks()
+    for tt in trade_ticks:
+        # TradeId format: runId-sourceSequence-childIndex
+        tid_str = str(tt.trade_id)
+        parts = tid_str.rsplit("-", 2)
+        tt_seq = int(parts[-2]) if len(parts) == 3 else 0
+        tt_child = int(parts[-1]) if len(parts) == 3 else 0
+        input_stream.append(
+            {
+                "sourceSequence": tt_seq,
+                "childIndex": tt_child,
+                "side": "TRADE",
+                "price": str(tt.price),
+                "size": str(tt.size),
+            }
+        )
+
+    # Lifecycle events (audit/catalog sidecar) — include sourceSequence and childIndex.
     lifecycle = cat.custom_data(cls=LifecycleEvent)
     for cd in lifecycle:
         le = cd.data
-        input_stream.append({"side": "LIFECYCLE", "ts": le.ts_event, "kind": le.kind})
+        input_stream.append(
+            {
+                "sourceSequence": le.sourceSequence,
+                "childIndex": le.childIndex,
+                "side": "LIFECYCLE",
+                "kind": le.kind,
+            }
+        )
 
+    # Canonical sort by (sourceSequence, childIndex, side) — includes ALL event types.
     input_stream.sort(
         key=lambda x: (x.get("sourceSequence", 0), x.get("childIndex", 0), x.get("side", ""))
     )
@@ -337,7 +374,7 @@ def _match_deltas_to_lineage(
         if not deltas or not token:
             continue
         lin_rows = lin_delta_by_token.get(token, [])
-        # Match by position within the sorted group — both are sorted by (ts_event, action_rank).
+        # Match by position within the sorted group â€” both are sorted by (ts_event, action_rank).
         # This works because the converter writes deltas and lineage in the same order.
         for i, d in enumerate(deltas):
             if i < len(lin_rows):

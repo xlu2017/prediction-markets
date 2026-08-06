@@ -10,6 +10,7 @@ from __future__ import annotations
 import json
 from collections.abc import Iterator
 from dataclasses import dataclass
+from decimal import Decimal
 from pathlib import Path
 
 from .schema_v2 import (
@@ -251,6 +252,121 @@ def load_run(run_directory: str | Path) -> RunDirectory:
             f"recomputed future-skew count {recomp_future} != "
             f"health.referenceFutureSourceSkewCount {health.get('referenceFutureSourceSkewCount', 0)}"
         )
+
+    # --- Verify eventCountsBySource and eventCountsByType ---
+    recomp_by_source: dict[str, int] = {}
+    recomp_by_type: dict[str, int] = {}
+    for env in events:
+        recomp_by_source[env.source] = recomp_by_source.get(env.source, 0) + 1
+        type_key = f"{env.source}:{env.eventType}"
+        recomp_by_type[type_key] = recomp_by_type.get(type_key, 0) + 1
+    health_by_source = health.get("eventCountsBySource", {})
+    if isinstance(health_by_source, dict):
+        for source, count in recomp_by_source.items():
+            h_count = health_by_source.get(source)
+            if h_count is not None and h_count != count:
+                errors.append(f"eventCountsBySource[{source}] = {h_count} != recomputed {count}")
+    health_by_type = health.get("eventCountsByType", {})
+    if isinstance(health_by_type, dict):
+        for type_key, count in recomp_by_type.items():
+            h_count = health_by_type.get(type_key)
+            if h_count is not None and h_count != count:
+                errors.append(f"eventCountsByType[{type_key}] = {h_count} != recomputed {count}")
+
+    # --- Reconstruct final books from events and compare with finalBookHealth ---
+    up_token = manifest["market"].upTokenId
+    down_token = manifest["market"].downTokenId
+    for token_id, expected_book in (
+        [
+            (up_token, fbh.get(up_token)),
+            (down_token, fbh.get(down_token)),
+        ]
+        if isinstance(fbh, dict)
+        else []
+    ):
+        if not isinstance(expected_book, dict):
+            continue
+        recon_bids: dict[str, str] = {}
+        recon_asks: dict[str, str] = {}
+        for env in events:
+            # Skip events that don't affect this token.
+            # For book events, check tokenId directly.
+            # For price_change events, check per-change asset_id.
+            if env.eventType == "book":
+                if env.tokenId != token_id:
+                    continue
+            elif env.eventType == "price_change":
+                # price_change may affect this token via per-change asset_id.
+                pass
+            else:
+                continue
+            payload = env.payload if isinstance(env.payload, dict) else {}
+            if env.eventType == "book":
+                # Snapshot: clear and rebuild.
+                recon_bids.clear()
+                recon_asks.clear()
+                for lv in payload.get("bids", []):
+                    if (
+                        isinstance(lv, dict)
+                        and isinstance(lv.get("price"), str)
+                        and isinstance(lv.get("size"), str)
+                    ):
+                        if lv["size"] != "0":
+                            recon_bids[lv["price"]] = lv["size"]
+                        else:
+                            recon_bids.pop(lv["price"], None)
+                for lv in payload.get("asks", []):
+                    if (
+                        isinstance(lv, dict)
+                        and isinstance(lv.get("price"), str)
+                        and isinstance(lv.get("size"), str)
+                    ):
+                        if lv["size"] != "0":
+                            recon_asks[lv["price"]] = lv["size"]
+                        else:
+                            recon_asks.pop(lv["price"], None)
+            elif env.eventType == "price_change":
+                for ch in payload.get("price_changes", []):
+                    if not isinstance(ch, dict):
+                        continue
+                    ch_token = ch.get("asset_id") or env.tokenId
+                    if ch_token != token_id:
+                        continue
+                    price = ch.get("price")
+                    size = ch.get("size")
+                    side = ch.get("side")
+                    if not isinstance(price, str) or not isinstance(size, str):
+                        continue
+                    book = recon_bids if side == "BUY" else recon_asks
+                    if size != "0":
+                        book[price] = size
+                    else:
+                        book.pop(price, None)
+        # Compare reconstructed best bid/ask with health.
+        recon_best_bid = max(recon_bids, key=lambda p: float(p)) if recon_bids else None
+        recon_best_ask = min(recon_asks, key=lambda p: float(p)) if recon_asks else None
+        exp_best_bid = expected_book.get("bestBid")
+        exp_best_ask = expected_book.get("bestAsk")
+        if exp_best_bid is not None and recon_best_bid is not None:
+            if Decimal(exp_best_bid) != Decimal(recon_best_bid):
+                errors.append(
+                    f"reconstructed best bid for {token_id} = {recon_best_bid} != health {exp_best_bid}"
+                )
+        if exp_best_ask is not None and recon_best_ask is not None:
+            if Decimal(exp_best_ask) != Decimal(recon_best_ask):
+                errors.append(
+                    f"reconstructed best ask for {token_id} = {recon_best_ask} != health {exp_best_ask}"
+                )
+        exp_bid_depth = expected_book.get("bidDepthCount")
+        if isinstance(exp_bid_depth, int) and exp_bid_depth != len(recon_bids):
+            errors.append(
+                f"reconstructed bid depth for {token_id} = {len(recon_bids)} != health {exp_bid_depth}"
+            )
+        exp_ask_depth = expected_book.get("askDepthCount")
+        if isinstance(exp_ask_depth, int) and exp_ask_depth != len(recon_asks):
+            errors.append(
+                f"reconstructed ask depth for {token_id} = {len(recon_asks)} != health {exp_ask_depth}"
+            )
 
     if errors:
         msg = "\n  - " + "\n  - ".join(errors)

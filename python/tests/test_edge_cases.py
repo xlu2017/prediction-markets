@@ -92,10 +92,14 @@ def test_duplicate_event_routed_to_audit(tmp_path: Path) -> None:
     dup["dedupeState"] = "DUPLICATE_APPLIED"
     dup["duplicateOfSequence"] = 2
     manifest = F.base_manifest(F.base_market(), finalEventCount=5)
+    health = F.base_health(totalEventsReceived=5, duplicateEventCount=1)
+    # Update event counts to include the duplicate event.
+    health["eventCountsBySource"]["POLYMARKET_CLOB"] = 3
+    health["eventCountsByType"]["POLYMARKET_CLOB:book"] = 3
     F.write_run(
         tmp_path,
         manifest,
-        F.base_health(totalEventsReceived=5, duplicateEventCount=1),
+        health,
         events + [dup],
         market=F.base_market(),
     )
@@ -135,7 +139,49 @@ def test_snapshot_followed_by_deltas(tmp_path: Path) -> None:
         F.reference_event(6),
     ]
     manifest = F.base_manifest(F.base_market(), finalEventCount=6)
-    health = F.base_health(totalEventsReceived=6)
+    # Build health that matches the actual event stream.
+    books = {
+        "111111": {
+            "tokenId": "111111",
+            "state": "SYNCHRONIZED",
+            "integrity": "NORMAL",
+            "crossedIncidentCount": 0,
+            "synchronizationEpoch": 0,
+            "snapshotConnectionGeneration": 1,
+            "bestBid": ".49",
+            "bestAsk": None,
+            "bidDepthCount": 2,
+            "askDepthCount": 0,
+            "lastSuccessfulUpdateTime": 1785909720306,
+            "healthy": True,
+        },
+        "222222": {
+            "tokenId": "222222",
+            "state": "SYNCHRONIZED",
+            "integrity": "NORMAL",
+            "crossedIncidentCount": 0,
+            "synchronizationEpoch": 0,
+            "snapshotConnectionGeneration": 1,
+            "bestBid": ".47",
+            "bestAsk": ".53",
+            "bidDepthCount": 1,
+            "askDepthCount": 1,
+            "lastSuccessfulUpdateTime": 1785909720116,
+            "healthy": True,
+        },
+    }
+    health = F.base_health(books=books, totalEventsReceived=6)
+    health["eventCountsBySource"] = {
+        "POLYMARKET_MARKET": 1,
+        "POLYMARKET_CLOB": 4,
+        "POLYMARKET_REFERENCE_PRICE": 1,
+    }
+    health["eventCountsByType"] = {
+        "POLYMARKET_MARKET:MARKET_DISCOVERED": 1,
+        "POLYMARKET_CLOB:book": 2,
+        "POLYMARKET_CLOB:price_change": 2,
+        "POLYMARKET_REFERENCE_PRICE:REFERENCE_PRICE": 1,
+    }
     F.write_run(tmp_path, manifest, health, events, market=F.base_market())
     run = load_run(tmp_path)
     normalized = normalize_run(run)
@@ -398,10 +444,13 @@ def test_unsupported_clob_event(tmp_path: Path) -> None:
     unsupported["eventType"] = "some_future_event"
     unsupported["payload"] = {"event_type": "some_future_event", "asset_id": "111111"}
     manifest = F.base_manifest(F.base_market(), finalEventCount=5)
+    health = F.base_health(totalEventsReceived=5)
+    health["eventCountsBySource"]["POLYMARKET_CLOB"] = 3
+    health["eventCountsByType"]["POLYMARKET_CLOB:some_future_event"] = 1
     F.write_run(
         tmp_path,
         manifest,
-        F.base_health(totalEventsReceived=5),
+        health,
         events + [unsupported],
         market=F.base_market(),
     )
@@ -585,10 +634,10 @@ def test_realistic_fixture_loads_and_converts(tmp_path: Path) -> None:
     assert len(normalized.snapshots) == 4
     assert len(normalized.deltas) == 3  # 1 single-token + 2 from multi-token
     assert len(normalized.trades) == 1
-    assert len(normalized.references) == 1  # only seq 8 is a reference
+    assert len(normalized.references) == 1  # only seq 8
     assert len(normalized.lifecycle) == 2  # MARKET_DISCOVERED + RECONNECT
     kinds = {ev.kind for ev in normalized.lifecycle}
-    assert "RECONNECT" in kinds
+    assert "RECONNECT_SCHEDULED" in kinds
     assert "MARKET_DISCOVERED" in kinds
 
 
@@ -660,7 +709,7 @@ def test_realistic_fixture_replay_determinism(tmp_path: Path) -> None:
 
 
 def test_backtest_node_proof(tmp_path: Path) -> None:
-    """The Nautilus BacktestNode runs against the converted catalog."""
+    """The Nautilus BacktestNode runs with fills and ordering proof."""
     from prediction_markets_nautilus.backtest import run_backtest_proof
 
     F.write_sample_run(tmp_path)
@@ -671,6 +720,54 @@ def test_backtest_node_proof(tmp_path: Path) -> None:
     assert result.book_events_received > 0, "Strategy received no book events"
     assert result.orders_submitted > 0, "Strategy submitted no orders"
     assert len(result.account_balances) > 0, "No account balances captured"
+    # The crossing order at the best ask should produce a fill.
+    assert result.fills_count > 0, "No fills — crossing order did not match"
+    # The strategy should have received deltas in non-decreasing sequence order.
+    seqs = result.received_sequences
+    assert len(seqs) > 0, "No sequence values recorded"
+    assert seqs == sorted(seqs), f"Sequences not in order: {seqs}"
+
+
+# --- 22b. BacktestNode recorder-order proof with regressing timestamps ---
+
+
+def test_backtest_node_recorder_order_with_regressing_timestamps(tmp_path: Path) -> None:
+    """BacktestNode delivers events in recorder order even when source timestamps regress.
+
+    The converter uses processedAt (monotonically increasing) for ts_event, so the
+    BacktestNode delivers events in recorder order even when sourceTimestamp regresses.
+    The embedded sequence field (sourceSequence * 1_000_000 + childIndex) is also
+    recorded to verify ordering independently.
+    """
+    from prediction_markets_nautilus.backtest import run_backtest_proof
+
+    F.write_regressing_timestamp_run(tmp_path)
+    cat_dir = tmp_path / "catalog"
+    convert_run(tmp_path, cat_dir)
+    result = run_backtest_proof(cat_dir)
+    assert result.ran, f"BacktestNode did not run: {result.error}"
+    assert result.book_events_received > 0, "Strategy received no book events"
+    seqs = result.received_sequences
+    assert len(seqs) > 0, "No sequence values recorded"
+    # Sequences should be non-decreasing (recorder order), even though sourceTimestamp regresses.
+    assert seqs == sorted(seqs), f"Sequences not in recorder order: {seqs}"
+    # The first delta should be from seq 2 (processedAt=106), not seq 4 (processedAt=156).
+    first_seq = seqs[0] // 1_000_000
+    assert first_seq == 2, f"First event should be from seq 2, got seq {first_seq}"
+
+
+def test_regressing_timestamp_fixture_replay(tmp_path: Path) -> None:
+    """Replay of regressing-timestamp fixture preserves recorder order."""
+    F.write_regressing_timestamp_run(tmp_path)
+    cat_dir = tmp_path / "catalog"
+    convert_run(tmp_path, cat_dir)
+    result = replay_catalog(cat_dir)
+    # UP book should reflect the delta at seq 4 (bid moved to .49).
+    assert result.final_up_book.best_bid == "0.49"
+    assert result.final_up_book.best_ask == "0.52"
+    # DOWN book should be unchanged from seq 3 snapshot.
+    assert result.final_down_book.best_bid == "0.47"
+    assert result.final_down_book.best_ask == "0.53"
 
 
 # --- 23. Reader invariant cross-checks ---

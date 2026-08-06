@@ -15,35 +15,55 @@ revision but require further validation before a final adoption decision:
 
 ### P0 findings (addressed)
 
-1. **Replay sequence preservation**: Replay now orders by `(sourceSequence, childIndex)` embedded
-   in each delta's `sequence` field, not by source timestamps which may be delayed or equal.
-2. **Multi-token price_change**: The converter now resolves the instrument per-change using
-   `price_changes[i].asset_id` when the envelope `tokenId` is null.
-3. **BacktestNode proof**: A real `BacktestNode` now runs against the converted catalog with a
-   strategy that receives book events, submits orders, and captures portfolio/account state.
-4. **Reader invariant cross-checks**: The reader now independently recomputes reference anomalies,
-   event counts, and book health from events rather than trusting health status fields.
-5. **Lineage one-to-one with catalog rows**: Each expanded catalog row (CLEAR + N ADDs from one
-   snapshot) has its own lineage row with a distinct `childIndex`.
+1. **Replay sequence preservation**: Replay now orders by `(sourceSequence, childIndex)` embedded in
+   each delta's `sequence` field (`sourceSequence * 1_000_000 + childIndex`). The converter uses
+   `processedAt` (monotonically increasing) for `ts_event` so the BacktestNode also delivers events
+   in recorder order even when `sourceTimestamp` regresses. A dedicated test with regressing source
+   timestamps proves this.
+2. **Multi-token price_change**: The converter resolves the instrument per-change using
+   `price_changes[i].asset_id` when the envelope `tokenId` is null. The lineage sidecar records
+   `resolvedTokenId` for each row.
+3. **BacktestNode proof**: A real `BacktestNode` runs against the converted catalog with a strategy
+   that receives book events, submits a crossing limit order at the best ask, and registers a fill
+   (`OrderFilled` event). The strategy records the `sequence` field of each delta to prove recorder
+   ordering. Reference prices are loaded from the catalog and counted.
+4. **Reader invariant cross-checks**: The reader independently recomputes `eventCountsBySource`,
+   `eventCountsByType`, reference anomalies, and reconstructs final book state from the event stream
+   to compare with `finalBookHealth`.
+5. **Lineage one-to-one with catalog rows**: Each expanded catalog row has its own lineage row with
+   a distinct `childIndex` and a stable `catalogRecordId`. The `sequence` field uses a 1,000,000
+   multiplier to avoid collisions. `TradeId` includes `childIndex` to avoid duplicate IDs for
+   batched trades. `ReferencePriceUpdate` and `LifecycleEvent` carry `sourceSequence` and
+   `childIndex`.
+6. **Canonical input hash**: The input stream hash now includes book deltas, trades, reference
+   observations, and lifecycle events, all ordered by `(sourceSequence, childIndex)`.
+7. **Real recorder lifecycle names**: The adapter recognizes `CONNECTION_ATTEMPT`,
+   `CONNECTION_OPEN`, `SUBSCRIPTION_SENT`, `CONNECTION_ERROR`, `CONNECTION_CLOSED`,
+   `DATA_GAP_STARTED`, `DATA_GAP_ENDED`, `RECONNECT_SCHEDULED`, `STALE_STREAM`, and
+   `BOOK_RESYNC_REQUIRED` — the actual event names emitted by `managed-websocket.ts`.
 
 ### P1 findings (addressed)
 
 1. **Python CI**: `uv sync --frozen --extra dev` installs dev dependencies.
-2. **Decimal guarantees**: Comparisons use `Decimal`, JSON float fallback uses `parse_float=Decimal`,
-   and a precision report is generated.
+2. **Decimal guarantees**: Comparisons use `Decimal`, JSON float fallback uses
+   `parse_float=Decimal`, and precision loss aborts conversion (sub-tick prices are not silently
+   quantized).
 3. **Audit classification**: `RECEIVED_NOT_APPLIED` is no longer classified as a duplicate — only
    `DUPLICATE_APPLIED` is.
-4. **Lifecycle support**: `RECONNECT`, `RESYNC_BOUNDARY`, `STALE_FEED`, `GAP_DETECTED`, and
-   `CONNECTION_GENERATION_CHANGE` events are routed to lifecycle events.
-5. **Realistic fixture**: A 10-event fixture with snapshots, deltas, trades, multi-token
-   price_changes, lifecycle events, and same-time conflicts is now tested.
+4. **Missing reference value**: The converter fails with an audit record instead of substituting
+   `"0"` when a reference value is missing.
+5. **Unknown book sides**: Invalid sides are rejected with a `ValueError` instead of defaulting to
+   `SELL`.
+6. **sourceEventCount**: Counts unique source envelopes, not expanded normalized records.
+7. **Realistic fixture**: A 10-event fixture with snapshots, deltas, trades, multi-token
+   price_changes, lifecycle events, and same-time conflicts. A separate regressing-timestamp fixture
+   proves recorder-order delivery.
 
 ### Remaining work before final decision
 
 - Validate the adapter against real (non-synthetic) schema-v2 recordings.
-- Test fill simulation with orders that actually cross the book.
-- Validate reference price custom data flow through the BacktestNode.
 - Performance test with larger event streams.
+- Test portfolio accounting with matching settlement currency.
 
 ## Answers to the required questions
 

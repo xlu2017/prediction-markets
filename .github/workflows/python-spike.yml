@@ -59,3 +59,19 @@ jobs:
           assert a["finalBookComparison"]["allMatch"] is True, "final-book comparison failed"
           print("deterministic replay verified: hashes identical and final books match recorder")
           PY
+      - name: BacktestNode proof with fills and ordering
+        run: |
+          uv run python -m prediction_markets_nautilus.backtest \
+            --catalog-directory .artifacts/nautilus-catalog --output .artifacts/backtest-proof.json
+          uv run python - <<'PY'
+          import json
+          r = json.load(open(".artifacts/backtest-proof.json", encoding="utf-8"))["backtestProof"]
+          assert r["ran"], f"BacktestNode did not run: {r['error']}"
+          assert r["bookEventsReceived"] > 0, "no book events"
+          assert r["ordersSubmitted"] > 0, "no orders submitted"
+          assert r["fillsCount"] > 0, "no fills — crossing order did not match"
+          assert r["referenceEventsReceived"] > 0, "no reference events"
+          seqs = r["receivedSequences"]
+          assert len(seqs) > 0 and seqs == sorted(seqs), f"sequences not in order: {seqs}"
+          print("backtest proof verified: fills, references, and recorder ordering confirmed")
+          PY

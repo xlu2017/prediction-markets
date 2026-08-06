@@ -42,6 +42,8 @@ class Lineage:
     receivedAt: int
     processedAt: int
     childIndex: int = 0  # disambiguates expanded rows from one envelope
+    resolvedTokenId: str | None = None  # actual token for multi-token events
+    catalogRecordId: str = ""  # stable unique ID for each catalog row
 
     @property
     def sourceSequence(self) -> int:
@@ -59,10 +61,12 @@ class Lineage:
             "marketId": self.marketId,
             "conditionId": self.conditionId,
             "tokenId": self.tokenId,
+            "resolvedTokenId": self.resolvedTokenId,
             "rawEventType": self.rawEventType,
             "sourceTimestamp": self.sourceTimestamp,
             "receivedAt": self.receivedAt,
             "processedAt": self.processedAt,
+            "catalogRecordId": self.catalogRecordId,
         }
 
 
@@ -170,7 +174,8 @@ class ReferencePriceUpdate(Data):
 
     A custom Nautilus data type so reference prices remain semantically distinct from
     Polymarket trades, outcome-token quotes, exchange mark prices, and fills. The exact source
-    decimal is preserved as ``value`` (a string).
+    decimal is preserved as ``value`` (a string). ``sourceSequence`` and ``childIndex`` carry
+    recorder order so the input hash can include references in canonical order.
     """
 
     symbol: str = ""
@@ -178,12 +183,20 @@ class ReferencePriceUpdate(Data):
     value: str = ""
     topLevelSourceTimestamp: int = 0
     payloadSourceTimestamp: int = 0
+    sourceSequence: int = 0
+    childIndex: int = 0
 
 
 @customdataclass
 class LifecycleEvent(Data):
-    """Connection-generation / resync-boundary lifecycle marker (audit/catalog sidecar)."""
+    """Connection-generation / resync-boundary lifecycle marker (audit/catalog sidecar).
+
+    ``sourceSequence`` and ``childIndex`` carry recorder order so the input hash can include
+    lifecycle events in canonical order.
+    """
 
     kind: str = ""
     generation: int = 0
     detail: str = ""
+    sourceSequence: int = 0
+    childIndex: int = 0

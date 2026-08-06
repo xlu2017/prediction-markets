@@ -47,7 +47,15 @@ def _ts_event_ms(env_source_ts: int | None, env_received_at: int) -> int:
     return env_source_ts if env_source_ts is not None else env_received_at
 
 
-def _lineage(env, market_id: str, child_index: int = 0) -> Lineage:
+def _lineage(
+    env, market_id: str, child_index: int = 0, resolved_token_id: str | None = None
+) -> Lineage:
+    # resolvedTokenId is the actual token for this row (may differ from envelope tokenId for
+    # multi-token price_change events where envelope tokenId is null).
+    rtid = resolved_token_id if resolved_token_id is not None else env.tokenId
+    # catalogRecordId: stable unique ID per catalog row. Uses a wide multiplier to avoid
+    # collisions even for events expanded into many children.
+    catalog_record_id = f"{env.runId}:{env.sequence}:{child_index}:{rtid or 'none'}"
     return Lineage(
         runId=env.runId,
         sequence=env.sequence,
@@ -63,6 +71,8 @@ def _lineage(env, market_id: str, child_index: int = 0) -> Lineage:
         receivedAt=env.receivedAt,
         processedAt=env.processedAt,
         childIndex=child_index,
+        resolvedTokenId=rtid,
+        catalogRecordId=catalog_record_id,
     )
 
 
@@ -131,7 +141,7 @@ def normalize_event(env, instruments_by_token: dict[str, NormalizedInstrument]) 
     lin = _lineage(env, market_id)
 
     # Duplicate handling: only DUPLICATE_APPLIED is definitively a duplicate.
-    # RECEIVED_NOT_APPLIED is an application outcome, not proof of duplication —
+    # RECEIVED_NOT_APPLIED is an application outcome, not proof of duplication Ã¢â‚¬â€
     # it could be an empty frame, foreign market, or other audit-only event.
     if env.dedupeState == "DUPLICATE_APPLIED":
         return [
@@ -167,8 +177,11 @@ def normalize_event(env, instruments_by_token: dict[str, NormalizedInstrument]) 
                 value = extracted
             elif isinstance(value, (int, Decimal)):
                 value = str(value)
+            elif value is None:
+                # Fail rather than invent a price.
+                return [_audit_unsupported(env, lin, "reference price missing value")]
             else:
-                value = str(value) if value is not None else "0"
+                value = str(value)
         symbol = inner.get("symbol") or payload.get("symbol") or ""
         topic = payload.get("topic") or ""
         return [
@@ -187,13 +200,18 @@ def normalize_event(env, instruments_by_token: dict[str, NormalizedInstrument]) 
         token_id = env.tokenId
         instr = instruments_by_token.get(token_id) if token_id else None
         et = env.eventType
-        # Lifecycle events: connection generation changes, resync boundaries, stale/gap markers.
+        # Lifecycle events: real recorder event names from managed-websocket.ts.
         if et in (
-            "CONNECTION_GENERATION_CHANGE",
-            "RESYNC_BOUNDARY",
-            "STALE_FEED",
-            "RECONNECT",
-            "GAP_DETECTED",
+            "CONNECTION_ATTEMPT",
+            "CONNECTION_OPEN",
+            "SUBSCRIPTION_SENT",
+            "CONNECTION_ERROR",
+            "CONNECTION_CLOSED",
+            "DATA_GAP_STARTED",
+            "DATA_GAP_ENDED",
+            "RECONNECT_SCHEDULED",
+            "STALE_STREAM",
+            "BOOK_RESYNC_REQUIRED",
         ):
             return [
                 NormalizedLifecycleEvent(
@@ -250,14 +268,14 @@ def normalize_event(env, instruments_by_token: dict[str, NormalizedInstrument]) 
                     out.append(
                         _audit_unsupported(
                             env,
-                            _lineage(env, market_id, child_idx),
+                            _lineage(env, market_id, child_idx, resolved_token_id=change_token),
                             f"price_change change {child_idx} without known token",
                         )
                     )
                     continue
                 out.append(
                     NormalizedBookDelta(
-                        lineage=_lineage(env, market_id, child_idx),
+                        lineage=_lineage(env, market_id, child_idx, resolved_token_id=change_token),
                         instrumentId=change_instr.instrumentId,
                         side=_map_side(side),
                         price=price,
@@ -434,14 +452,14 @@ def _snapshot_to_deltas(
 
     instr = instruments_by_id[snap.instrumentId]
     iid = instr.id
-    ts_event = _ms_to_ns(snap.sourceTimestamp) or _ms_to_ns(snap.lineage.receivedAt)
+    ts_event = _ms_to_ns(snap.lineage.processedAt)
     ts_init = _ms_to_ns(snap.lineage.processedAt)
     deltas: list[OrderBookDelta] = []
     lineage_rows: list[dict] = []
     child = 0
 
     # CLEAR
-    seq_key = snap.lineage.sourceSequence * 1000 + child
+    seq_key = snap.lineage.sourceSequence * 1_000_000 + child
     deltas.append(
         OrderBookDelta(
             instrument_id=iid,
@@ -470,7 +488,7 @@ def _snapshot_to_deltas(
             size=instr.make_qty(Decimal(lv.size)),
             order_id=child,
         )
-        seq_key = snap.lineage.sourceSequence * 1000 + child
+        seq_key = snap.lineage.sourceSequence * 1_000_000 + child
         deltas.append(
             OrderBookDelta(
                 instrument_id=iid,
@@ -496,7 +514,7 @@ def _snapshot_to_deltas(
             size=instr.make_qty(Decimal(lv.size)),
             order_id=child,
         )
-        seq_key = snap.lineage.sourceSequence * 1000 + child
+        seq_key = snap.lineage.sourceSequence * 1_000_000 + child
         deltas.append(
             OrderBookDelta(
                 instrument_id=iid,
@@ -523,12 +541,17 @@ def _delta_to_nautilus(
 
     instr = instruments_by_id[d.instrumentId]
     iid = instr.id
-    ts_event = _ms_to_ns(d.sourceTimestamp) or _ms_to_ns(d.lineage.receivedAt)
+    ts_event = _ms_to_ns(d.lineage.processedAt)
     ts_init = _ms_to_ns(d.lineage.processedAt)
-    side = OrderSide.BUY if d.side == "BUY" else OrderSide.SELL
+    if d.side == "BUY":
+        side = OrderSide.BUY
+    elif d.side == "SELL":
+        side = OrderSide.SELL
+    else:
+        raise ValueError(f"invalid book side: {d.side!r} for seq {d.lineage.sourceSequence}")
     size_dec = Decimal(d.size)
     action = BookAction.UPDATE if size_dec > 0 else BookAction.DELETE
-    seq_key = d.lineage.sourceSequence * 1000 + d.lineage.childIndex
+    seq_key = d.lineage.sourceSequence * 1_000_000 + d.lineage.childIndex
     order = BookOrder(
         side=side,
         price=instr.make_price(Decimal(d.price)),
@@ -557,14 +580,14 @@ def _trade_to_nautilus(
 
     instr = instruments_by_id[t.instrumentId]
     iid = instr.id
-    ts_event = _ms_to_ns(t.sourceTimestamp) or _ms_to_ns(t.lineage.receivedAt)
+    ts_event = _ms_to_ns(t.lineage.processedAt)
     ts_init = _ms_to_ns(t.lineage.processedAt)
     agg = AggressorSide.NO_AGGRESSOR
     if t.aggressorSide == "BUY":
         agg = AggressorSide.BUYER
     elif t.aggressorSide == "SELL":
         agg = AggressorSide.SELLER
-    trade_id = TradeId(f"{t.lineage.runId}-{t.lineage.sequence}")
+    trade_id = TradeId(f"{t.lineage.runId}-{t.lineage.sourceSequence}-{t.lineage.childIndex}")
     trade = TradeTick(
         instrument_id=iid,
         price=instr.make_price(Decimal(t.price)),
@@ -581,7 +604,7 @@ def _trade_to_nautilus(
 def _reference_to_nautilus(r: NormalizedReferencePrice) -> tuple[Any, list[dict]]:
     from nautilus_trader.model.data import CustomData, DataType
 
-    ts_event = _ms_to_ns(r.sourceTimestamp) or _ms_to_ns(r.lineage.receivedAt)
+    ts_event = _ms_to_ns(r.lineage.processedAt)
     ts_init = _ms_to_ns(r.lineage.processedAt)
     update = ReferencePriceUpdate(
         ts_event,
@@ -591,6 +614,8 @@ def _reference_to_nautilus(r: NormalizedReferencePrice) -> tuple[Any, list[dict]
         value=r.value,
         topLevelSourceTimestamp=r.topLevelSourceTimestamp or 0,
         payloadSourceTimestamp=r.payloadSourceTimestamp or 0,
+        sourceSequence=r.lineage.sourceSequence,
+        childIndex=r.lineage.childIndex,
     )
     cd = CustomData(
         DataType(ReferencePriceUpdate, {"topic": r.topic or "crypto_prices_chainlink"}), update
@@ -602,7 +627,7 @@ def _reference_to_nautilus(r: NormalizedReferencePrice) -> tuple[Any, list[dict]
 def _lifecycle_to_nautilus(ev: NormalizedLifecycleEvent) -> tuple[Any, list[dict]]:
     from nautilus_trader.model.data import CustomData, DataType
 
-    ts_event = _ms_to_ns(ev.lineage.sourceTimestamp) or _ms_to_ns(ev.lineage.receivedAt)
+    ts_event = _ms_to_ns(ev.lineage.processedAt)
     ts_init = _ms_to_ns(ev.lineage.processedAt)
     le = LifecycleEvent(
         ts_event,
@@ -610,6 +635,8 @@ def _lifecycle_to_nautilus(ev: NormalizedLifecycleEvent) -> tuple[Any, list[dict
         kind=ev.kind,
         generation=ev.generation or 0,
         detail=ev.detail or "",
+        sourceSequence=ev.lineage.sourceSequence,
+        childIndex=ev.lineage.childIndex,
     )
     cd = CustomData(DataType(LifecycleEvent, {"kind": ev.kind}), le)
     lineage_rows = [{**ev.lineage.to_dict(), "recordType": "LifecycleEvent"}]
@@ -716,6 +743,21 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
         _check_precision(
             t.price, instruments_by_id[t.instrumentId], "trade", t.lineage, precision_issues
         )
+    # Abort if any precision loss was detected Ã¢â‚¬â€ sub-tick prices must not be silently quantized.
+    if precision_issues:
+        issue_lines = [
+            f"  seq {pi.get('sourceSequence')} child {pi.get('childIndex')}: "
+            f"{pi.get('sourcePrice')} -> {pi.get('instrumentPrice', pi.get('error'))}"
+            for pi in precision_issues[:10]
+        ]
+        suffix = (
+            f"\n  ... and {len(precision_issues) - 10} more" if len(precision_issues) > 10 else ""
+        )
+        raise ValueError(
+            f"conversion aborted: {len(precision_issues)} precision loss issue(s) detected. "
+            f"Source prices contain sub-tick values that would be quantized by instrument precision."
+            f"\n{'\n'.join(issue_lines)}{suffix}"
+        )
     for r in normalized.references:
         ref_obj, rows = _reference_to_nautilus(r)
         all_refs.append(ref_obj)
@@ -749,19 +791,20 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
     # Audit sidecar: full audit events.
     _write_audit_sidecar(cat_dir, normalized.audit)
 
-    seq_records: list[Any] = [
+    # Count source envelopes (unique source sequences), not expanded normalized records.
+    all_records: list[Any] = [
+        *normalized.instruments,
         *normalized.snapshots,
         *normalized.deltas,
         *normalized.trades,
         *normalized.references,
         *normalized.lifecycle,
         *normalized.audit,
-        *normalized.instruments,
     ]
-    sequences = [e.lineage.sequence for e in seq_records]
+    source_sequences = {e.lineage.sourceSequence for e in all_records}
     report = {
         "sourceRunId": normalized.runId,
-        "sourceEventCount": len(sequences),
+        "sourceEventCount": len(source_sequences),
         "convertedSnapshotCount": snapshot_count,
         "convertedDeltaCount": delta_count,
         "convertedTradeCount": trade_count,
@@ -773,8 +816,8 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
         ),
         "conversionErrors": [],
         "precisionIssues": precision_issues,
-        "firstSourceSequence": min(sequences) if sequences else None,
-        "lastSourceSequence": max(sequences) if sequences else None,
+        "firstSourceSequence": min(source_sequences) if source_sequences else None,
+        "lastSourceSequence": max(source_sequences) if source_sequences else None,
         "catalogLocation": str(cat_dir),
         "catalogRowCount": len(catalog_lineage_rows),
         "unsupportedEventTypes": sorted(
