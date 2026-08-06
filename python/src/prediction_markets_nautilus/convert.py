@@ -813,6 +813,7 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
     all_refs: list = []
     all_lifecycle: list = []
     catalog_lineage_rows: list[dict] = []
+    audit_rows: list[dict] = []
     catalog_ordinal = 0
 
     def _add_lineage_row(base: dict, record_type: str | None = None) -> dict:
@@ -911,9 +912,21 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
             f"\n{'\n'.join(issue_lines)}{suffix}"
         )
 
-    # Audit events: one lineage row per audit event.
+    # Audit events: one lineage row per audit event; reuse the finalized ID in the
+    # audit sidecar so both sidecars share the same catalogRecordId with global ordinal.
     for a in normalized.audit:
-        catalog_lineage_rows.append(_add_lineage_row(a.lineage.to_dict(), "AuditEvent"))
+        row = _add_lineage_row(a.lineage.to_dict(), "AuditEvent")
+        catalog_lineage_rows.append(row)
+        audit_rows.append(
+            {
+                **row,
+                "kind": a.kind,
+                "originalEventType": a.originalEventType,
+                "originalPayload": json.dumps(a.originalPayload, sort_keys=True, default=str),
+                "rawText": a.rawText,
+                "rawMessageText": a.rawMessageText,
+            }
+        )
 
     if all_deltas:
         # Sort by ts_init as required by the catalog.
@@ -928,10 +941,13 @@ def write_catalog(normalized: NormalizedRun, catalog_directory: str | Path) -> d
         cat.write_data(all_lifecycle)
 
     # Lineage sidecar: one row per actual catalog row (not per normalized record).
+    ids = [row["catalogRecordId"] for row in catalog_lineage_rows]
+    if len(ids) != len(set(ids)):
+        raise ValueError("duplicate catalogRecordId detected")
     _write_lineage_sidecar(cat_dir, catalog_lineage_rows)
 
-    # Audit sidecar: full audit events.
-    _write_audit_sidecar(cat_dir, normalized.audit)
+    # Audit sidecar: full audit events using the same finalized lineage rows.
+    _write_audit_sidecar(cat_dir, audit_rows)
 
     # Count source envelopes (unique source sequences), not expanded normalized records.
     all_records: list[Any] = [
@@ -978,22 +994,10 @@ def _write_lineage_sidecar(cat_dir: Path, rows: list[dict]) -> None:
     pq.write_table(table, cat_dir / "lineage.parquet")
 
 
-def _write_audit_sidecar(cat_dir: Path, audit: list[NormalizedAuditEvent]) -> None:
-    if not audit:
+def _write_audit_sidecar(cat_dir: Path, audit_rows: list[dict]) -> None:
+    if not audit_rows:
         return
-    rows = []
-    for a in audit:
-        rows.append(
-            {
-                **a.lineage.to_dict(),
-                "kind": a.kind,
-                "originalEventType": a.originalEventType,
-                "originalPayload": json.dumps(a.originalPayload, sort_keys=True, default=str),
-                "rawText": a.rawText,
-                "rawMessageText": a.rawMessageText,
-            }
-        )
-    table = pa.Table.from_pylist(rows)
+    table = pa.Table.from_pylist(audit_rows)
     pq.write_table(table, cat_dir / "audit.parquet")
 
 

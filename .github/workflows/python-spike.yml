@@ -71,7 +71,7 @@ jobs:
           assert r["ordersSubmitted"] > 0, "no orders submitted"
           assert r["fillsCount"] > 0, "no fills — crossing order did not match"
           assert r["referenceEventsReceived"] > 0, "no reference events"
-          seqs = r["receivedSequences"]
-          assert len(seqs) > 0 and seqs == sorted(seqs), f"sequences not in order: {seqs}"
+          assert r["ledgerMatch"] is True, "ledger mismatch"
+          assert r["receivedLedger"] == r["expectedLedger"], "received ledger does not match expected"
           print("backtest proof verified: fills, references, and recorder ordering confirmed")
           PY

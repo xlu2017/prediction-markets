@@ -45,6 +45,7 @@ class BacktestProofResult:
     account_balances: list[str] = field(default_factory=list)
     positions: list[str] = field(default_factory=list)
     received_ledger: list[dict] = field(default_factory=list)
+    sorted_received_ledger: list[dict] = field(default_factory=list)
     expected_ledger: list[dict] = field(default_factory=list)
     ledger_match: bool = False
     error: str | None = None
@@ -60,6 +61,7 @@ class BacktestProofResult:
             "accountBalances": self.account_balances,
             "positions": self.positions,
             "receivedLedger": self.received_ledger,
+            "sortedReceivedLedger": self.sorted_received_ledger,
             "expectedLedger": self.expected_ledger,
             "ledgerMatch": self.ledger_match,
             "error": self.error,
@@ -373,8 +375,12 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
     received_ledger = list(ProofStrategy._received_ledger)
     fill_details = list(ProofStrategy._fill_details)
 
-    # Sort the received ledger the same way as expected for comparison.
-    received_ledger.sort(key=lambda x: (x["sourceSequence"], x["childIndex"], x["eventType"]))
+    # Compare the raw observed order against the expected ledger. Sorting the
+    # observed ledger before comparison would destroy the order proof, so we
+    # compare the raw callbacks and keep a sorted copy only for diagnostics.
+    sorted_received_ledger = sorted(
+        received_ledger, key=lambda x: (x["sourceSequence"], x["childIndex"], x["eventType"])
+    )
     ledger_match = received_ledger == expected_ledger
 
     return BacktestProofResult(
@@ -387,6 +393,7 @@ def run_backtest_proof(catalog_directory: str | Path) -> BacktestProofResult:
         account_balances=account_balances,
         positions=positions,
         received_ledger=received_ledger,
+        sorted_received_ledger=sorted_received_ledger,
         expected_ledger=expected_ledger,
         ledger_match=ledger_match,
     )
