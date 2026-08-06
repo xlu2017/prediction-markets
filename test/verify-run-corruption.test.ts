@@ -1234,4 +1234,79 @@ describe("verify-run corrupted artifact detection", () => {
       /event sequence 5: payload\.event_type.*does not match envelope\.eventType/,
     );
   });
+
+  it("fails when PONG carries a market-data payload", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const pong = {
+      schemaVersion: 2,
+      runId: "fixture-run-001",
+      sequence: 5,
+      source: "POLYMARKET_CLOB",
+      eventType: "PONG",
+      marketId: "market-200",
+      conditionId: "0xcondition",
+      sourceMarketId: null,
+      tokenId: null,
+      observedTokenIds: null,
+      sourceTimestamp: null,
+      topLevelSourceTimestamp: null,
+      payloadSourceTimestamp: null,
+      receivedAt: 1785909720130,
+      processedAt: 1785909720131,
+      connectionGeneration: 1,
+      frameId: "frame-5",
+      messageIndex: 0,
+      messageCount: 1,
+      isDuplicate: false,
+      dedupeState: "UNIQUE_APPLIED",
+      duplicateOfSequence: null,
+      dedupeReason: null,
+      payload: {
+        value: "PONG",
+        event_type: "book",
+        market: "0xcondition",
+        asset_id: "111111",
+        bids: [],
+        asks: [],
+        timestamp: String(1785909720100),
+      },
+      rawText: "PONG",
+      rawMessageText: "PONG",
+    };
+    lines.push(JSON.stringify(pong));
+    const manifest = await readJson(path.join(dir, "manifest.json"));
+    manifest.finalEventCount = 5;
+    await writeJson(path.join(dir, "manifest.json"), manifest);
+    const health = await readJson(path.join(dir, "health.json"));
+    health.totalEventsReceived = 5;
+    (health.eventCountsBySource as Record<string, number>).POLYMARKET_CLOB = 3;
+    (health.eventCountsByType as Record<string, number>)["POLYMARKET_CLOB:PONG"] = 1;
+    await writeJson(path.join(dir, "health.json"), health);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/PONG.*market-data payload/);
+  });
+
+  it("fails when an event is received before run start", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const first = JSON.parse(requireLine(lines, 0)) as Record<string, unknown>;
+    first.receivedAt = 1785909719999;
+    lines[0] = JSON.stringify(first);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/receivedAt.*before run start/);
+  });
+
+  it("fails when an event is processed after run end", async () => {
+    const dir = await createTempRunDir();
+    await copyFixture(dir);
+    const lines = await readLines(path.join(dir, "events.jsonl"));
+    const last = JSON.parse(requireLine(lines, 3)) as Record<string, unknown>;
+    last.processedAt = 1785909720127;
+    lines[3] = JSON.stringify(last);
+    await writeLines(path.join(dir, "events.jsonl"), lines);
+    await expect(verifyRun(dir, 1)).rejects.toThrow(/processedAt.*after run end/);
+  });
 });
