@@ -4,3 +4,12 @@ coverage/
 data/
 *.log
 .DS_Store
+
+# Python spike artifacts
+python/.venv/
+python/.artifacts/
+python/__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

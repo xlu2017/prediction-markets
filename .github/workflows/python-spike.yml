@@ -1,0 +1,61 @@
+name: Python spike (Nautilus replay)
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  python-spike:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: python
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.12.2"
+          enable-cache: true
+          cache-dependency-glob: "python/uv.lock"
+      - name: Set up Python
+        run: uv python install 3.12
+      - name: Install dependencies from lock file
+        run: uv sync --frozen
+      - name: Format check
+        run: uv run ruff format --check src tests
+      - name: Lint
+        run: uv run ruff check src tests
+      - name: Type check
+        run: uv run mypy src
+      - name: Unit tests
+        run: uv run python -m pytest tests -q
+      - name: Fixture conversion
+        run: |
+          uv run python -m prediction_markets_nautilus.convert \
+            --run-directory ../fixtures/sample-run \
+            --catalog-directory .artifacts/nautilus-catalog
+      - name: Two independent deterministic replays with hash comparison
+        run: |
+          uv run python -m prediction_markets_nautilus.replay \
+            --catalog-directory .artifacts/nautilus-catalog --output .artifacts/replay-1.json
+          uv run python -m prediction_markets_nautilus.replay \
+            --catalog-directory .artifacts/nautilus-catalog --output .artifacts/replay-2.json
+          uv run python - <<'PY'
+          import json
+          a = json.load(open(".artifacts/replay-1.json", encoding="utf-8"))
+          b = json.load(open(".artifacts/replay-2.json", encoding="utf-8"))
+          ra, rb = a["replay"], b["replay"]
+          keys = ["inputStreamHash", "finalUpBookHash", "finalDownBookHash",
+                  "referenceStreamHash", "strategyVisibleStreamHash", "orderIntentStreamHash"]
+          assert all(ra[k] == rb[k] for k in keys), "replay hashes differ across runs"
+          assert ra["upBookAfterEachEvent"] == rb["upBookAfterEachEvent"]
+          assert ra["downBookAfterEachEvent"] == rb["downBookAfterEachEvent"]
+          assert a["finalBookComparison"]["allMatch"] is True, "final-book comparison failed"
+          print("deterministic replay verified: hashes identical and final books match recorder")
+          PY
